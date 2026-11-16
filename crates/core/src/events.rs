@@ -14,5 +14,7 @@ pub enum SyncEvent {
         approximate_total: u64,
     },
     InitialSyncComplete,
+    // Jira answered 401: the sync is paused until `api::renew_token` succeeds
+    TokenRejected,
     Error(String),
 }

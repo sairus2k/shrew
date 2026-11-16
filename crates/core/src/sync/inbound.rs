@@ -587,7 +587,10 @@ mod tests {
                 .await
                 .expect("the sync cycle did not end")
                 .unwrap();
-            let last = matches!(event, SyncEvent::Completed | SyncEvent::Error(_));
+            let last = matches!(
+                event,
+                SyncEvent::Completed | SyncEvent::Error(_) | SyncEvent::TokenRejected
+            );
             cycle.push(format!("{event:?}"));
             if last {
                 return cycle;
@@ -791,6 +794,61 @@ mod tests {
             ]
         );
         assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn a_401_pauses_the_sync_until_a_new_token_is_saved() {
+        use wiremock::matchers::basic_auth;
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        // Jira has stopped accepting the saved token. It is asked once: a
+        // second request with that token would fail the test.
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(basic_auth("ada@example.com", "secret-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/rest/api/3/myself"))
+            .and(basic_auth("ada@example.com", "mistyped"))
+            .respond_with(ResponseTemplate::new(401))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
+        poll(JUST_SYNCED, page(&[renamed], None))
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(cycle(&mut events).await, ["Started", "TokenRejected"]);
+
+        state.sync_waker.send(()).unwrap();
+        let error = api::renew_token(&state, "mistyped").await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Jira rejected the API token");
+        assert_eq!(
+            state.tokens.load().unwrap().as_deref(),
+            Some("secret-token")
+        );
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(200), events.recv());
+        assert!(quiet.await.is_err(), "the paused engine sent an event");
+
+        api::renew_token(&state, " new-token ").await.unwrap();
+
+        // Nothing but the saved token wakes the engine
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(state.tokens.load().unwrap().as_deref(), Some("new-token"));
     }
 
     #[tokio::test]

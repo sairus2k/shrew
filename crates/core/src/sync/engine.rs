@@ -1,6 +1,9 @@
 //! The background loop that keeps the cache in step with Jira.
 
-use crate::{AppState, SyncEvent, sync::inbound};
+use crate::{
+    AppState, SyncEvent,
+    sync::{inbound, jira_client::JiraError},
+};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -10,8 +13,11 @@ pub(crate) async fn run(state: Arc<AppState>, mut waker: watch::Receiver<()>) {
     // The pass for deleted and moved issues runs on the first full cycle after
     // the start, whatever its saved time says
     let mut reconciled = false;
+    // The token Jira answered 401 to. The app cannot renew it, so no cycle runs
+    // until the config holds another one.
+    let mut rejected_token = None;
     loop {
-        if let Err(error) = sync_cycle(&state, &mut reconciled).await {
+        if let Err(error) = sync_cycle(&state, &mut reconciled, &mut rejected_token).await {
             state
                 .events
                 .send(SyncEvent::Error(format!("{error:#}")))
@@ -24,7 +30,11 @@ pub(crate) async fn run(state: Arc<AppState>, mut waker: watch::Receiver<()>) {
     }
 }
 
-async fn sync_cycle(state: &AppState, reconciled: &mut bool) -> anyhow::Result<()> {
+async fn sync_cycle(
+    state: &AppState,
+    reconciled: &mut bool,
+    rejected_token: &mut Option<String>,
+) -> anyhow::Result<()> {
     // Until the initial sync has finished there is no time to continue from
     let Some(config) = state.config.read().await.clone() else {
         return Ok(());
@@ -32,6 +42,10 @@ async fn sync_cycle(state: &AppState, reconciled: &mut bool) -> anyhow::Result<(
     let Some(last_sync_at) = config.last_sync_at else {
         return Ok(());
     };
+
+    if rejected_token.as_ref() == Some(&config.api_token) {
+        return Ok(());
+    }
 
     state.events.send(SyncEvent::Started).ok();
     let mut changed = Vec::new();
@@ -49,6 +63,13 @@ async fn sync_cycle(state: &AppState, reconciled: &mut bool) -> anyhow::Result<(
     // not report them as changed
     if !changed.is_empty() {
         state.events.send(SyncEvent::IssuesUpdated(changed)).ok();
+    }
+    if let Err(error) = &synced
+        && matches!(error.downcast_ref(), Some(JiraError::Unauthorized))
+    {
+        *rejected_token = Some(config.api_token);
+        state.events.send(SyncEvent::TokenRejected).ok();
+        return Ok(());
     }
     synced?;
     state.events.send(SyncEvent::Completed).ok();

@@ -1,22 +1,26 @@
-use app_core::models::SetupStep;
-use gpui_kit::component::ActiveTheme;
+use app_core::{SyncEvent, models::SetupStep};
+use gpui_kit::component::{ActiveTheme, WindowExt as _, notification::Notification};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use initial_sync::{InitialSync, InitialSyncDone};
 use issue::IssueModel;
 use issue_detail::{DetailClosed, DetailPane};
 use issue_list::{IssueList, IssueOpened};
+use new_token::{NewToken, TokenRenewed};
 use projects::{ProjectPicker, ProjectsChosen};
 use runtime::{Core, SyncBridge};
 use sign_in::{SignIn, SignedIn};
+use sync_status::SyncStatus;
 
 mod initial_sync;
 mod issue;
 mod issue_detail;
 mod issue_list;
+mod new_token;
 mod projects;
 mod runtime;
 mod sign_in;
+mod sync_status;
 
 // Names the data directory: ~/Library/Application Support/<APP_ID>
 const APP_ID: &str = "dev.shrew.app";
@@ -29,18 +33,64 @@ enum Screen {
         list: Entity<IssueList>,
         // The issue the user opened from the list
         detail: Option<Entity<DetailPane>>,
+        status: Entity<SyncStatus>,
+        // Shown from the moment Jira rejects the API token until it accepts a new one
+        new_token: Option<Entity<NewToken>>,
     },
 }
 
 struct Root {
     screen: Screen,
+    // The sync error the user was last told about. While Jira is down every
+    // cycle fails the same way, and one notification is enough.
+    notified_error: Option<String>,
 }
 
 impl Root {
     fn new(step: SetupStep, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let sync = cx.global::<Core>().sync.clone();
+        cx.subscribe_in(&sync, window, Self::on_sync_event).detach();
         Self {
             screen: Self::screen(step, window, cx),
+            notified_error: None,
         }
+    }
+
+    fn on_sync_event(
+        &mut self,
+        _: &Entity<SyncBridge>,
+        event: &SyncEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SyncEvent::Completed => self.notified_error = None,
+            SyncEvent::Error(error) if self.notified_error.as_ref() != Some(error) => {
+                self.notified_error = Some(error.clone());
+                window.push_notification(Notification::error(error.clone()), cx);
+            }
+            SyncEvent::TokenRejected => self.ask_for_token(window, cx),
+            _ => {}
+        }
+    }
+
+    fn ask_for_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Screen::Home { new_token, .. } = &mut self.screen else {
+            return;
+        };
+        if new_token.is_some() {
+            return;
+        }
+        let banner = cx.new(|cx| NewToken::new(window, cx));
+        cx.subscribe(&banner, |this, _, _: &TokenRenewed, cx| {
+            if let Screen::Home { new_token, .. } = &mut this.screen {
+                *new_token = None;
+            }
+            cx.notify();
+        })
+        .detach();
+        *new_token = Some(banner);
+        cx.notify();
     }
 
     fn show(&mut self, step: SetupStep, window: &mut Window, cx: &mut Context<Self>) {
@@ -82,13 +132,18 @@ impl Root {
             SetupStep::Ready => {
                 let list = cx.new(|cx| IssueList::new(window, cx));
                 cx.subscribe(&list, Self::open_issue).detach();
-                Screen::Home { list, detail: None }
+                Screen::Home {
+                    list,
+                    detail: None,
+                    status: cx.new(SyncStatus::new),
+                    new_token: None,
+                }
             }
         }
     }
 
     fn open_issue(&mut self, _: Entity<IssueList>, opened: &IssueOpened, cx: &mut Context<Self>) {
-        let Screen::Home { list, detail } = &mut self.screen else {
+        let Screen::Home { list, detail, .. } = &mut self.screen else {
             return;
         };
         let issue = cx.new(|cx| IssueModel::new(opened.0.clone(), cx));
@@ -113,30 +168,44 @@ impl Render for Root {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
             Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
             Screen::InitialSync(sync) => sync.clone().into_any_element(),
-            Screen::Home { list, detail } => div()
+            Screen::Home {
+                list,
+                detail,
+                status,
+                new_token,
+            } => div()
                 .id("home")
                 .test_support()
                 .size_full()
                 .flex()
+                .flex_col()
+                .children(new_token.clone())
                 .child(
                     div()
-                        .h_full()
-                        .min_w_0()
-                        .map(|list| match detail {
-                            Some(_) => list.w(relative(0.4)).flex_none(),
-                            None => list.flex_1(),
-                        })
-                        .child(list.clone()),
-                )
-                .children(detail.clone().map(|detail| {
-                    div()
-                        .h_full()
                         .flex_1()
-                        .min_w_0()
-                        .border_l_1()
-                        .border_color(cx.theme().border)
-                        .child(detail)
-                }))
+                        .min_h_0()
+                        .flex()
+                        .child(
+                            div()
+                                .h_full()
+                                .min_w_0()
+                                .map(|list| match detail {
+                                    Some(_) => list.w(relative(0.4)).flex_none(),
+                                    None => list.flex_1(),
+                                })
+                                .child(list.clone()),
+                        )
+                        .children(detail.clone().map(|detail| {
+                            div()
+                                .h_full()
+                                .flex_1()
+                                .min_w_0()
+                                .border_l_1()
+                                .border_color(cx.theme().border)
+                                .child(detail)
+                        })),
+                )
+                .child(status.clone())
                 .into_any_element(),
         }
     }

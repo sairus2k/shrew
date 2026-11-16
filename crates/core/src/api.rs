@@ -62,6 +62,42 @@ pub async fn sign_in(
     Ok(account(state).await.expect("the config was just set"))
 }
 
+/// Replaces the API token after `SyncEvent::TokenRejected`. The token is
+/// checked with Jira and saved only if Jira accepts it; the sync then resumes.
+/// The error says what went wrong in words meant for the user.
+pub async fn renew_token(state: &AppState, api_token: &str) -> anyhow::Result<()> {
+    let api_token = api_token.trim();
+    if api_token.is_empty() {
+        bail!("Enter the API token");
+    }
+    let config = state.config.read().await.clone().context("Sign in first")?;
+    let site_url = &config.site_url;
+    match JiraClient::new(site_url, &config.email, api_token)
+        .myself()
+        .await
+    {
+        Ok(_) => {}
+        Err(JiraError::Unauthorized) => bail!("Jira rejected the API token"),
+        Err(JiraError::Status(status, _)) => bail!("{site_url} answered {status}"),
+        Err(JiraError::Http(error)) => bail!("Could not reach {site_url}: {error}"),
+    }
+
+    let mut saved = state.config.write().await;
+    // Only the token is replaced: a sync may have moved its times meanwhile
+    let current = saved.as_mut().context("Sign in first")?;
+    current.api_token = api_token.to_owned();
+    auth::save(&state.data_dir, state.tokens.clone(), current).await?;
+    drop(saved);
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+/// When the last sync that completed had started, in Unix milliseconds.
+/// `None` until the initial sync has finished.
+pub async fn last_sync_at(state: &AppState) -> Option<i64> {
+    state.config.read().await.as_ref()?.last_sync_at
+}
+
 pub async fn setup_step(state: &AppState) -> SetupStep {
     match &*state.config.read().await {
         None => SetupStep::SignIn,

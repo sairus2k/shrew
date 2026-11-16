@@ -14,10 +14,6 @@ pub struct AppState {
     pub(crate) config: RwLock<Option<Config>>,
     pub(crate) data_dir: PathBuf,
     // Sending wakes the sync engine before its poll interval is over
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing outside the tests wakes the sync yet")
-    )]
     pub(crate) sync_waker: watch::Sender<()>,
     pub(crate) tokens: Arc<dyn TokenStore>,
 }
