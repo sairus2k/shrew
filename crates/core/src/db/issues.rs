@@ -7,7 +7,29 @@
 )]
 
 use crate::models::{IssueKey, IssueRow, StatusCategory, SyncStatus};
+use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::SqlitePool;
+
+/// The moment Jira last changed an issue.
+// Jira sends `updated` with the UTC offset of the requesting user's time zone,
+// which changes with daylight saving time and with the profile setting. The
+// stale-write guard in `upsert` compares the column as text, so the value is
+// held in UTC with a fixed width: only then does text order equal time order.
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub(crate) struct JiraTimestamp(String);
+
+impl JiraTimestamp {
+    /// Parses Jira's `updated` value, such as `2026-03-29T01:30:00.000+0100`.
+    pub(crate) fn parse(updated: &str) -> chrono::ParseResult<Self> {
+        let instant = DateTime::parse_from_str(updated, "%Y-%m-%dT%H:%M:%S%.f%z")?;
+        Ok(Self(
+            instant
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+        ))
+    }
+}
 
 /// An issue as it is written to the cache.
 pub(crate) struct IssueRecord {
@@ -22,9 +44,7 @@ pub(crate) struct IssueRecord {
     pub project_key: String,
     pub issue_type: Option<String>,
     pub raw_json: String,
-    // Compared as text to tell a stale write from a fresh one, so every value
-    // must be in the same format and UTC offset
-    pub remote_updated_at: String,
+    pub remote_updated_at: JiraTimestamp,
 }
 
 pub(crate) async fn upsert(pool: &SqlitePool, issue: &IssueRecord) -> sqlx::Result<()> {
@@ -152,12 +172,12 @@ mod tests {
             project_key: key.split('-').next().unwrap().to_owned(),
             issue_type: Some("Task".to_owned()),
             raw_json: "{}".to_owned(),
-            remote_updated_at: updated_at.to_owned(),
+            remote_updated_at: JiraTimestamp::parse(updated_at).unwrap(),
         }
     }
 
-    const T1: &str = "2026-01-01T10:00:00.000Z";
-    const T2: &str = "2026-01-02T10:00:00.000Z";
+    const T1: &str = "2026-01-01T10:00:00.000+0000";
+    const T2: &str = "2026-01-02T10:00:00.000+0000";
 
     async fn seed(pool: &SqlitePool, issues: &[(&str, &str)]) {
         for (n, (key, summary)) in issues.iter().enumerate() {
@@ -202,6 +222,120 @@ mod tests {
         assert_eq!(row.summary, "new title");
         assert_eq!(row.status_category, StatusCategory::Done);
         assert_eq!(row.sync_status, SyncStatus::Synced);
+    }
+
+    #[sqlx::test]
+    async fn upsert_applies_later_instant_whose_text_sorts_lower(pool: SqlitePool) {
+        // 09:00 UTC, then 09:30 UTC written with another offset
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-01-01T10:00:00.000+0100", "old title"),
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-01-01T04:30:00.000-0500", "new title"),
+        )
+        .await
+        .unwrap();
+
+        let row = get(&pool, &"PROJ-1".into()).await.unwrap().unwrap();
+        assert_eq!(row.summary, "new title");
+    }
+
+    #[sqlx::test]
+    async fn upsert_ignores_earlier_instant_whose_text_sorts_higher(pool: SqlitePool) {
+        // 09:30 UTC, then 09:00 UTC written with another offset
+        upsert(
+            &pool,
+            &issue(
+                "1",
+                "PROJ-1",
+                "2026-01-01T04:30:00.000-0500",
+                "current title",
+            ),
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-01-01T10:00:00.000+0100", "stale title"),
+        )
+        .await
+        .unwrap();
+
+        let row = get(&pool, &"PROJ-1".into()).await.unwrap().unwrap();
+        assert_eq!(row.summary, "current title");
+    }
+
+    #[sqlx::test]
+    async fn upsert_orders_instants_across_a_daylight_saving_change(pool: SqlitePool) {
+        // Clocks go back from +0200 to +0100 on 2026-10-25 at 01:00 UTC, so the
+        // local hour 02:00-03:00 happens twice and the second pass sorts lower
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-10-25T02:50:00.000+0200", "before"),
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-10-25T02:10:00.000+0100", "after"),
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-10-25T02:50:00.000+0200", "before"),
+        )
+        .await
+        .unwrap();
+
+        let row = get(&pool, &"PROJ-1".into()).await.unwrap().unwrap();
+        assert_eq!(row.summary, "after");
+    }
+
+    #[sqlx::test]
+    async fn remote_updated_at_is_stored_in_utc(pool: SqlitePool) {
+        upsert(
+            &pool,
+            &issue("1", "PROJ-1", "2026-03-29T01:30:00.000+0100", "a"),
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            &issue("2", "PROJ-2", "2026-03-29T03:30:00.5+0200", "b"),
+        )
+        .await
+        .unwrap();
+
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT remote_updated_at FROM issues ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            ["2026-03-29T00:30:00.000Z", "2026-03-29T01:30:00.500Z"]
+        );
+    }
+
+    #[test]
+    fn jira_timestamp_rejects_what_is_not_a_timestamp() {
+        for value in [
+            "",
+            "yesterday",
+            "2026-01-01",
+            "2026-01-01T10:00:00.000",
+            "2026-13-01T10:00:00.000+0000",
+        ] {
+            assert!(
+                JiraTimestamp::parse(value).is_err(),
+                "{value:?} was accepted"
+            );
+        }
     }
 
     #[sqlx::test]

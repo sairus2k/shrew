@@ -219,6 +219,7 @@ name = "app-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "reqwest",
  "serde",
  "serde_json",
