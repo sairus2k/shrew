@@ -10,12 +10,17 @@ use crate::{
 use anyhow::Context;
 use serde::Deserialize;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 // How far before the last sync a poll looks. Jira's search index lags behind a
 // write, and the local clock is not Jira's: an issue changed just before a poll
 // can be missing from it. The upsert drops what is already stored.
 const POLL_OVERLAP_MS: i64 = 60_000;
+
+const RECONCILE_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 const ISSUE_FIELDS: &[&str] = &[
     "summary",
@@ -214,19 +219,76 @@ pub(crate) async fn poll_updated_issues(
 // The span is relative ("-5m"), which Jira counts back from its own clock. A
 // JQL date string would be read in the time zone of the user's Jira profile.
 fn incremental_jql(watched_projects: &[String], last_sync_at: i64, now: i64) -> String {
+    // Rounded up to whole minutes, and at least one if the clock was set back
+    let minutes = ((now - last_sync_at + POLL_OVERLAP_MS) / 60_000 + 1).max(1);
+    format!(
+        "{} AND updated >= \"-{minutes}m\" ORDER BY updated DESC",
+        in_projects(watched_projects),
+    )
+}
+
+fn in_projects(watched_projects: &[String]) -> String {
     let projects: Vec<String> = watched_projects
         .iter()
         .map(|key| format!("\"{key}\""))
         .collect();
-    // Rounded up to whole minutes, and at least one if the clock was set back
-    let minutes = ((now - last_sync_at + POLL_OVERLAP_MS) / 60_000 + 1).max(1);
-    format!(
-        "project IN ({}) AND updated >= \"-{minutes}m\" ORDER BY updated DESC",
-        projects.join(", "),
-    )
+    format!("project IN ({})", projects.join(", "))
 }
 
-fn now_ms() -> anyhow::Result<i64> {
+/// Whether the pass for deleted and moved issues should run in this sync
+/// cycle: in the first one after the app started, then once an hour.
+pub(crate) fn reconcile_due(config: &Config, reconciled_since_start: bool, now: i64) -> bool {
+    // A saved time in the future means the clock was set back: waiting for it
+    // to pass could take days
+    !reconciled_since_start
+        || !(0..RECONCILE_INTERVAL_MS).contains(&(now - config.last_reconcile_at))
+}
+
+/// Removes the cached issues that Jira no longer has in the watched projects:
+/// deleted, moved to an unwatched project or hidden from the user. Returns
+/// their keys.
+pub(crate) async fn reconcile_removed_issues(
+    state: &AppState,
+    config: &Config,
+) -> anyhow::Result<Vec<IssueKey>> {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let started_at = now_ms()?;
+    // A failed page ends the pass here. A partial listing would read as "the
+    // rest was deleted".
+    let remote: HashSet<String> = client
+        .issue_ids(&in_projects(&config.watched_projects))
+        .await?
+        .into_iter()
+        .collect();
+
+    let mut saved = state.config.write().await;
+    // After a sign-in or a change of the watched projects during the listing,
+    // the cache is no longer the one these ids describe
+    let Some(current) = saved.as_mut().filter(|current| {
+        current.site_url == config.site_url
+            && current.account_id == config.account_id
+            && current.watched_projects == config.watched_projects
+    }) else {
+        return Ok(Vec::new());
+    };
+
+    let mut removed = Vec::new();
+    let mut tx = state.pool.begin().await?;
+    // Ids that only Jira has are new issues: the incremental poll stores them
+    for issue in issues::cached(&mut *tx).await? {
+        if config.watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
+            issues::delete(&mut *tx, &issue.id).await?;
+            removed.push(issue.key);
+        }
+    }
+    tx.commit().await?;
+
+    current.last_reconcile_at = started_at;
+    auth::save_config(&state.data_dir, current).await?;
+    Ok(removed)
+}
+
+pub(crate) fn now_ms() -> anyhow::Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
 }
 
@@ -458,7 +520,36 @@ mod tests {
         mount_page(server, "API", None, page(&[], None)).await;
         api::initial_sync(&state).await.unwrap();
         received(&mut events);
+        listing(ids(1..10)).mount(server).await;
         (state, events)
+    }
+
+    /// The id listing of the watched projects, answered with `response`. The
+    /// one `synced` mounts has every id a test stores, so its pass removes
+    /// nothing; a test that mounts its own gives it a higher priority.
+    fn listing(response: ResponseTemplate) -> Mock {
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(body_json(json!({
+                "jql": "project IN (\"WEB\", \"API\")",
+                "fields": ["id"],
+                "maxResults": 5000,
+            })))
+            .respond_with(response)
+    }
+
+    fn ids(range: std::ops::Range<u32>) -> ResponseTemplate {
+        let issues: Vec<Value> = range.map(|id| json!({ "id": id.to_string() })).collect();
+        page(&issues, None)
+    }
+
+    async fn last_reconcile_at(state: &AppState) -> i64 {
+        state
+            .config
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .last_reconcile_at
     }
 
     async fn last_sync_at(state: &AppState) -> i64 {
@@ -685,6 +776,7 @@ mod tests {
         server.reset().await;
         let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
         poll(182, page(&[renamed], None)).mount(&server).await;
+        listing(ids(1..2)).mount(&server).await;
         let (state, mut events) = start_syncing_without_keychain(data_dir.path())
             .await
             .unwrap();
@@ -699,6 +791,144 @@ mod tests {
             ]
         );
         assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn an_issue_deleted_in_jira_is_removed_from_the_cache_and_from_search() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        // Jira no longer has WEB-2, and has an issue the cache has not seen yet
+        listing(page(&[json!({ "id": "1" }), json!({ "id": "7" })], None))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(last_reconcile_at(&state).await, 0);
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-2")])"#,
+                "Completed"
+            ]
+        );
+        // The unseen issue is left to the poll
+        assert_eq!(stored_keys(&state).await, ["WEB-1"]);
+        let found = issues::search(&state.pool, "number", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, "WEB-1".into());
+        let passed_at = last_reconcile_at(&state).await;
+        assert!(passed_at > 0);
+        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
+        let saved: Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved["last_reconcile_at"], json!(passed_at));
+
+        // The next cycle is within the hour: the listing is not asked for again
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+    }
+
+    #[tokio::test]
+    async fn an_issue_moved_to_an_unwatched_project_is_removed() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        // WEB-2 became OPS-5. The move changed it, but the poll asks for the
+        // watched projects only, and so does the listing.
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        listing(ids(1..2)).with_priority(1).mount(&server).await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-2")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(stored_keys(&state).await, ["WEB-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_listing_removes_nothing() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB"), issue(3, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        // The first page has WEB-1, the second fails once and then has WEB-2:
+        // only WEB-3 is gone
+        listing(page(&[json!({ "id": "1" })], Some("more")))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let second_page = || {
+            Mock::given(path("/rest/api/3/search/jql")).and(wiremock::matchers::body_partial_json(
+                json!({ "nextPageToken": "more" }),
+            ))
+        };
+        second_page()
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        second_page()
+            .respond_with(page(&[json!({ "id": "2" })], None))
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        let failed = cycle(&mut events).await;
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert!(failed[1].starts_with("Error(") && failed[1].contains("503"));
+        assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2", "WEB-3"]);
+        assert_eq!(last_reconcile_at(&state).await, 0);
+
+        // The pass is still due, and the next cycle runs it in full
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-3")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
+    }
+
+    #[test]
+    fn the_pass_runs_on_start_then_hourly() {
+        let mut config: Config = serde_json::from_value(json!({
+            "site_url": "http://localhost",
+            "email": "ada@example.com",
+            "account_id": "5b10a",
+        }))
+        .unwrap();
+        const HOUR: i64 = 60 * 60 * 1000;
+        config.last_reconcile_at = 10 * HOUR;
+
+        // The app has just started: the saved time does not matter
+        assert!(reconcile_due(&config, false, 10 * HOUR + 1));
+        assert!(!reconcile_due(&config, true, 10 * HOUR + 1));
+        assert!(!reconcile_due(&config, true, 11 * HOUR - 1));
+        assert!(reconcile_due(&config, true, 11 * HOUR));
+        // The clock was set back since the last pass
+        assert!(reconcile_due(&config, true, 9 * HOUR));
     }
 
     #[test]

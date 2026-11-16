@@ -170,6 +170,32 @@ pub(crate) async fn get_detail(
     }))
 }
 
+/// What identifies a cached issue, on Jira's side and on ours.
+pub(crate) struct CachedIssue {
+    pub id: String,
+    pub key: IssueKey,
+    pub project_key: String,
+}
+
+pub(crate) async fn cached(
+    executor: impl sqlx::SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<CachedIssue>> {
+    sqlx::query_as!(
+        CachedIssue,
+        r#"SELECT id AS "id!", key AS "key: IssueKey", project_key FROM issues"#
+    )
+    .fetch_all(executor)
+    .await
+}
+
+/// `id` is Jira's issue id. The FTS trigger takes the issue out of the search index.
+pub(crate) async fn delete(executor: impl sqlx::SqliteExecutor<'_>, id: &str) -> sqlx::Result<()> {
+    sqlx::query!("DELETE FROM issues WHERE id = ?", id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Every cached issue, the one Jira changed last first.
 pub(crate) async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<IssueRow>> {
     sqlx::query_as!(

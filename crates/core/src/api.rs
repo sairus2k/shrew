@@ -55,6 +55,7 @@ pub async fn sign_in(
         api_token: api_token.to_owned(),
         watched_projects: Vec::new(),
         last_sync_at: None,
+        last_reconcile_at: 0,
     };
     auth::save(&state.data_dir, state.tokens.clone(), &config).await?;
     *state.config.write().await = Some(config);
@@ -208,6 +209,7 @@ mod tests {
                 "account_id": "5b10a",
                 "watched_projects": [],
                 "last_sync_at": null,
+                "last_reconcile_at": 0,
             })
         );
         assert_eq!(

@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 use std::{fmt, time::Duration};
 
 const PAGE_SIZE: u32 = 100;
+// Jira serves pages this large only when no field but the id is asked for
+const ID_PAGE_SIZE: u32 = 5000;
 const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 
 #[derive(Debug)]
@@ -71,6 +73,18 @@ pub(crate) struct SearchPage {
     pub issues: Vec<Value>,
     /// `None` on the last page.
     pub next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdPage {
+    issues: Vec<IssueId>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IssueId {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -144,12 +158,39 @@ impl JiraClient {
         fields: &[&str],
         page_token: Option<&str>,
     ) -> Result<SearchPage, JiraError> {
-        let mut body = json!({ "jql": jql, "fields": fields, "maxResults": PAGE_SIZE });
+        self.send(self.search_request(jql, fields, PAGE_SIZE, page_token))
+            .await
+    }
+
+    /// The ids of every issue `jql` matches. An error on any page fails the
+    /// whole listing: the caller never sees a part of it.
+    pub(crate) async fn issue_ids(&self, jql: &str) -> Result<Vec<String>, JiraError> {
+        let mut ids = Vec::new();
+        let mut next_page_token: Option<String> = None;
+        loop {
+            let request =
+                self.search_request(jql, &["id"], ID_PAGE_SIZE, next_page_token.as_deref());
+            let page: IdPage = self.send(request).await?;
+            ids.extend(page.issues.into_iter().map(|issue| issue.id));
+            next_page_token = page.next_page_token;
+            if next_page_token.is_none() {
+                return Ok(ids);
+            }
+        }
+    }
+
+    fn search_request(
+        &self,
+        jql: &str,
+        fields: &[&str],
+        max_results: u32,
+        page_token: Option<&str>,
+    ) -> RequestBuilder {
+        let mut body = json!({ "jql": jql, "fields": fields, "maxResults": max_results });
         if let Some(token) = page_token {
             body["nextPageToken"] = Value::String(token.to_owned());
         }
-        self.send(self.http.post(self.url("/search/jql")).json(&body))
-            .await
+        self.http.post(self.url("/search/jql")).json(&body)
     }
 
     /// An estimate, good for a progress bar only. Jira requires a bounded JQL.
@@ -340,6 +381,48 @@ mod tests {
         let found = client(&server).search(jql, &["summary"]).await.unwrap();
 
         assert_eq!(found, issues(0..150));
+    }
+
+    #[tokio::test]
+    async fn issue_ids_lists_every_page_or_nothing() {
+        let server = MockServer::start().await;
+        let jql = "project IN (PROJ)";
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(body_json(
+                json!({ "jql": jql, "fields": ["id"], "maxResults": 5000 }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "issues": issues(0..2), "nextPageToken": "tok123" })),
+            )
+            .mount(&server)
+            .await;
+        let second_page = || {
+            Mock::given(path("/rest/api/3/search/jql")).and(body_json(json!({
+                "jql": jql, "fields": ["id"], "maxResults": 5000, "nextPageToken": "tok123",
+            })))
+        };
+        second_page()
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        second_page()
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "issues": issues(2..3) })),
+            )
+            .mount(&server)
+            .await;
+        let client = client(&server);
+
+        let failed = client.issue_ids(jql).await.unwrap_err();
+        let ids = client.issue_ids(jql).await.unwrap();
+
+        assert!(matches!(
+            failed,
+            JiraError::Status(StatusCode::SERVICE_UNAVAILABLE, _)
+        ));
+        assert_eq!(ids, ["0", "1", "2"]);
     }
 
     #[tokio::test]

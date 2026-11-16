@@ -10,13 +10,17 @@ pub(crate) struct Config {
     pub site_url: String, // https://{site}.atlassian.net
     pub email: String,
     pub account_id: String, // from GET /myself
-    // The two fields below default, so a config written before they existed still loads
+    // The fields below default, so a config written before they existed still loads
     #[serde(default)]
     pub watched_projects: Vec<String>, // project keys
     // When the last sync started, in Unix milliseconds. `None` until the initial
     // sync has finished
     #[serde(default)]
     pub last_sync_at: Option<i64>,
+    // When the last pass for deleted and moved issues started, in Unix
+    // milliseconds. 0 until the first one
+    #[serde(default)]
+    pub last_reconcile_at: i64,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,

@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!\", key AS \"key: IssueKey\", project_key FROM issues",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key: IssueKey",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_key",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a659294bcb86f56944033947ac32d2c26adb1ba2f296bc3fb8cfca5e481bcb11"
+}
