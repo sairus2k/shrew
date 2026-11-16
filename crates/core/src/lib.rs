@@ -4,6 +4,7 @@ use tokio::sync::{RwLock, mpsc};
 pub mod api;
 pub mod models;
 
+mod adf;
 mod auth;
 mod db; // the UI cannot reach SQLite
 mod events;
