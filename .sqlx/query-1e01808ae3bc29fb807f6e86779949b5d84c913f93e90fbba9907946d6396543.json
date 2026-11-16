@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT transitions, fetched_at < datetime('now', '-1 hour') AS \"stale!: bool\"\n        FROM transition_cache\n        WHERE project_key = ? AND issue_type = ? AND from_status = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "transitions",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "stale!: bool",
+        "ordinal": 1,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "1e01808ae3bc29fb807f6e86779949b5d84c913f93e90fbba9907946d6396543"
+}

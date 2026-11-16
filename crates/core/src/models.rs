@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// An issue key such as "PROJ-123".
@@ -18,8 +19,9 @@ impl fmt::Display for IssueKey {
 }
 
 // Jira's fourth category, "No Category" (key `undefined`), is stored as `Todo`
-#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum StatusCategory {
     Todo,
     InProgress,
@@ -76,6 +78,30 @@ pub struct Comment {
     pub created: String,
     /// Markdown.
     pub body_md: String,
+}
+
+/// One way out of a status: an entry of the status menu.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Transition {
+    pub id: String,
+    pub name: String,
+    pub to_status: String,
+    pub to_status_category: StatusCategory,
+    /// The fields Jira refuses the transition without. Empty for most transitions.
+    pub required_fields: Vec<RequiredField>,
+}
+
+/// A field the user has to fill in before a transition can be sent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RequiredField {
+    /// The key of the value in the request to Jira, such as `resolution`.
+    pub id: String,
+    pub name: String,
+    /// Jira's description of the value, such as `{ "type": "resolution" }`.
+    pub schema: serde_json::Value,
+    /// The values Jira accepts, as it sent them. `None` for a field that
+    /// takes any value of its type.
+    pub allowed_values: Option<Vec<serde_json::Value>>,
 }
 
 /// The Jira account the app is signed in to.

@@ -6,6 +6,7 @@ use std::path::Path;
 
 pub(crate) mod issues;
 pub(crate) mod sync_queue;
+pub(crate) mod transitions;
 
 const DB_FILE: &str = "shrew.db";
 

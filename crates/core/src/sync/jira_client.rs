@@ -7,7 +7,7 @@ use crate::models::IssueKey;
 use reqwest::{RequestBuilder, Response, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{fmt, time::Duration};
+use std::{collections::BTreeMap, fmt, time::Duration};
 
 const PAGE_SIZE: u32 = 100;
 // Jira serves pages this large only when no field but the id is asked for
@@ -91,6 +91,44 @@ struct IssueId {
 #[derive(Deserialize)]
 struct ApproximateCount {
     count: u64,
+}
+
+#[derive(Deserialize)]
+struct TransitionList {
+    transitions: Vec<JiraTransition>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct JiraTransition {
+    pub id: String,
+    pub name: String,
+    pub to: TargetStatus,
+    /// The fields of the transition's screen, by field id. Empty when it has none.
+    #[serde(default)]
+    pub fields: BTreeMap<String, TransitionField>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TargetStatus {
+    pub name: String,
+    pub status_category: TargetCategory,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TargetCategory {
+    pub key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TransitionField {
+    pub required: bool,
+    #[serde(default)]
+    pub has_default_value: bool,
+    pub name: String,
+    pub schema: Value,
+    pub allowed_values: Option<Vec<Value>>,
 }
 
 pub(crate) struct JiraClient {
@@ -202,6 +240,20 @@ impl JiraClient {
             .json(&json!({ "jql": jql }));
         let count: ApproximateCount = self.send(request).await?;
         Ok(count.count)
+    }
+
+    /// The transitions the issue offers from the status it has in Jira, each
+    /// with the fields of its screen.
+    pub(crate) async fn transitions(
+        &self,
+        key: &IssueKey,
+    ) -> Result<Vec<JiraTransition>, JiraError> {
+        let request = self
+            .http
+            .get(self.url(&format!("/issue/{key}/transitions")))
+            .query(&[("expand", "transitions.fields")]);
+        let list: TransitionList = self.send(request).await?;
+        Ok(list.transitions)
     }
 
     /// `body` is the request body of Jira's transition call: the transition id

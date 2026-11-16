@@ -98,12 +98,7 @@ pub(crate) fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
         summary: fields.summary,
         description_text: (!description_text.is_empty()).then_some(description_text),
         status: fields.status.name,
-        status_category: match fields.status.status_category.key.as_str() {
-            "indeterminate" => StatusCategory::InProgress,
-            "done" => StatusCategory::Done,
-            // "new", and "undefined" for a status with no category
-            _ => StatusCategory::Todo,
-        },
+        status_category: status_category(&fields.status.status_category.key),
         assignee_id,
         assignee_name,
         project_key: fields.project.key,
@@ -113,6 +108,16 @@ pub(crate) fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
         remote_updated_at: JiraTimestamp::parse(&fields.updated)
             .map_err(|error| anyhow::anyhow!("{key} has an unreadable `updated`: {error}"))?,
     })
+}
+
+/// `key` is the key of a status category in Jira.
+pub(crate) fn status_category(key: &str) -> StatusCategory {
+    match key {
+        "indeterminate" => StatusCategory::InProgress,
+        "done" => StatusCategory::Done,
+        // "new", and "undefined" for a status with no category
+        _ => StatusCategory::Todo,
+    }
 }
 
 /// Downloads every issue of the watched projects. The sync counts as done only

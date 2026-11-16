@@ -2,10 +2,11 @@
 
 use crate::{
     AppState, auth, db,
-    models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep},
+    models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep, Transition},
     sync::{
         inbound,
         jira_client::{JiraClient, JiraError},
+        transitions,
     },
 };
 use anyhow::{Context, bail};
@@ -156,6 +157,14 @@ pub async fn get_issue(state: &AppState, key: &IssueKey) -> anyhow::Result<Issue
     db::issues::get_detail(&state.pool, key, &site_url)
         .await?
         .with_context(|| format!("issue {key} not found"))
+}
+
+/// The transitions the issue offers from its current status. They come from
+/// the local cache; Jira is asked only for a status of a workflow that was
+/// never opened before.
+pub async fn get_transitions(state: &AppState, key: &IssueKey) -> anyhow::Result<Vec<Transition>> {
+    let (transitions, _refresh) = transitions::get(state, key).await?;
+    Ok(transitions)
 }
 
 /// The 50 best matches of `query` in the local cache, best first. Every word

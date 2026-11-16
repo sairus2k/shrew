@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO transition_cache (project_key, issue_type, from_status, transitions)\n         VALUES (?, ?, ?, ?)\n         ON CONFLICT(project_key, issue_type, from_status) DO UPDATE SET\n             transitions = excluded.transitions,\n             fetched_at  = datetime('now')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "95cfd2f60da2fc0beed3a58c1900d2a5f7f5442c005a6c11dd2777ad130f6ff2"
+}
