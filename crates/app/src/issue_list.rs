@@ -93,6 +93,7 @@ fn row(issue: &IssueRow, cx: &App) -> impl IntoElement + use<> {
         .aria_label(label)
         // uniform_list gives every row the height of the first one
         .h(px(32.))
+        .w_full()
         .px_4()
         .flex()
         .items_center()
@@ -170,7 +171,7 @@ mod tests {
         models::{IssueRow, StatusCategory, SyncStatus},
     };
     use gpui_kit::test::{TestQueryExt, TestWindowExt};
-    use gpui_kit::{AnyWindowHandle, AppContext, Role, TestAppContext, Window, WindowOptions};
+    use gpui_kit::{AnyWindowHandle, AppContext, Role, TestAppContext, Window, WindowOptions, px};
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
     use tokio::{runtime::Runtime, sync::oneshot};
@@ -272,6 +273,10 @@ mod tests {
                 "WEB-1: Fix login, To Do, Unassigned",
             ],
         );
+        // Each row is as wide as the window, so the columns line up
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("issue-WEB-1").bounds().size.width, px(800.));
+        });
     }
 
     #[gpui_kit::test]
