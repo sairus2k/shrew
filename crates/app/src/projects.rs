@@ -168,8 +168,9 @@ impl Render for ProjectPicker {
 
 #[cfg(test)]
 mod tests {
-    use crate::sign_in::tests::{
-        fill_in_and_submit, in_window, jira, launch, tokio_runtime, wait_until,
+    use crate::{
+        harness::{in_window, launch, tokio_runtime, wait_until},
+        sign_in::tests::{fill_in_and_submit, jira},
     };
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestWindowExt;

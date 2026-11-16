@@ -161,7 +161,7 @@ impl Render for InitialSync {
 #[cfg(test)]
 mod tests {
     use super::grouped;
-    use crate::sign_in::tests::{in_window, launch, tokio_runtime, wait_until};
+    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestWindowExt;
     use serde_json::{Value, json};

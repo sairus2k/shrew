@@ -12,6 +12,8 @@ use runtime::{Core, SyncBridge};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
 
+#[cfg(test)]
+mod harness;
 mod initial_sync;
 mod issue;
 mod issue_detail;

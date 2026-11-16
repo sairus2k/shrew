@@ -238,8 +238,8 @@ impl Render for DetailPane {
 
 #[cfg(test)]
 mod tests {
+    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, rows, sync_brings, synced};
-    use crate::sign_in::tests::{in_window, launch, tokio_runtime, wait_until};
     use gpui_kit::base::test_support::texts;
     use gpui_kit::test::{TestEventExt, TestWindowExt};
     use gpui_kit::{

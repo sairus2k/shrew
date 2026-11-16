@@ -198,8 +198,8 @@ impl Render for IssueList {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::IssueList;
+    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
     use crate::runtime::{Core, tests::init_core};
-    use crate::sign_in::tests::{in_window, launch, tokio_runtime, wait_until};
     use app_core::{
         SyncEvent,
         models::{IssueRow, StatusCategory, SyncStatus},

@@ -117,9 +117,10 @@ impl Render for NewToken {
 #[cfg(test)]
 mod tests {
     use crate::{
+        harness::{in_window, launch, tokio_runtime, wait_until},
         issue_list::tests::synced,
         runtime::Core,
-        sign_in::tests::{in_window, jira, launch, tokio_runtime, wait_until},
+        sign_in::tests::jira,
     };
     use app_core::SyncEvent;
     use gpui_kit::test::TestWindowExt;
