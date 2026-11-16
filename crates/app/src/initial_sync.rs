@@ -161,7 +161,7 @@ impl Render for InitialSync {
 #[cfg(test)]
 mod tests {
     use super::grouped;
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
+    use crate::harness::{in_window, launch, tokio_runtime, wait_until, watching_web};
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestWindowExt;
     use serde_json::{Value, json};
@@ -193,21 +193,6 @@ mod tests {
                 "updated": "2026-03-29T01:30:00.000+0100",
             },
         })
-    }
-
-    /// A data dir of an app that is signed in to `server` and watches WEB, but
-    /// has not synced yet.
-    fn watching_web(server: &MockServer) -> tempfile::TempDir {
-        let data_dir = tempfile::tempdir().unwrap();
-        let config = json!({
-            "site_url": server.uri(),
-            "email": "ada@example.com",
-            "account_id": "5b10a",
-            "watched_projects": ["WEB"],
-        });
-        std::fs::write(data_dir.path().join("config.json"), config.to_string()).unwrap();
-        std::fs::write(data_dir.path().join("api-token"), "secret-token").unwrap();
-        data_dir
     }
 
     /// WEB has 3 issues in two pages, and Jira estimates them as 2340.

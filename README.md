@@ -21,6 +21,20 @@ cargo run -p app
 cargo test --workspace
 ```
 
+### UI integration tests
+
+The tests of the `app` crate run the real views in a headless GPUI window on a fresh SQLite file, with a [wiremock](https://docs.rs/wiremock) server as the Jira site. They need macOS, as the app itself does, so CI needs a macOS runner. They touch neither the Keychain nor the network.
+
+```sh
+# All of them; they are part of `cargo test --workspace` as well
+cargo test -p app
+
+# One module or one test
+cargo test -p app harness::
+```
+
+The shared helpers are in `crates/app/src/harness.rs`. `launch_on_jira` starts the app against a mock Jira that serves the given issues, and `wait_until` waits for a visible condition: the core works on tokio threads, so `cx.run_until_parked()` does not wait for it.
+
 The workspace has two crates. `crates/core` (package `app-core`) holds the database, the sync engine and the Jira client and has no UI dependency. `crates/app` (package `app`) is the GPUI binary.
 
 Once `crates/core/migrations` exists, the database steps apply as well:
