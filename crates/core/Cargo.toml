@@ -1,0 +1,13 @@
+[package]
+name = "app-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[features]
+# Lets UI tests send a SyncEvent without a sync engine behind it
+test-support = []
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
