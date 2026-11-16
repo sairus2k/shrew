@@ -7,6 +7,7 @@ pub mod models;
 mod db; // the UI cannot reach SQLite
 mod events;
 mod state;
+mod sync; // or the Jira client
 pub use events::SyncEvent;
 pub use state::AppState; // an opaque handle: its fields are pub(crate)
 
