@@ -1,9 +1,10 @@
 use std::{path::Path, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 pub mod api;
 pub mod models;
 
+mod auth;
 mod db; // the UI cannot reach SQLite
 mod events;
 mod state;
@@ -14,10 +15,35 @@ pub use state::AppState; // an opaque handle: its fields are pub(crate)
 pub async fn start(
     data_dir: &Path,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
+    start_with(data_dir, Arc::new(auth::Keychain::of_the_app())).await
+}
+
+/// `start` with the API token kept in a file under `data_dir`, so that tests
+/// never read or write the user's Keychain.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn start_without_keychain(
+    data_dir: &Path,
+) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
+    let tokens = auth::TokenFile(data_dir.join("api-token"));
+    start_with(data_dir, Arc::new(tokens)).await
+}
+
+async fn start_with(
+    data_dir: &Path,
+    tokens: Arc<dyn auth::TokenStore>,
+) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
     tokio::fs::create_dir_all(data_dir).await?;
     let pool = db::init(data_dir).await?;
+    let config = auth::load(data_dir, tokens.clone()).await;
     let (events, events_rx) = mpsc::unbounded_channel();
-    Ok((Arc::new(AppState { pool, events }), events_rx))
+    let state = AppState {
+        pool,
+        events,
+        config: RwLock::new(config),
+        data_dir: data_dir.to_owned(),
+        tokens,
+    };
+    Ok((Arc::new(state), events_rx))
 }
 
 #[cfg(test)]

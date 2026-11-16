@@ -45,3 +45,11 @@ pub struct IssueRow {
     pub project_key: String,
     pub sync_status: SyncStatus,
 }
+
+/// The Jira account the app is signed in to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Account {
+    pub site_url: String,
+    pub email: String,
+    pub account_id: String,
+}

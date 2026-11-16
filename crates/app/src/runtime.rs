@@ -2,8 +2,6 @@
 //! directly: they need the tokio context. `spawn` is the only way from the UI into
 //! the core.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "no view calls the core yet"))]
-
 use app_core::{AppState, SyncEvent};
 use gpui_kit::*;
 use std::sync::Arc;
@@ -12,6 +10,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub struct Core {
     pub state: Arc<AppState>,
     pub tokio: tokio::runtime::Handle,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no view listens to core events yet")
+    )]
     pub sync: Entity<SyncBridge>,
 }
 
@@ -49,22 +51,23 @@ impl SyncBridge {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{Core, SyncBridge, spawn};
     use app_core::SyncEvent;
     use gpui_kit::{AppContext, Context, Render, TestAppContext, Window, div};
+    use std::path::Path;
 
-    // The returned runtime and data dir must outlive the test body
-    fn init_core(cx: &mut TestAppContext) -> (tokio::runtime::Runtime, tempfile::TempDir) {
-        let tokio = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
+    /// Starts a core on `data_dir` and installs it as the global, the way main()
+    /// does. Returns whether that core has saved credentials.
+    pub(crate) fn init_core(
+        cx: &mut TestAppContext,
+        tokio: &tokio::runtime::Runtime,
+        data_dir: &Path,
+    ) -> bool {
+        let (state, events) = tokio
+            .block_on(app_core::start_without_keychain(data_dir))
             .unwrap();
-        // Each test gets its own database: tests run in parallel, and two of them
-        // migrating the same file would race
-        let data_dir = tempfile::tempdir().unwrap();
-        let (state, events) = tokio.block_on(app_core::start(data_dir.path())).unwrap();
+        let signed_in = tokio.block_on(app_core::api::account(&state)).is_some();
         let handle = tokio.handle().clone();
         cx.update(|cx| {
             let sync = cx.new(|cx| SyncBridge::new(events, cx));
@@ -74,6 +77,20 @@ mod tests {
                 sync,
             });
         });
+        signed_in
+    }
+
+    // The returned runtime and data dir must outlive the test body
+    fn init_fresh_core(cx: &mut TestAppContext) -> (tokio::runtime::Runtime, tempfile::TempDir) {
+        let tokio = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // Each test gets its own database: tests run in parallel, and two of them
+        // migrating the same file would race
+        let data_dir = tempfile::tempdir().unwrap();
+        init_core(cx, &tokio, data_dir.path());
         (tokio, data_dir)
     }
 
@@ -100,7 +117,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn spawn_runs_a_future_on_tokio_and_returns_its_result(cx: &mut TestAppContext) {
-        let _core = init_core(cx);
+        let _core = init_fresh_core(cx);
         // The tokio side is outside GPUI's deterministic scheduler
         cx.executor().allow_parking();
 
@@ -116,7 +133,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn a_core_event_reaches_a_view_subscribed_to_the_bridge(cx: &mut TestAppContext) {
-        let _core = init_core(cx);
+        let _core = init_fresh_core(cx);
         let probe = cx.new(Probe::new);
 
         cx.update(|cx| cx.global::<Core>().state.emit(SyncEvent::Started));

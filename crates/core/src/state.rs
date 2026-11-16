@@ -1,6 +1,10 @@
-use crate::SyncEvent;
+use crate::{
+    SyncEvent,
+    auth::{Config, TokenStore},
+};
 use sqlx::SqlitePool;
-use tokio::sync::mpsc;
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::{RwLock, mpsc};
 
 pub struct AppState {
     #[cfg_attr(
@@ -14,6 +18,10 @@ pub struct AppState {
         expect(dead_code, reason = "nothing in the core sends events yet")
     )]
     pub(crate) events: mpsc::UnboundedSender<SyncEvent>,
+    // `None` until the user signs in
+    pub(crate) config: RwLock<Option<Config>>,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) tokens: Arc<dyn TokenStore>,
 }
 
 #[cfg(feature = "test-support")]
