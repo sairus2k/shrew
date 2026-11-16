@@ -5,7 +5,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "neither the sync engine nor the issue detail converts ADF yet"
+        reason = "the issue detail does not convert ADF to Markdown yet"
     )
 )]
 

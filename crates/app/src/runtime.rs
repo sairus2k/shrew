@@ -10,10 +10,6 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub struct Core {
     pub state: Arc<AppState>,
     pub tokio: tokio::runtime::Handle,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no view listens to core events yet")
-    )]
     pub sync: Entity<SyncBridge>,
 }
 
@@ -53,21 +49,21 @@ impl SyncBridge {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{Core, SyncBridge, spawn};
-    use app_core::SyncEvent;
+    use app_core::{SyncEvent, models::SetupStep};
     use gpui_kit::{AppContext, Context, Render, TestAppContext, Window, div};
     use std::path::Path;
 
     /// Starts a core on `data_dir` and installs it as the global, the way main()
-    /// does. Returns whether that core has saved credentials.
+    /// does. Returns the setup step that core is at.
     pub(crate) fn init_core(
         cx: &mut TestAppContext,
         tokio: &tokio::runtime::Runtime,
         data_dir: &Path,
-    ) -> bool {
+    ) -> SetupStep {
         let (state, events) = tokio
             .block_on(app_core::start_without_keychain(data_dir))
             .unwrap();
-        let signed_in = tokio.block_on(app_core::api::account(&state)).is_some();
+        let step = tokio.block_on(app_core::api::setup_step(&state));
         let handle = tokio.handle().clone();
         cx.update(|cx| {
             let sync = cx.new(|cx| SyncBridge::new(events, cx));
@@ -77,7 +73,7 @@ pub(crate) mod tests {
                 sync,
             });
         });
-        signed_in
+        step
     }
 
     // The returned runtime and data dir must outlive the test body

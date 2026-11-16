@@ -7,16 +7,8 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, mpsc};
 
 pub struct AppState {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing in the core queries the database yet")
-    )]
     pub(crate) pool: SqlitePool,
     // Every committed change to local data is announced here; the UI listens
-    #[cfg_attr(
-        not(any(test, feature = "test-support")),
-        expect(dead_code, reason = "nothing in the core sends events yet")
-    )]
     pub(crate) events: mpsc::UnboundedSender<SyncEvent>,
     // `None` until the user signs in
     pub(crate) config: RwLock<Option<Config>>,

@@ -1,9 +1,6 @@
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "neither the sync engine nor the API uses the storage yet"
-    )
+    expect(dead_code, reason = "nothing reads the stored issues yet")
 )]
 
 use crate::models::{IssueKey, IssueRow, StatusCategory, SyncStatus};
@@ -47,7 +44,10 @@ pub(crate) struct IssueRecord {
     pub remote_updated_at: JiraTimestamp,
 }
 
-pub(crate) async fn upsert(pool: &SqlitePool, issue: &IssueRecord) -> sqlx::Result<()> {
+pub(crate) async fn upsert(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    issue: &IssueRecord,
+) -> sqlx::Result<()> {
     sqlx::query!(
         r#"
         INSERT INTO issues
@@ -85,7 +85,7 @@ pub(crate) async fn upsert(pool: &SqlitePool, issue: &IssueRecord) -> sqlx::Resu
         issue.raw_json,
         issue.remote_updated_at,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

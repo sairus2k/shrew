@@ -134,7 +134,7 @@ impl Render for SignIn {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::{Root, runtime::tests::init_core};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -147,7 +147,7 @@ mod tests {
         matchers::{method, path},
     };
 
-    fn tokio_runtime() -> tokio::runtime::Runtime {
+    pub(crate) fn tokio_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -155,7 +155,7 @@ mod tests {
             .unwrap()
     }
 
-    fn jira(tokio: &tokio::runtime::Runtime, myself: ResponseTemplate) -> MockServer {
+    pub(crate) fn jira(tokio: &tokio::runtime::Runtime, myself: ResponseTemplate) -> MockServer {
         tokio.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -168,13 +168,13 @@ mod tests {
     }
 
     // What main() does: start the core on the data dir, then open the window
-    fn launch(
+    pub(crate) fn launch(
         cx: &mut TestAppContext,
         tokio: &tokio::runtime::Runtime,
         data_dir: &Path,
     ) -> AnyWindowHandle {
         cx.update(gpui_kit::init);
-        let signed_in = init_core(cx, tokio, data_dir);
+        let step = init_core(cx, tokio, data_dir);
         // The tokio side is outside GPUI's deterministic scheduler
         cx.executor().allow_parking();
         cx.update(|cx| {
@@ -184,14 +184,14 @@ mod tests {
                 ..Default::default()
             };
             let (window, _) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Root::new(signed_in, window, cx))
+                cx.new(|cx| Root::new(step, window, cx))
             })
             .unwrap();
             window
         })
     }
 
-    fn in_window<R>(
+    pub(crate) fn in_window<R>(
         cx: &mut TestAppContext,
         window: AnyWindowHandle,
         f: impl FnOnce(&mut Window, &mut App) -> R,
@@ -205,7 +205,7 @@ mod tests {
 
     // The answer comes from a real HTTP request on the tokio runtime, so the
     // wait is in real time, not on GPUI's test clock
-    fn wait_until(
+    pub(crate) fn wait_until(
         cx: &mut TestAppContext,
         window: AnyWindowHandle,
         mut reached: impl FnMut(&mut Window) -> bool,
@@ -220,7 +220,11 @@ mod tests {
         panic!("the window did not reach the expected state in 5 s");
     }
 
-    fn fill_in_and_submit(cx: &mut TestAppContext, window: AnyWindowHandle, site_url: &str) {
+    pub(crate) fn fill_in_and_submit(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        site_url: &str,
+    ) {
         in_window(cx, window, |window, cx| {
             window.click("site-url", cx);
             window.input(site_url, cx);
@@ -243,7 +247,7 @@ mod tests {
             assert_eq!(window.find("site-url").label(), Some("Site URL"));
             assert_eq!(window.find("email").label(), Some("Email"));
             assert_eq!(window.find("api-token").label(), Some("API token"));
-            assert!(window.try_find("home").is_none());
+            assert!(window.try_find("choose-projects").is_none());
         });
     }
 
@@ -260,14 +264,16 @@ mod tests {
 
         fill_in_and_submit(cx, window, &server.uri());
 
-        wait_until(cx, window, |window| window.try_find("home").is_some());
+        wait_until(cx, window, |window| {
+            window.try_find("choose-projects").is_some()
+        });
         in_window(cx, window, |window, _| {
             assert!(window.try_find("sign-in").is_none());
         });
 
         let window = launch(cx, &tokio, data_dir.path());
         in_window(cx, window, |window, _| {
-            assert!(window.try_find("home").is_some());
+            assert!(window.try_find("choose-projects").is_some());
             assert!(window.try_find("sign-in").is_none());
         });
     }
@@ -289,7 +295,7 @@ mod tests {
                 window.find("sign-in-error").label(),
                 Some("Jira rejected the email or the API token")
             );
-            assert!(window.try_find("home").is_none());
+            assert!(window.try_find("choose-projects").is_none());
             assert_eq!(
                 window.find("email").value(),
                 Some("ada@example.com"),

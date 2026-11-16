@@ -67,9 +67,10 @@ struct ProjectPage {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SearchPage {
-    issues: Vec<Value>,
-    next_page_token: Option<String>,
+pub(crate) struct SearchPage {
+    pub issues: Vec<Value>,
+    /// `None` on the last page.
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -121,15 +122,9 @@ impl JiraClient {
     pub(crate) async fn search(&self, jql: &str, fields: &[&str]) -> Result<Vec<Value>, JiraError> {
         let mut issues = Vec::new();
         let mut next_page_token = None;
-        // Jira rejects parallel pagination: a page is reachable only through
-        // the token of the one before it
         loop {
-            let mut body = json!({ "jql": jql, "fields": fields, "maxResults": PAGE_SIZE });
-            if let Some(token) = next_page_token {
-                body["nextPageToken"] = Value::String(token);
-            }
-            let page: SearchPage = self
-                .send(self.http.post(self.url("/search/jql")).json(&body))
+            let page = self
+                .search_page(jql, fields, next_page_token.as_deref())
                 .await?;
             issues.extend(page.issues);
             next_page_token = page.next_page_token;
@@ -137,6 +132,24 @@ impl JiraClient {
                 return Ok(issues);
             }
         }
+    }
+
+    /// One page of a search. Pass `None` for the first page, then the token of
+    /// the page before.
+    // Jira rejects parallel pagination: a page is reachable only through the
+    // token of the one before it
+    pub(crate) async fn search_page(
+        &self,
+        jql: &str,
+        fields: &[&str],
+        page_token: Option<&str>,
+    ) -> Result<SearchPage, JiraError> {
+        let mut body = json!({ "jql": jql, "fields": fields, "maxResults": PAGE_SIZE });
+        if let Some(token) = page_token {
+            body["nextPageToken"] = Value::String(token.to_owned());
+        }
+        self.send(self.http.post(self.url("/search/jql")).json(&body))
+            .await
     }
 
     /// An estimate, good for a progress bar only. Jira requires a bounded JQL.

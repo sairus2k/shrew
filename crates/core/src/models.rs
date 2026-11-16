@@ -53,3 +53,19 @@ pub struct Account {
     pub email: String,
     pub account_id: String,
 }
+
+/// A Jira project the account can see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Project {
+    pub key: String,
+    pub name: String,
+}
+
+/// What the app still needs before it can show issues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupStep {
+    SignIn,
+    ChooseProjects,
+    InitialSync,
+    Ready,
+}

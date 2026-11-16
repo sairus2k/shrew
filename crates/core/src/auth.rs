@@ -10,6 +10,13 @@ pub(crate) struct Config {
     pub site_url: String, // https://{site}.atlassian.net
     pub email: String,
     pub account_id: String, // from GET /myself
+    // The two fields below default, so a config written before they existed still loads
+    #[serde(default)]
+    pub watched_projects: Vec<String>, // project keys
+    // When the last sync started, in Unix milliseconds. `None` until the initial
+    // sync has finished
+    #[serde(default)]
+    pub last_sync_at: Option<i64>,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,
@@ -91,6 +98,11 @@ pub(crate) async fn save(
 ) -> anyhow::Result<()> {
     let api_token = config.api_token.clone();
     tokio::task::spawn_blocking(move || tokens.save(&api_token)).await??;
+    save_config(data_dir, config).await
+}
+
+/// Writes the config file only: the token store is not touched.
+pub(crate) async fn save_config(data_dir: &Path, config: &Config) -> anyhow::Result<()> {
     tokio::fs::write(
         data_dir.join(CONFIG_FILE),
         serde_json::to_vec_pretty(config)?,

@@ -2,10 +2,13 @@
 
 use crate::{
     AppState, auth,
-    models::Account,
-    sync::jira_client::{JiraClient, JiraError},
+    models::{Account, Project, SetupStep},
+    sync::{
+        inbound,
+        jira_client::{JiraClient, JiraError},
+    },
 };
-use anyhow::bail;
+use anyhow::{Context, bail};
 
 /// The account the app is signed in to, or `None` when it has no credentials.
 pub async fn account(state: &AppState) -> Option<Account> {
@@ -50,10 +53,56 @@ pub async fn sign_in(
         email: email.to_owned(),
         account_id: myself.account_id,
         api_token: api_token.to_owned(),
+        watched_projects: Vec::new(),
+        last_sync_at: None,
     };
     auth::save(&state.data_dir, state.tokens.clone(), &config).await?;
     *state.config.write().await = Some(config);
     Ok(account(state).await.expect("the config was just set"))
+}
+
+pub async fn setup_step(state: &AppState) -> SetupStep {
+    match &*state.config.read().await {
+        None => SetupStep::SignIn,
+        Some(config) if config.watched_projects.is_empty() => SetupStep::ChooseProjects,
+        Some(config) if config.last_sync_at.is_none() => SetupStep::InitialSync,
+        Some(_) => SetupStep::Ready,
+    }
+}
+
+/// The projects the account can see, ordered by name.
+pub async fn projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
+    let config = state.config.read().await.clone().context("Sign in first")?;
+    let projects = JiraClient::new(&config.site_url, &config.email, &config.api_token)
+        .projects()
+        .await?;
+    Ok(projects
+        .into_iter()
+        .map(|project| Project {
+            key: project.key,
+            name: project.name,
+        })
+        .collect())
+}
+
+/// Saves the projects whose issues the app keeps locally.
+pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow::Result<()> {
+    if project_keys.is_empty() {
+        bail!("Choose at least one project");
+    }
+    let mut saved = state.config.write().await;
+    let mut config = saved.clone().context("Sign in first")?;
+    config.watched_projects = project_keys.to_vec();
+    auth::save_config(&state.data_dir, &config).await?;
+    *saved = Some(config);
+    Ok(())
+}
+
+/// Downloads every issue of the watched projects, reporting through
+/// `SyncEvent::InitialSyncProgress` and `SyncEvent::InitialSyncComplete`.
+/// After an error or a quit, calling it again completes the sync.
+pub async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
+    inbound::initial_sync(state).await
 }
 
 #[cfg(test)]
@@ -128,6 +177,8 @@ mod tests {
                 "site_url": server.uri(),
                 "email": "ada@example.com",
                 "account_id": "5b10a",
+                "watched_projects": [],
+                "last_sync_at": null,
             })
         );
         assert_eq!(
@@ -151,6 +202,87 @@ mod tests {
         assert_eq!(account(&state).await, Some(signed_in));
         let config = state.config.read().await;
         assert_eq!(config.as_ref().unwrap().api_token, "secret-token");
+    }
+
+    fn project_list() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "isLast": true,
+            "values": [
+                { "id": "10001", "key": "API", "name": "Backend" },
+                { "id": "10000", "key": "WEB", "name": "Website" },
+            ],
+        }))
+    }
+
+    #[tokio::test]
+    async fn the_watched_projects_are_chosen_from_the_accessible_ones_and_saved() {
+        let server = jira(myself()).await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/project/search"))
+            .and(basic_auth("ada@example.com", "secret-token"))
+            .respond_with(project_list())
+            .mount(&server)
+            .await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+
+        let accessible = projects(&state).await.unwrap();
+        assert_eq!(
+            accessible,
+            [
+                Project {
+                    key: "API".to_owned(),
+                    name: "Backend".to_owned()
+                },
+                Project {
+                    key: "WEB".to_owned(),
+                    name: "Website".to_owned()
+                },
+            ]
+        );
+        watch_projects(&state, &["WEB".to_owned()]).await.unwrap();
+
+        assert_eq!(setup_step(&state).await, SetupStep::InitialSync);
+        state.pool.close().await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(setup_step(&state).await, SetupStep::InitialSync);
+        let config = state.config.read().await;
+        assert_eq!(config.as_ref().unwrap().watched_projects, ["WEB"]);
+    }
+
+    #[tokio::test]
+    async fn watching_no_project_is_refused() {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+
+        let error = watch_projects(&state, &[]).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Choose at least one project");
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+    }
+
+    #[tokio::test]
+    async fn a_config_saved_before_project_selection_existed_still_loads() {
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data_dir.path().join("config.json"),
+            r#"{ "site_url": "https://x.atlassian.net", "email": "ada@example.com", "account_id": "5b10a" }"#,
+        )
+        .unwrap();
+        std::fs::write(data_dir.path().join("api-token"), "secret-token").unwrap();
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
     }
 
     #[tokio::test]
