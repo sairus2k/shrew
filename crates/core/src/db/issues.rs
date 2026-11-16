@@ -376,11 +376,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found(&pool, "checkout", None).await, [] as [&str; 0]);
+        check_fts_integrity(&pool).await;
+    }
+
+    async fn check_fts_integrity(pool: &SqlitePool) {
         // Fails if the index and the content table disagree
         sqlx::query("INSERT INTO issues_fts(issues_fts, rank) VALUES ('integrity-check', 1)")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn search_survives_vacuum(pool: SqlitePool) {
+        seed(
+            &pool,
+            &[
+                ("PROJ-1", "Alpha"),
+                ("PROJ-2", "Bravo"),
+                ("PROJ-3", "Charlie"),
+            ],
+        )
+        .await;
+        sqlx::query("DELETE FROM issues WHERE id = 'id-0'")
             .execute(&pool)
             .await
             .unwrap();
+
+        // SQLite only promises to keep rowids over VACUUM for an INTEGER PRIMARY
+        // KEY. Current versions keep implicit ones too, so the search below
+        // cannot catch a regression of the schema; this check does.
+        let rowid_type: String =
+            sqlx::query_scalar("SELECT type FROM pragma_table_info('issues') WHERE pk = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rowid_type, "INTEGER");
+
+        sqlx::query("VACUUM").execute(&pool).await.unwrap();
+
+        assert_eq!(found(&pool, "bravo", None).await, ["PROJ-2"]);
+        assert_eq!(found(&pool, "charlie", None).await, ["PROJ-3"]);
+        check_fts_integrity(&pool).await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn rowid_migration_keeps_the_rows_of_an_older_database(pool: SqlitePool) {
+        for migration in [
+            include_str!("../../migrations/0001_initial.sql"),
+            include_str!("../../migrations/0002_fts5.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        for (id, key, summary) in [
+            ("10", "PROJ-1", "Alpha"),
+            ("11", "PROJ-2", "Bravo"),
+            ("12", "PROJ-3", "Charlie"),
+        ] {
+            sqlx::query(
+                "INSERT INTO issues (id, key, summary, status, status_category, project_key,
+                                     raw_json, sync_status, remote_updated_at)
+                 VALUES (?, ?, ?, 'To Do', 'todo', 'PROJ', '{}', 'pending', '2026-01-01T10:00:00.000Z')",
+            )
+            .bind(id)
+            .bind(key)
+            .bind(summary)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Leaves a gap in the rowids, as a real cache has
+        sqlx::query("DELETE FROM issues WHERE id = '10'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!("../../migrations/0003_issues_rowid.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row = get(&pool, &"PROJ-3".into()).await.unwrap().unwrap();
+        assert_eq!(row.id, "12");
+        assert_eq!(row.summary, "Charlie");
+        assert_eq!(row.sync_status, SyncStatus::Pending);
+        assert!(get(&pool, &"PROJ-2".into()).await.unwrap().is_some());
+        assert!(get(&pool, &"PROJ-1".into()).await.unwrap().is_none());
+        assert_eq!(found(&pool, "bravo", None).await, ["PROJ-2"]);
+        assert_eq!(found(&pool, "charlie", None).await, ["PROJ-3"]);
+        check_fts_integrity(&pool).await;
+
+        // The upsert still finds the row by its Jira id
+        upsert(&pool, &issue("12", "PROJ-3", T2, "Delta"))
+            .await
+            .unwrap();
+        assert_eq!(found(&pool, "delta", None).await, ["PROJ-3"]);
+        assert_eq!(found(&pool, "charlie", None).await, [] as [&str; 0]);
     }
 
     #[sqlx::test]
