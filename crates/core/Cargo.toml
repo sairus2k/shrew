@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [features]
-# Lets UI tests send a SyncEvent without a sync engine behind it
+# Lets UI tests store issues and send a SyncEvent without a sync engine behind them
 test-support = []
 
 [dependencies]

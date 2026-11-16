@@ -69,7 +69,7 @@ struct IssueType {
 }
 
 /// `issue` is one element of a search page, fetched with `ISSUE_FIELDS`.
-fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
+pub(crate) fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
     let JiraIssue { id, key, fields } = JiraIssue::deserialize(issue)
         .with_context(|| format!("unexpected issue from Jira: {}", issue["key"]))?;
     let description_text = adf::to_plain_text(fields.description.as_ref());

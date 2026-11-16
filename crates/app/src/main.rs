@@ -1,11 +1,13 @@
 use app_core::models::SetupStep;
 use gpui_kit::*;
 use initial_sync::{InitialSync, InitialSyncDone};
+use issue_list::IssueList;
 use projects::{ProjectPicker, ProjectsChosen};
 use runtime::{Core, SyncBridge};
 use sign_in::{SignIn, SignedIn};
 
 mod initial_sync;
+mod issue_list;
 mod projects;
 mod runtime;
 mod sign_in;
@@ -17,7 +19,7 @@ enum Screen {
     SignIn(Entity<SignIn>),
     ChooseProjects(Entity<ProjectPicker>),
     InitialSync(Entity<InitialSync>),
-    Home,
+    Home(Entity<IssueList>),
 }
 
 struct Root {
@@ -26,16 +28,19 @@ struct Root {
 
 impl Root {
     fn new(step: SetupStep, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
-            screen: Screen::Home,
-        };
-        this.show(step, window, cx);
-        this
+        Self {
+            screen: Self::screen(step, window, cx),
+        }
+    }
+
+    fn show(&mut self, step: SetupStep, window: &mut Window, cx: &mut Context<Self>) {
+        self.screen = Self::screen(step, window, cx);
+        cx.notify();
     }
 
     // Each setup screen reports when it is done, and the next one takes its place
-    fn show(&mut self, step: SetupStep, window: &mut Window, cx: &mut Context<Self>) {
-        self.screen = match step {
+    fn screen(step: SetupStep, window: &mut Window, cx: &mut Context<Self>) -> Screen {
+        match step {
             SetupStep::SignIn => {
                 let sign_in = cx.new(|cx| SignIn::new(window, cx));
                 cx.subscribe_in(&sign_in, window, |this, _, _: &SignedIn, window, cx| {
@@ -64,9 +69,8 @@ impl Root {
                 .detach();
                 Screen::InitialSync(sync)
             }
-            SetupStep::Ready => Screen::Home,
-        };
-        cx.notify();
+            SetupStep::Ready => Screen::Home(cx.new(|cx| IssueList::new(window, cx))),
+        }
     }
 }
 
@@ -76,14 +80,11 @@ impl Render for Root {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
             Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
             Screen::InitialSync(sync) => sync.clone().into_any_element(),
-            Screen::Home => div()
+            Screen::Home(issues) => div()
                 .id("home")
                 .test_support()
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child("Shrew")
+                .child(issues.clone())
                 .into_any_element(),
         }
     }

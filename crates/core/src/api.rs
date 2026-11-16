@@ -1,8 +1,8 @@
 //! The async functions the UI calls. They need the tokio runtime.
 
 use crate::{
-    AppState, auth,
-    models::{Account, Project, SetupStep},
+    AppState, auth, db,
+    models::{Account, IssueRow, Project, SetupStep},
     sync::{
         inbound,
         jira_client::{JiraClient, JiraError},
@@ -103,6 +103,21 @@ pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow
 /// After an error or a quit, calling it again completes the sync.
 pub async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
     inbound::initial_sync(state).await
+}
+
+/// Every issue in the local cache, the one Jira changed last first.
+pub async fn list_issues(state: &AppState) -> anyhow::Result<Vec<IssueRow>> {
+    Ok(db::issues::list(&state.pool).await?)
+}
+
+/// The 50 best matches of `query` in the local cache, best first. Every word
+/// must match a key, a summary or a description, as a word, a stem or a prefix.
+pub async fn search_issues(
+    state: &AppState,
+    query: &str,
+    project: Option<&str>,
+) -> anyhow::Result<Vec<IssueRow>> {
+    Ok(db::issues::search(&state.pool, query, project, 50).await?)
 }
 
 #[cfg(test)]

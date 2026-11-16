@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing reads the stored issues yet")
-)]
-
 use crate::models::{IssueKey, IssueRow, StatusCategory, SyncStatus};
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::SqlitePool;
@@ -90,6 +85,10 @@ pub(crate) async fn upsert(
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the issue detail view is not built yet")
+)]
 pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Option<IssueRow>> {
     sqlx::query_as!(
         IssueRow,
@@ -104,6 +103,24 @@ pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Optio
         key
     )
     .fetch_optional(pool)
+    .await
+}
+
+/// Every cached issue, the one Jira changed last first.
+pub(crate) async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<IssueRow>> {
+    sqlx::query_as!(
+        IssueRow,
+        r#"
+        SELECT id AS "id!", key AS "key: IssueKey", summary, status,
+               status_category AS "status_category: StatusCategory",
+               assignee_name, project_key,
+               sync_status AS "sync_status: SyncStatus"
+        FROM issues
+        -- Both columns come from idx_issues_updated, so nothing is sorted
+        ORDER BY remote_updated_at DESC, rowid DESC
+        "#
+    )
+    .fetch_all(pool)
     .await
 }
 
@@ -336,6 +353,23 @@ mod tests {
                 "{value:?} was accepted"
             );
         }
+    }
+
+    #[sqlx::test]
+    async fn list_returns_every_issue_with_the_last_changed_first(pool: SqlitePool) {
+        upsert(&pool, &issue("1", "PROJ-1", T1, "Older"))
+            .await
+            .unwrap();
+        upsert(&pool, &issue("2", "PROJ-2", T2, "Newer"))
+            .await
+            .unwrap();
+        upsert(&pool, &issue("3", "PROJ-3", T1, "Older, stored later"))
+            .await
+            .unwrap();
+
+        let rows = list(&pool).await.unwrap();
+        let keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
+        assert_eq!(keys, ["PROJ-2", "PROJ-3", "PROJ-1"]);
     }
 
     #[sqlx::test]

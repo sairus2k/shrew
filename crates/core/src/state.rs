@@ -21,4 +21,16 @@ impl AppState {
     pub fn emit(&self, event: SyncEvent) {
         self.events.send(event).ok();
     }
+
+    /// Stores issues the way a sync does. Each one is an element of a Jira
+    /// search page. No event is sent.
+    pub async fn store_issues(&self, issues: &[serde_json::Value]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for issue in issues {
+            let record = crate::sync::inbound::issue_record(issue)?;
+            crate::db::issues::upsert(&mut *tx, &record).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
