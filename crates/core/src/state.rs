@@ -4,7 +4,7 @@ use crate::{
 };
 use sqlx::SqlitePool;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 
 pub struct AppState {
     pub(crate) pool: SqlitePool,
@@ -13,6 +13,12 @@ pub struct AppState {
     // `None` until the user signs in
     pub(crate) config: RwLock<Option<Config>>,
     pub(crate) data_dir: PathBuf,
+    // Sending wakes the sync engine before its poll interval is over
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "nothing outside the tests wakes the sync yet")
+    )]
+    pub(crate) sync_waker: watch::Sender<()>,
     pub(crate) tokens: Arc<dyn TokenStore>,
 }
 

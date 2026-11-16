@@ -1,15 +1,21 @@
 //! Issues coming from Jira into the local cache.
 
 use crate::{
-    AppState, SyncEvent, adf, auth,
+    AppState, SyncEvent, adf,
+    auth::{self, Config},
     db::issues::{self, IssueRecord, JiraTimestamp},
-    models::StatusCategory,
+    models::{IssueKey, StatusCategory},
     sync::jira_client::JiraClient,
 };
 use anyhow::Context;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// How far before the last sync a poll looks. Jira's search index lags behind a
+// write, and the local clock is not Jira's: an issue changed just before a poll
+// can be missing from it. The upsert drops what is already stored.
+const POLL_OVERLAP_MS: i64 = 60_000;
 
 const ISSUE_FIELDS: &[&str] = &[
     "summary",
@@ -112,7 +118,7 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     // An issue that changes while the pages are read can be missed by them. The
     // first incremental sync starts from this moment and picks it up.
-    let started_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let started_at = now_ms()?;
 
     for project_key in &config.watched_projects {
         let jql = format!("project = \"{project_key}\" ORDER BY updated DESC");
@@ -158,13 +164,79 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Stores the issues Jira changed since `last_sync_at` and moves the saved sync
+/// time forward. The keys of the rows that changed are added to `changed` page
+/// by page, so the caller can announce them even when a later page fails.
+pub(crate) async fn poll_updated_issues(
+    state: &AppState,
+    config: &Config,
+    last_sync_at: i64,
+    changed: &mut Vec<IssueKey>,
+) -> anyhow::Result<()> {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let started_at = now_ms()?;
+    let jql = incremental_jql(&config.watched_projects, last_sync_at, started_at);
+
+    let mut page_token = None;
+    loop {
+        let page = client
+            .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
+            .await?;
+        let mut written = Vec::new();
+        let mut tx = state.pool.begin().await?;
+        for issue in &page.issues {
+            let record = issue_record(issue)?;
+            if issues::upsert(&mut *tx, &record).await? {
+                written.push(record.key);
+            }
+        }
+        tx.commit().await?;
+        changed.extend(written);
+
+        if page.next_page_token.is_none() {
+            break;
+        }
+        page_token = page.next_page_token;
+    }
+
+    let mut saved = state.config.write().await;
+    // A sign-in during the poll starts a new setup: its sync time is not ours to set
+    if let Some(current) = saved
+        .as_mut()
+        .filter(|current| current.last_sync_at == Some(last_sync_at))
+    {
+        current.last_sync_at = Some(started_at);
+        auth::save_config(&state.data_dir, current).await?;
+    }
+    Ok(())
+}
+
+// The span is relative ("-5m"), which Jira counts back from its own clock. A
+// JQL date string would be read in the time zone of the user's Jira profile.
+fn incremental_jql(watched_projects: &[String], last_sync_at: i64, now: i64) -> String {
+    let projects: Vec<String> = watched_projects
+        .iter()
+        .map(|key| format!("\"{key}\""))
+        .collect();
+    // Rounded up to whole minutes, and at least one if the clock was set back
+    let minutes = ((now - last_sync_at + POLL_OVERLAP_MS) / 60_000 + 1).max(1);
+    format!(
+        "project IN ({}) AND updated >= \"-{minutes}m\" ORDER BY updated DESC",
+        projects.join(", "),
+    )
+}
+
+fn now_ms() -> anyhow::Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         api,
         models::{SetupStep, SyncStatus},
-        start_without_keychain,
+        start_syncing_without_keychain, start_without_keychain,
     };
     use serde_json::json;
     use std::{path::Path, sync::Arc};
@@ -252,7 +324,7 @@ mod tests {
             )
             .mount(server)
             .await;
-        let (state, events) = start_without_keychain(data_dir).await.unwrap();
+        let (state, events) = start_syncing_without_keychain(data_dir).await.unwrap();
         api::sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
@@ -370,6 +442,277 @@ mod tests {
         // A finished sync is not repeated by the start after it
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+    }
+
+    /// A core that watches WEB and API and has finished the initial sync,
+    /// which stored `issues`.
+    async fn synced(
+        server: &MockServer,
+        data_dir: &Path,
+        issues: &[Value],
+    ) -> (Arc<AppState>, UnboundedReceiver<SyncEvent>) {
+        let (state, mut events) = watching(server, data_dir, &["WEB", "API"]).await;
+        mount_count(server, "WEB", 0).await;
+        mount_page(server, "WEB", None, page(issues, None)).await;
+        mount_count(server, "API", 0).await;
+        mount_page(server, "API", None, page(&[], None)).await;
+        api::initial_sync(&state).await.unwrap();
+        received(&mut events);
+        (state, events)
+    }
+
+    async fn last_sync_at(state: &AppState) -> i64 {
+        let config = state.config.read().await;
+        config.as_ref().unwrap().last_sync_at.unwrap()
+    }
+
+    /// The poll for the last `minutes`, answered with `response`.
+    fn poll(minutes: u32, response: ResponseTemplate) -> Mock {
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(body_json(json!({
+                "jql": format!(
+                    "project IN (\"WEB\", \"API\") AND updated >= \"-{minutes}m\" ORDER BY updated DESC"
+                ),
+                "fields": ISSUE_FIELDS,
+                "maxResults": 100,
+            })))
+            .respond_with(response)
+    }
+
+    // A poll right after a sync: the overlap, rounded up
+    const JUST_SYNCED: u32 = 2;
+
+    fn changed(mut issue: Value, updated: &str, summary: &str) -> Value {
+        issue["fields"]["updated"] = json!(updated);
+        issue["fields"]["summary"] = json!(summary);
+        issue
+    }
+
+    /// The events of one sync cycle, up to the one that ends it.
+    async fn cycle(events: &mut UnboundedReceiver<SyncEvent>) -> Vec<String> {
+        let mut cycle = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the sync cycle did not end")
+                .unwrap();
+            let last = matches!(event, SyncEvent::Completed | SyncEvent::Error(_));
+            cycle.push(format!("{event:?}"));
+            if last {
+                return cycle;
+            }
+        }
+    }
+
+    async fn summary(state: &AppState, key: &str) -> String {
+        let row = issues::get(&state.pool, &key.into()).await.unwrap();
+        row.unwrap().summary
+    }
+
+    const LATER: &str = "2026-03-29T09:00:00.000+0000";
+    const EARLIER: &str = "2026-03-28T09:00:00.000+0000";
+
+    #[tokio::test]
+    async fn a_poll_stores_the_issues_jira_changed_since_the_last_sync() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        let before = last_sync_at(&state).await;
+        // The overlap brings WEB-2 back although it has not changed
+        let polled = [
+            changed(issue(1, "WEB"), LATER, "Renamed"),
+            issue(2, "WEB"),
+            issue(5, "API"),
+        ];
+        poll(JUST_SYNCED, page(&polled, None)).mount(&server).await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1"), IssueKey("API-5")])"#,
+                "Completed",
+            ]
+        );
+        assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+        assert_eq!(stored_keys(&state).await, ["API-5", "WEB-1", "WEB-2"]);
+        let now = last_sync_at(&state).await;
+        assert!(now > before);
+        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
+        let saved: Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved["last_sync_at"], json!(now));
+    }
+
+    #[tokio::test]
+    async fn a_poll_runs_by_itself_when_the_interval_is_over() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (_state, mut events) = synced(&server, data_dir.path(), &[]).await;
+        // Only the timer of the engine is moved: the wall clock, which the span
+        // of the poll is counted from, stays
+        poll(JUST_SYNCED, page(&[issue(1, "WEB")], None))
+            .mount(&server)
+            .await;
+        assert!(events.try_recv().is_err());
+
+        tokio::time::pause();
+        tokio::time::advance(crate::sync::engine::POLL_INTERVAL).await;
+        tokio::time::resume();
+
+        assert_eq!(
+            cycle(&mut events).await[1],
+            r#"IssuesUpdated([IssueKey("WEB-1")])"#
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_reads_every_page() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[]).await;
+        // The second page is asked for with the token, so the first mock no longer matches
+        poll(JUST_SYNCED, page(&[issue(1, "WEB")], Some("tok")))
+            .mount(&server)
+            .await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "nextPageToken": "tok" }),
+            ))
+            .respond_with(page(&[issue(2, "WEB")], None))
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await[1],
+            r#"IssuesUpdated([IssueKey("WEB-1"), IssueKey("WEB-2")])"#
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_keeps_the_local_row_when_jira_sends_an_older_version() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let stale = changed(issue(1, "WEB"), EARLIER, "Stale title");
+        poll(JUST_SYNCED, page(&[stale], None)).mount(&server).await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+        assert_eq!(summary(&state, "WEB-1").await, "Issue number 1");
+    }
+
+    #[tokio::test]
+    async fn an_issue_moved_to_another_watched_project_keeps_its_row() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let mut moved = changed(issue(1, "API"), LATER, "Moved");
+        moved["key"] = json!("API-9");
+        poll(JUST_SYNCED, page(&[moved], None)).mount(&server).await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("API-9")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(stored_keys(&state).await, ["API-9"]);
+        let row = issues::get(&state.pool, &"API-9".into()).await.unwrap();
+        assert_eq!(row.unwrap().project_key, "API");
+    }
+
+    #[tokio::test]
+    async fn a_failed_poll_reports_the_error_and_the_next_one_still_runs() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let before = last_sync_at(&state).await;
+        poll(JUST_SYNCED, ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
+        poll(JUST_SYNCED, page(&[renamed], None))
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        let failed = cycle(&mut events).await;
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert_eq!(failed[0], "Started");
+        assert!(failed[1].starts_with("Error(") && failed[1].contains("503"));
+        // The failed poll did not move the sync time: the next one asks for the same span
+        assert_eq!(last_sync_at(&state).await, before);
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn the_first_poll_after_a_restart_continues_from_the_saved_sync_time() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        state.pool.close().await;
+        // The app was last synced three hours ago
+        let config_file = data_dir.path().join("config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+        config["last_sync_at"] = json!(now_ms().unwrap() - 3 * 60 * 60 * 1000);
+        std::fs::write(&config_file, config.to_string()).unwrap();
+
+        // Only a poll for those three hours is answered; any other gets a 404
+        server.reset().await;
+        let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
+        poll(182, page(&[renamed], None)).mount(&server).await;
+        let (state, mut events) = start_syncing_without_keychain(data_dir.path())
+            .await
+            .unwrap();
+
+        // Nothing wakes the engine: it polls on start
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+    }
+
+    #[test]
+    fn a_poll_asks_for_whole_minutes_since_the_last_sync_plus_the_overlap() {
+        let watched = ["WEB".to_owned()];
+        let jql = |since, now| incremental_jql(&watched, since, now);
+
+        assert_eq!(
+            jql(0, 180_000),
+            r#"project IN ("WEB") AND updated >= "-5m" ORDER BY updated DESC"#
+        );
+        assert!(jql(0, 179_999).contains(r#""-4m""#));
+        // The clock was set back since the last sync
+        assert!(jql(10_000_000, 0).contains(r#""-1m""#));
     }
 
     #[test]

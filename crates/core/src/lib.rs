@@ -1,5 +1,5 @@
 use std::{path::Path, sync::Arc};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 
 pub mod api;
 pub mod models;
@@ -13,6 +13,7 @@ mod sync; // or the Jira client
 pub use events::SyncEvent;
 pub use state::AppState; // an opaque handle: its fields are pub(crate)
 
+// Must be called inside the tokio runtime: it spawns the sync engine
 pub async fn start(
     data_dir: &Path,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
@@ -20,9 +21,21 @@ pub async fn start(
 }
 
 /// `start` with the API token kept in a file under `data_dir`, so that tests
-/// never read or write the user's Keychain.
+/// never read or write the user's Keychain, and with no sync engine: a UI test
+/// moves the data itself, and an engine polling on its own thread would make
+/// the test's event order depend on timing.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn start_without_keychain(
+    data_dir: &Path,
+) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
+    let tokens = auth::TokenFile(data_dir.join("api-token"));
+    let (state, events_rx, _wake_rx) = open(data_dir, Arc::new(tokens)).await?;
+    Ok((state, events_rx))
+}
+
+/// `start_without_keychain` with the sync engine running.
+#[cfg(test)]
+pub(crate) async fn start_syncing_without_keychain(
     data_dir: &Path,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
     let tokens = auth::TokenFile(data_dir.join("api-token"));
@@ -33,18 +46,33 @@ async fn start_with(
     data_dir: &Path,
     tokens: Arc<dyn auth::TokenStore>,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
+    let (state, events_rx, wake_rx) = open(data_dir, tokens).await?;
+    tokio::spawn(sync::engine::run(state.clone(), wake_rx));
+    Ok((state, events_rx))
+}
+
+async fn open(
+    data_dir: &Path,
+    tokens: Arc<dyn auth::TokenStore>,
+) -> anyhow::Result<(
+    Arc<AppState>,
+    mpsc::UnboundedReceiver<SyncEvent>,
+    watch::Receiver<()>,
+)> {
     tokio::fs::create_dir_all(data_dir).await?;
     let pool = db::init(data_dir).await?;
     let config = auth::load(data_dir, tokens.clone()).await;
     let (events, events_rx) = mpsc::unbounded_channel();
+    let (sync_waker, wake_rx) = watch::channel(());
     let state = AppState {
         pool,
         events,
         config: RwLock::new(config),
         data_dir: data_dir.to_owned(),
+        sync_waker,
         tokens,
     };
-    Ok((Arc::new(state), events_rx))
+    Ok((Arc::new(state), events_rx, wake_rx))
 }
 
 #[cfg(test)]

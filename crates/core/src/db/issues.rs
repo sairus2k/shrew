@@ -43,11 +43,13 @@ pub(crate) struct IssueRecord {
     pub remote_updated_at: JiraTimestamp,
 }
 
+/// Returns whether the row was written: `false` means the cache already holds
+/// this version of the issue or a newer one.
 pub(crate) async fn upsert(
     executor: impl sqlx::SqliteExecutor<'_>,
     issue: &IssueRecord,
-) -> sqlx::Result<()> {
-    sqlx::query!(
+) -> sqlx::Result<bool> {
+    let written = sqlx::query!(
         r#"
         INSERT INTO issues
             (id, key, summary, description_text, status, status_category,
@@ -86,7 +88,7 @@ pub(crate) async fn upsert(
     )
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(written.rows_affected() > 0)
 }
 
 #[cfg_attr(
