@@ -35,4 +35,16 @@ impl AppState {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Runs one cycle of the sync engine: a core started without the engine
+    /// syncs only when the test says so.
+    pub async fn sync_once(&self) -> anyhow::Result<()> {
+        crate::sync::engine::sync_cycle(self, &mut true, &mut None).await
+    }
+
+    /// Runs `sql` on the cache, for a state that no API leads to.
+    pub async fn execute(&self, sql: &str) -> anyhow::Result<()> {
+        sqlx::raw_sql(sql).execute(&self.pool).await?;
+        Ok(())
+    }
 }

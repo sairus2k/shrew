@@ -11,6 +11,25 @@ pub(crate) struct QueueEntry {
     pub retry_count: i64,
 }
 
+/// Adds a change to send to Jira. `payload` is the body of the request.
+pub(crate) async fn enqueue(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    entity_type: &str,
+    issue_key: &IssueKey,
+    payload: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)
+         VALUES (?, ?, 'create', ?)",
+        entity_type,
+        issue_key,
+        payload,
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Marks the oldest entry that still has to be sent as `in_progress` and
 /// returns it.
 // `created_at` has a resolution of one second; the id is the creation order.
@@ -35,13 +54,16 @@ pub(crate) async fn claim_next(pool: &SqlitePool) -> sqlx::Result<Option<QueueEn
     .await
 }
 
-pub(crate) async fn mark_synced(pool: &SqlitePool, id: i64) -> sqlx::Result<()> {
+pub(crate) async fn mark_synced(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    id: i64,
+) -> sqlx::Result<()> {
     sqlx::query!(
         "UPDATE sync_queue SET status = 'synced', error_msg = NULL, synced_at = datetime('now')
          WHERE id = ?",
         id
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

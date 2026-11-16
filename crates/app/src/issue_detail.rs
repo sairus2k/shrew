@@ -1,7 +1,8 @@
 //! The pane beside the list: one issue with its description and comments.
 
 use crate::issue::IssueModel;
-use app_core::models::{Comment, IssueDetail, StatusCategory};
+use crate::transition::StatusButton;
+use app_core::models::{Comment, IssueDetail, SyncStatus};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
@@ -14,6 +15,7 @@ pub struct DetailClosed;
 
 pub struct DetailPane {
     issue: Entity<IssueModel>,
+    status: Entity<StatusButton>,
     _issue_changed: Subscription,
 }
 
@@ -23,6 +25,7 @@ impl DetailPane {
     pub fn new(issue: Entity<IssueModel>, cx: &mut Context<Self>) -> Self {
         let _issue_changed = cx.observe(&issue, |_, _, cx| cx.notify());
         Self {
+            status: cx.new(|cx| StatusButton::new(issue.clone(), cx)),
             issue,
             _issue_changed,
         }
@@ -30,12 +33,28 @@ impl DetailPane {
 }
 
 /// A line of the field list. Tests read it as "Name: value".
-fn field(id: &'static str, name: &str, value: &str, color: Hsla, cx: &App) -> impl IntoElement {
+fn field(id: &'static str, name: &str, value: &str, cx: &App) -> impl IntoElement {
+    let shown = div()
+        .flex_1()
+        .min_w_0()
+        .text_color(cx.theme().foreground)
+        .child(value.to_owned());
+    field_line(id, name, value, cx).child(shown)
+}
+
+/// The line without its value: the caller adds the element that shows it.
+fn field_line(
+    id: &'static str,
+    name: &str,
+    value: &str,
+    cx: &App,
+) -> impl IntoElement + ParentElement {
     div()
         .id(id)
         .test_support()
         .aria_label(format!("{name}: {value}"))
         .flex()
+        .items_center()
         .gap_3()
         .child(
             div()
@@ -43,13 +62,6 @@ fn field(id: &'static str, name: &str, value: &str, color: Hsla, cx: &App) -> im
                 .flex_none()
                 .text_color(cx.theme().muted_foreground)
                 .child(name.to_owned()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_color(color)
-                .child(value.to_owned()),
         )
 }
 
@@ -80,13 +92,8 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
         ))
 }
 
-fn body(issue: &IssueDetail, cx: &App) -> impl IntoElement {
-    let foreground = cx.theme().foreground;
+fn body(issue: &IssueDetail, status: Entity<StatusButton>, cx: &App) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
-    let status_color = match issue.status_category {
-        StatusCategory::Done => muted,
-        StatusCategory::Todo | StatusCategory::InProgress => foreground,
-    };
     let or_none = |value: &Option<String>| value.clone().unwrap_or_else(|| "None".to_owned());
     let labels = if issue.labels.is_empty() {
         "None".to_owned()
@@ -123,42 +130,39 @@ fn body(issue: &IssueDetail, cx: &App) -> impl IntoElement {
                 .flex_col()
                 .gap_1()
                 .text_sm()
-                .child(field(
-                    "detail-status",
-                    "Status",
-                    &issue.status,
-                    status_color,
-                    cx,
-                ))
-                .child(field(
-                    "detail-assignee",
-                    "Assignee",
-                    assignee,
-                    foreground,
-                    cx,
-                ))
+                .child(
+                    field_line("detail-status", "Status", &issue.status, cx)
+                        .child(status)
+                        // The status is the user's own change and Jira does not have it yet
+                        .children((issue.sync_status == SyncStatus::Pending).then(|| {
+                            div()
+                                .id("sync-badge")
+                                .test_support()
+                                .aria_label("Pending")
+                                .text_color(muted)
+                                .child("Pending")
+                        })),
+                )
+                .child(field("detail-assignee", "Assignee", assignee, cx))
                 .child(field(
                     "detail-reporter",
                     "Reporter",
                     &or_none(&issue.reporter_name),
-                    foreground,
                     cx,
                 ))
                 .child(field(
                     "detail-type",
                     "Type",
                     &or_none(&issue.issue_type),
-                    foreground,
                     cx,
                 ))
                 .child(field(
                     "detail-priority",
                     "Priority",
                     &or_none(&issue.priority),
-                    foreground,
                     cx,
                 ))
-                .child(field("detail-labels", "Labels", &labels, foreground, cx)),
+                .child(field("detail-labels", "Labels", &labels, cx)),
         )
         .child(if issue.description_md.is_empty() {
             div()
@@ -232,7 +236,12 @@ impl Render for DetailPane {
                     .children(open_in_jira)
                     .child(close),
             )
-            .children(issue.detail.as_ref().map(|detail| body(detail, cx)))
+            .children(
+                issue
+                    .detail
+                    .as_ref()
+                    .map(|detail| body(detail, self.status.clone(), cx)),
+            )
     }
 }
 

@@ -30,7 +30,7 @@ pub(crate) async fn run(state: Arc<AppState>, mut waker: watch::Receiver<()>) {
     }
 }
 
-async fn sync_cycle(
+pub(crate) async fn sync_cycle(
     state: &AppState,
     reconciled: &mut bool,
     rejected_token: &mut Option<String>,

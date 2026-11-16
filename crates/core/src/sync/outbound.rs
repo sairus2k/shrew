@@ -3,7 +3,10 @@
 use crate::{
     AppState, SyncEvent,
     auth::Config,
-    db::sync_queue::{self, QueueEntry},
+    db::{
+        issues,
+        sync_queue::{self, QueueEntry},
+    },
     models::IssueKey,
     sync::jira_client::{JiraClient, JiraError},
 };
@@ -38,7 +41,11 @@ pub(crate) async fn process_queue(
     // A retried entry is claimed again: it is still the oldest one
     while let Some(entry) = sync_queue::claim_next(&state.pool).await? {
         let Err(error) = deliver(&client, &entry).await else {
-            sync_queue::mark_synced(&state.pool, entry.id).await?;
+            // One transaction: an issue must not stay pending with nothing left to send
+            let mut tx = state.pool.begin().await?;
+            sync_queue::mark_synced(&mut *tx, entry.id).await?;
+            issues::confirm(&mut *tx, &entry.issue_key).await?;
+            tx.commit().await?;
             if !delivered.contains(&entry.issue_key) {
                 delivered.push(entry.issue_key);
             }
@@ -95,7 +102,12 @@ fn failure(error: &anyhow::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api, start_syncing_without_keychain, start_without_keychain, sync::inbound};
+    use crate::{
+        api,
+        models::{StatusCategory, SyncStatus, Transition},
+        start_syncing_without_keychain, start_without_keychain,
+        sync::inbound,
+    };
     use serde_json::{Value, json};
     use std::{path::Path, sync::Arc};
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -461,6 +473,128 @@ mod tests {
                 "/rest/api/3/search/jql"
             ]
         );
+    }
+
+    fn start() -> Transition {
+        Transition {
+            id: "21".to_owned(),
+            name: "Start".to_owned(),
+            to_status: "In Progress".to_owned(),
+            to_status_category: StatusCategory::InProgress,
+            required_fields: Vec::new(),
+        }
+    }
+
+    fn review() -> Transition {
+        Transition {
+            id: "31".to_owned(),
+            name: "Review".to_owned(),
+            to_status: "In Review".to_owned(),
+            to_status_category: StatusCategory::InProgress,
+            ..start()
+        }
+    }
+
+    /// Puts WEB-1 into the cache, in To Do.
+    async fn store_issue(state: &AppState) {
+        let issue = inbound::issue_record(&json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        }))
+        .unwrap();
+        issues::upsert(&state.pool, &issue).await.unwrap();
+    }
+
+    /// The status of WEB-1 and whether it waits for Jira.
+    async fn issue(state: &AppState) -> (String, SyncStatus) {
+        let issue = issues::get(&state.pool, &"WEB-1".into()).await;
+        let issue = issue.unwrap().unwrap();
+        (issue.status, issue.sync_status)
+    }
+
+    #[tokio::test]
+    async fn an_issue_stays_pending_until_jira_has_its_last_transition() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        // Jira takes the first transition, then stops accepting the token
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let key = IssueKey::from("WEB-1");
+        api::transition_issue(&state, &key, &start(), &json!({}))
+            .await
+            .unwrap();
+        api::transition_issue(&state, &key, &review(), &json!({}))
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            issue(&state).await,
+            ("In Review".to_owned(), SyncStatus::Pending)
+        );
+
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(
+            issue(&state).await,
+            ("In Review".to_owned(), SyncStatus::Synced)
+        );
+        let sent: Vec<Value> = requests(&server)
+            .await
+            .into_iter()
+            .map(|(_, body)| body["transition"]["id"].clone())
+            .collect();
+        assert_eq!(sent, [json!("21"), json!("31"), json!("31")]);
+    }
+
+    #[tokio::test]
+    async fn a_transition_is_sent_without_waiting_for_the_next_poll() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = syncing(&server, data_dir.path()).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        sign_in(&state, &server).await;
+        cycle(&mut events).await;
+        store_issue(&state).await;
+
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        // The next poll is three minutes away: only a woken engine ends this
+        // wait before `cycle` gives up
+        while issue(&state).await.1 == SyncStatus::Pending {
+            cycle(&mut events).await;
+        }
+        assert_eq!(issue(&state).await.0, "In Progress");
     }
 
     #[tokio::test]

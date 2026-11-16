@@ -3,7 +3,7 @@
 use crate::runtime::{Core, spawn};
 use app_core::{
     SyncEvent, api,
-    models::{IssueKey, IssueRow, StatusCategory},
+    models::{IssueKey, IssueRow, StatusCategory, SyncStatus},
 };
 use gpui_kit::component::{
     ActiveTheme,
@@ -108,9 +108,14 @@ fn row(
     let muted = cx.theme().muted_foreground;
     let key = issue.key.clone();
     let assignee = issue.assignee_name.as_deref().unwrap_or("Unassigned");
+    // The status is the user's own change and Jira does not have it yet
+    let pending = issue.sync_status == SyncStatus::Pending;
     let label = format!(
-        "{}: {}, {}, {assignee}",
-        issue.key, issue.summary, issue.status
+        "{}: {}, {}{}, {assignee}",
+        issue.key,
+        issue.summary,
+        issue.status,
+        if pending { " (pending)" } else { "" }
     );
     div()
         .id(SharedString::from(format!("issue-{}", issue.key)))
@@ -155,7 +160,11 @@ fn row(
                         StatusCategory::Done => muted,
                         StatusCategory::Todo | StatusCategory::InProgress => cx.theme().foreground,
                     })
-                    .child(issue.status.clone()),
+                    .child(if pending {
+                        format!("↑ {}", issue.status)
+                    } else {
+                        issue.status.clone()
+                    }),
             )
             .child(
                 div()
@@ -235,9 +244,18 @@ pub(crate) mod tests {
     /// The data dir of an app that has finished its initial sync and has
     /// `issues` in its cache.
     pub(crate) fn synced(tokio: &Runtime, issues: &[Value]) -> tempfile::TempDir {
+        synced_on(tokio, "http://localhost", issues)
+    }
+
+    /// `synced` for an app that is signed in to `site_url`.
+    pub(crate) fn synced_on(
+        tokio: &Runtime,
+        site_url: &str,
+        issues: &[Value],
+    ) -> tempfile::TempDir {
         let data_dir = tempfile::tempdir().unwrap();
         let config = json!({
-            "site_url": "http://localhost",
+            "site_url": site_url,
             "email": "ada@example.com",
             "account_id": "5b10a",
             "watched_projects": ["WEB"],

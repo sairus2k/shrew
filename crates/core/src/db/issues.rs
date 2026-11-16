@@ -122,6 +122,7 @@ pub(crate) async fn get_detail(
         r#"
         SELECT key AS "key: IssueKey", summary, status,
                status_category AS "status_category: StatusCategory",
+               sync_status AS "sync_status: SyncStatus",
                assignee_name, issue_type, raw_json
         FROM issues
         WHERE key = ?
@@ -145,6 +146,7 @@ pub(crate) async fn get_detail(
         summary: row.summary,
         status: row.status,
         status_category: row.status_category,
+        sync_status: row.sync_status,
         issue_type: row.issue_type,
         assignee_name: row.assignee_name,
         reporter_name: name(&fields["reporter"]["displayName"]),
@@ -168,6 +170,44 @@ pub(crate) async fn get_detail(
         key: row.key,
         url,
     }))
+}
+
+/// Writes a status the user chose, which Jira has not confirmed yet. Returns
+/// whether the cache has the issue.
+pub(crate) async fn set_pending_status(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+    status: &str,
+    status_category: StatusCategory,
+) -> sqlx::Result<bool> {
+    let written = sqlx::query!(
+        "UPDATE issues SET status = ?, status_category = ?, sync_status = 'pending' WHERE key = ?",
+        status,
+        status_category,
+        key,
+    )
+    .execute(executor)
+    .await?;
+    Ok(written.rows_affected() > 0)
+}
+
+/// Marks the issue as confirmed by Jira, unless the outbox still holds a
+/// change of it that has to be sent.
+pub(crate) async fn confirm(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE issues SET sync_status = 'synced'
+         WHERE key = ? AND sync_status = 'pending' AND NOT EXISTS (
+             SELECT 1 FROM sync_queue
+             WHERE issue_key = issues.key AND status IN ('pending', 'in_progress')
+         )",
+        key,
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 /// What identifies a cached issue, on Jira's side and on ours.

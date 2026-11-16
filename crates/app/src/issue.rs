@@ -5,7 +5,7 @@
 use crate::runtime::{Core, spawn};
 use app_core::{
     SyncEvent, api,
-    models::{IssueDetail, IssueKey},
+    models::{IssueDetail, IssueKey, SyncStatus, Transition},
 };
 use gpui_kit::*;
 
@@ -37,7 +37,7 @@ impl IssueModel {
         this
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
         let key = self.key.clone();
         let load = spawn(cx, move |state| async move {
             api::get_issue(&state, &key).await
@@ -52,5 +52,18 @@ impl IssueModel {
             })
             .ok();
         });
+    }
+
+    /// Shows the issue in the status `transition` leads to before the core
+    /// has stored it.
+    pub fn apply_transition(&mut self, transition: &Transition, cx: &mut Context<Self>) {
+        // A read still in flight would put the old status back
+        self._load = Task::ready(());
+        if let Some(detail) = &mut self.detail {
+            detail.status = transition.to_status.clone();
+            detail.status_category = transition.to_status_category;
+            detail.sync_status = SyncStatus::Pending;
+        }
+        cx.notify();
     }
 }

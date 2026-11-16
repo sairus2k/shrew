@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE issues SET sync_status = 'synced'\n         WHERE key = ? AND sync_status = 'pending' AND NOT EXISTS (\n             SELECT 1 FROM sync_queue\n             WHERE issue_key = issues.key AND status IN ('pending', 'in_progress')\n         )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "f400a24f53c0448a1b8e8cb692cfe45f145d74ae8407d54924eb4f86614c477e"
+}

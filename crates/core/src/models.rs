@@ -55,6 +55,8 @@ pub struct IssueDetail {
     pub summary: String,
     pub status: String,
     pub status_category: StatusCategory,
+    /// `Pending` while a change made here has not reached Jira.
+    pub sync_status: SyncStatus,
     pub issue_type: Option<String>,
     pub assignee_name: Option<String>,
     pub reporter_name: Option<String>,

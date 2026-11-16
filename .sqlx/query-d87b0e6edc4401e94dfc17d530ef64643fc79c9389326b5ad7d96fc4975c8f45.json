@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, issue_type, raw_json\n        FROM issues\n        WHERE key = ?\n        ",
+  "query": "\n        SELECT key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               sync_status AS \"sync_status: SyncStatus\",\n               assignee_name, issue_type, raw_json\n        FROM issues\n        WHERE key = ?\n        ",
   "describe": {
     "columns": [
       {
@@ -24,18 +24,23 @@
         "type_info": "Text"
       },
       {
-        "name": "assignee_name",
+        "name": "sync_status: SyncStatus",
         "ordinal": 4,
         "type_info": "Text"
       },
       {
-        "name": "issue_type",
+        "name": "assignee_name",
         "ordinal": 5,
         "type_info": "Text"
       },
       {
-        "name": "raw_json",
+        "name": "issue_type",
         "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "raw_json",
+        "ordinal": 7,
         "type_info": "Text"
       }
     ],
@@ -47,10 +52,11 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       false
     ]
   },
-  "hash": "83aca1fd1202d12e6865bc60344023ce2d848be5acff028b13402547cdfd6f95"
+  "hash": "d87b0e6edc4401e94dfc17d530ef64643fc79c9389326b5ad7d96fc4975c8f45"
 }

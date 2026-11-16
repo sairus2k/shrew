@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)\n         VALUES (?, ?, 'create', ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "5251bc2777a189e45dcae73c7c3876a9914df55af8d452d2d18c4c031a03bdb3"
+}

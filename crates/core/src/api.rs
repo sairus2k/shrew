@@ -1,7 +1,7 @@
 //! The async functions the UI calls. They need the tokio runtime.
 
 use crate::{
-    AppState, auth, db,
+    AppState, SyncEvent, auth, db,
     models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep, Transition},
     sync::{
         inbound,
@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use anyhow::{Context, bail};
+use serde_json::json;
 
 /// The account the app is signed in to, or `None` when it has no credentials.
 pub async fn account(state: &AppState) -> Option<Account> {
@@ -167,6 +168,40 @@ pub async fn get_transitions(state: &AppState, key: &IssueKey) -> anyhow::Result
     Ok(transitions)
 }
 
+/// Moves the issue to the status `transition` leads to, locally and at once:
+/// Jira gets the change from the outbox. `fields` holds the values of the
+/// transition's required fields, by field id.
+pub async fn transition_issue(
+    state: &AppState,
+    key: &IssueKey,
+    transition: &Transition,
+    fields: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let payload = json!({ "transition": { "id": transition.id }, "fields": fields });
+    // One transaction: a crash must not leave a status Jira will never hear
+    // of, or an outbox entry for a status the user does not see
+    let mut tx = state.pool.begin().await?;
+    let found = db::issues::set_pending_status(
+        &mut *tx,
+        key,
+        &transition.to_status,
+        transition.to_status_category,
+    )
+    .await?;
+    if !found {
+        bail!("issue {key} not found");
+    }
+    db::sync_queue::enqueue(&mut *tx, "transition", key, &payload.to_string()).await?;
+    tx.commit().await?;
+
+    state
+        .events
+        .send(SyncEvent::IssuesUpdated(vec![key.clone()]))
+        .ok();
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
 /// The 50 best matches of `query` in the local cache, best first. Every word
 /// must match a key, a summary or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
@@ -181,7 +216,7 @@ pub async fn search_issues(
 mod tests {
     use super::*;
     use crate::{
-        models::{Comment, StatusCategory},
+        models::{Comment, StatusCategory, SyncStatus},
         start_without_keychain,
     };
     use serde_json::json;
@@ -432,6 +467,7 @@ mod tests {
                 summary: "Fix login".to_owned(),
                 status: "In Review".to_owned(),
                 status_category: StatusCategory::InProgress,
+                sync_status: SyncStatus::Synced,
                 issue_type: Some("Bug".to_owned()),
                 assignee_name: Some("Ada Lovelace".to_owned()),
                 reporter_name: Some("Grace Hopper".to_owned()),
@@ -482,6 +518,97 @@ mod tests {
 
         let error = get_issue(&state, &"WEB-2".into()).await.unwrap_err();
         assert_eq!(error.to_string(), "issue WEB-2 not found");
+    }
+
+    fn start() -> Transition {
+        Transition {
+            id: "21".to_owned(),
+            name: "Start".to_owned(),
+            to_status: "In Progress".to_owned(),
+            to_status_category: StatusCategory::InProgress,
+            required_fields: Vec::new(),
+        }
+    }
+
+    fn todo_issue() -> serde_json::Value {
+        json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        })
+    }
+
+    /// The type and the payload of every outbox entry that waits for Jira.
+    async fn queued(state: &AppState) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT entity_type, payload FROM sync_queue WHERE status = 'pending' ORDER BY id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_transition_changes_the_status_at_once_and_queues_it_for_jira() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+        let fields = json!({ "resolution": { "id": "10000" } });
+
+        transition_issue(&state, &"WEB-1".into(), &start(), &fields)
+            .await
+            .unwrap();
+
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.status, "In Progress");
+        assert_eq!(issue.status_category, StatusCategory::InProgress);
+        assert_eq!(issue.sync_status, SyncStatus::Pending);
+        let queued = queued(&state).await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "transition");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&queued[0].1).unwrap(),
+            json!({ "transition": { "id": "21" }, "fields": fields })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_that_cannot_be_queued_leaves_the_issue_as_it_was() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+        sqlx::query(
+            "CREATE TRIGGER outbox_is_broken BEFORE INSERT ON sync_queue
+             BEGIN SELECT RAISE(ABORT, 'the outbox is broken'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let error = transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("the outbox is broken"),
+            "{error}"
+        );
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.status, "To Do");
+        assert_eq!(issue.sync_status, SyncStatus::Synced);
+    }
+
+    #[tokio::test]
+    async fn a_transition_of_an_issue_the_cache_does_not_have_queues_nothing() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+
+        let error = transition_issue(&state, &"WEB-2".into(), &start(), &json!({}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "issue WEB-2 not found");
+        assert_eq!(queued(&state).await, []);
     }
 
     #[tokio::test]
