@@ -10,4 +10,8 @@ test-support = []
 
 [dependencies]
 anyhow = "1"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,334 @@
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "neither the sync engine nor the API uses the storage yet"
+    )
+)]
+
+use crate::models::{IssueKey, IssueRow, StatusCategory, SyncStatus};
+use sqlx::SqlitePool;
+
+/// An issue as it is written to the cache.
+pub(crate) struct IssueRecord {
+    pub id: String,
+    pub key: IssueKey,
+    pub summary: String,
+    pub description_text: Option<String>,
+    pub status: String,
+    pub status_category: StatusCategory,
+    pub assignee_id: Option<String>,
+    pub assignee_name: Option<String>,
+    pub project_key: String,
+    pub issue_type: Option<String>,
+    pub raw_json: String,
+    // Compared as text to tell a stale write from a fresh one, so every value
+    // must be in the same format and UTC offset
+    pub remote_updated_at: String,
+}
+
+pub(crate) async fn upsert(pool: &SqlitePool, issue: &IssueRecord) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO issues
+            (id, key, summary, description_text, status, status_category,
+             assignee_id, assignee_name, project_key, issue_type, raw_json,
+             remote_updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        -- Conflict on id, not key: a moved issue keeps its id but gets a new key
+        ON CONFLICT(id) DO UPDATE SET
+            key                = excluded.key,
+            project_key        = excluded.project_key,
+            summary            = excluded.summary,
+            description_text   = excluded.description_text,
+            status             = excluded.status,
+            status_category    = excluded.status_category,
+            assignee_id        = excluded.assignee_id,
+            assignee_name      = excluded.assignee_name,
+            issue_type         = excluded.issue_type,
+            raw_json           = excluded.raw_json,
+            remote_updated_at  = excluded.remote_updated_at,
+            sync_status        = 'synced',
+            synced_at          = datetime('now')
+        WHERE excluded.remote_updated_at > issues.remote_updated_at
+        "#,
+        issue.id,
+        issue.key,
+        issue.summary,
+        issue.description_text,
+        issue.status,
+        issue.status_category,
+        issue.assignee_id,
+        issue.assignee_name,
+        issue.project_key,
+        issue.issue_type,
+        issue.raw_json,
+        issue.remote_updated_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Option<IssueRow>> {
+    sqlx::query_as!(
+        IssueRow,
+        r#"
+        SELECT id AS "id!", key AS "key: IssueKey", summary, status,
+               status_category AS "status_category: StatusCategory",
+               assignee_name, project_key,
+               sync_status AS "sync_status: SyncStatus"
+        FROM issues
+        WHERE key = ?
+        "#,
+        key
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Full-text search over key, summary and description, best match first.
+/// Every word of `query` must match, as a whole word, a stem or a prefix.
+pub(crate) async fn search(
+    pool: &SqlitePool,
+    query: &str,
+    project_filter: Option<&str>,
+    limit: i64,
+) -> sqlx::Result<Vec<IssueRow>> {
+    let Some(fts_query) = match_expression(query) else {
+        return Ok(Vec::new());
+    };
+
+    sqlx::query_as!(
+        IssueRow,
+        r#"
+        SELECT i.id AS "id!", i.key AS "key: IssueKey", i.summary, i.status,
+               i.status_category AS "status_category: StatusCategory",
+               i.assignee_name, i.project_key,
+               i.sync_status AS "sync_status: SyncStatus"
+        FROM issues i
+        JOIN issues_fts ON i.rowid = issues_fts.rowid
+        WHERE issues_fts MATCH ?
+          AND (? IS NULL OR i.project_key = ?)
+        ORDER BY issues_fts.rank
+        LIMIT ?
+        "#,
+        fts_query,
+        project_filter,
+        project_filter,
+        limit
+    )
+    .fetch_all(pool)
+    .await
+}
+
+// User input is not FTS5 syntax. Each word becomes a quoted string, so `"`, `*`,
+// `:`, `-`, AND/OR/NOT/NEAR are plain text, and gets a `*` to match by prefix.
+// A word without a letter or digit yields no token and FTS5 rejects an empty
+// expression, so such words are dropped.
+fn match_expression(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue(id: &str, key: &str, updated_at: &str, summary: &str) -> IssueRecord {
+        IssueRecord {
+            id: id.to_owned(),
+            key: key.into(),
+            summary: summary.to_owned(),
+            description_text: None,
+            status: "To Do".to_owned(),
+            status_category: StatusCategory::Todo,
+            assignee_id: None,
+            assignee_name: None,
+            project_key: key.split('-').next().unwrap().to_owned(),
+            issue_type: Some("Task".to_owned()),
+            raw_json: "{}".to_owned(),
+            remote_updated_at: updated_at.to_owned(),
+        }
+    }
+
+    const T1: &str = "2026-01-01T10:00:00.000Z";
+    const T2: &str = "2026-01-02T10:00:00.000Z";
+
+    async fn seed(pool: &SqlitePool, issues: &[(&str, &str)]) {
+        for (n, (key, summary)) in issues.iter().enumerate() {
+            upsert(pool, &issue(&format!("id-{n}"), key, T1, summary))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn found(pool: &SqlitePool, query: &str, project: Option<&str>) -> Vec<String> {
+        let rows = search(pool, query, project, 10).await.unwrap();
+        rows.iter().map(|row| row.key.to_string()).collect()
+    }
+
+    #[sqlx::test]
+    async fn upsert_ignores_stale_remote(pool: SqlitePool) {
+        upsert(&pool, &issue("1", "PROJ-1", T2, "current title"))
+            .await
+            .unwrap();
+        upsert(&pool, &issue("1", "PROJ-1", T1, "stale title"))
+            .await
+            .unwrap();
+
+        let row = get(&pool, &"PROJ-1".into()).await.unwrap().unwrap();
+        assert_eq!(row.summary, "current title");
+        assert_eq!(found(&pool, "stale", None).await, [] as [&str; 0]);
+    }
+
+    #[sqlx::test]
+    async fn upsert_applies_newer_remote(pool: SqlitePool) {
+        upsert(&pool, &issue("1", "PROJ-1", T1, "old title"))
+            .await
+            .unwrap();
+        let newer = IssueRecord {
+            status: "Done".to_owned(),
+            status_category: StatusCategory::Done,
+            ..issue("1", "PROJ-1", T2, "new title")
+        };
+        upsert(&pool, &newer).await.unwrap();
+
+        let row = get(&pool, &"PROJ-1".into()).await.unwrap().unwrap();
+        assert_eq!(row.summary, "new title");
+        assert_eq!(row.status_category, StatusCategory::Done);
+        assert_eq!(row.sync_status, SyncStatus::Synced);
+    }
+
+    #[sqlx::test]
+    async fn upsert_follows_moved_issue(pool: SqlitePool) {
+        upsert(&pool, &issue("1", "PROJ-1", T1, "title"))
+            .await
+            .unwrap();
+        // Same Jira id, new key: the issue was moved to another watched project
+        upsert(&pool, &issue("1", "OTHER-7", T2, "title"))
+            .await
+            .unwrap();
+
+        assert!(get(&pool, &"PROJ-1".into()).await.unwrap().is_none());
+        let moved = get(&pool, &"OTHER-7".into()).await.unwrap().unwrap();
+        assert_eq!(moved.project_key, "OTHER");
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM issues")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    async fn fts_index_follows_insert_update_and_delete(pool: SqlitePool) {
+        upsert(&pool, &issue("1", "PROJ-1", T1, "Broken login"))
+            .await
+            .unwrap();
+        assert_eq!(found(&pool, "login", None).await, ["PROJ-1"]);
+
+        upsert(&pool, &issue("1", "PROJ-1", T2, "Broken checkout"))
+            .await
+            .unwrap();
+        assert_eq!(found(&pool, "login", None).await, [] as [&str; 0]);
+        assert_eq!(found(&pool, "checkout", None).await, ["PROJ-1"]);
+
+        sqlx::query!("DELETE FROM issues WHERE id = '1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(found(&pool, "checkout", None).await, [] as [&str; 0]);
+        // Fails if the index and the content table disagree
+        sqlx::query("INSERT INTO issues_fts(issues_fts, rank) VALUES ('integrity-check', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn search_matches_by_prefix(pool: SqlitePool) {
+        seed(&pool, &[("PROJ-1", "Fix authentication failure")]).await;
+
+        assert_eq!(found(&pool, "auth", None).await, ["PROJ-1"]);
+        assert_eq!(found(&pool, "fix fail", None).await, ["PROJ-1"]);
+        assert_eq!(found(&pool, "fix payment", None).await, [] as [&str; 0]);
+    }
+
+    #[sqlx::test]
+    async fn search_matches_by_porter_stem(pool: SqlitePool) {
+        seed(&pool, &[("PROJ-1", "Fix authentication failure")]).await;
+
+        assert_eq!(found(&pool, "authenticating", None).await, ["PROJ-1"]);
+    }
+
+    #[sqlx::test]
+    async fn search_matches_by_issue_key_and_description(pool: SqlitePool) {
+        seed(&pool, &[("PROJ-1", "First"), ("PROJ-12", "Second")]).await;
+        let described = IssueRecord {
+            description_text: Some("Stack trace attached".to_owned()),
+            ..issue("d", "PROJ-3", T1, "Third")
+        };
+        upsert(&pool, &described).await.unwrap();
+
+        let mut by_key = found(&pool, "PROJ-1", None).await;
+        by_key.sort();
+        assert_eq!(by_key, ["PROJ-1", "PROJ-12"]);
+        assert_eq!(found(&pool, "trace", None).await, ["PROJ-3"]);
+    }
+
+    #[sqlx::test]
+    async fn search_can_be_limited_to_one_project(pool: SqlitePool) {
+        seed(&pool, &[("PROJ-1", "Login page"), ("OTHER-1", "Login API")]).await;
+
+        assert_eq!(found(&pool, "login", None).await.len(), 2);
+        assert_eq!(found(&pool, "login", Some("OTHER")).await, ["OTHER-1"]);
+    }
+
+    #[sqlx::test]
+    async fn search_treats_quotes_and_fts5_operators_as_text(pool: SqlitePool) {
+        seed(
+            &pool,
+            &[("PROJ-1", "Login AND logout near the \"home\" page")],
+        )
+        .await;
+
+        for query in [
+            "\"",
+            "\"home",
+            "say \"home\" page",
+            "login AND",
+            "AND",
+            "OR login",
+            "NOT",
+            "NEAR(login logout)",
+            "login*",
+            "*",
+            "summary:login",
+            "key : PROJ",
+            "-login",
+            "^login",
+            "(login",
+            "login)",
+            "{login logout}",
+            "lo+gin",
+            "'; DROP TABLE issues; --",
+            "",
+            "   ",
+        ] {
+            search(&pool, query, None, 10)
+                .await
+                .unwrap_or_else(|err| panic!("query {query:?} failed: {err}"));
+        }
+
+        assert_eq!(found(&pool, "\"home\"", None).await, ["PROJ-1"]);
+        assert_eq!(found(&pool, "login AND", None).await, ["PROJ-1"]);
+        assert_eq!(
+            found(&pool, "login NOT logout", None).await,
+            [] as [&str; 0]
+        );
+    }
+}

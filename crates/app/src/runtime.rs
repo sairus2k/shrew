@@ -54,15 +54,17 @@ mod tests {
     use app_core::SyncEvent;
     use gpui_kit::{AppContext, Context, Render, TestAppContext, Window, div};
 
-    // The returned runtime must outlive the test body
-    fn init_core(cx: &mut TestAppContext) -> tokio::runtime::Runtime {
+    // The returned runtime and data dir must outlive the test body
+    fn init_core(cx: &mut TestAppContext) -> (tokio::runtime::Runtime, tempfile::TempDir) {
         let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
-        let data_dir = std::env::temp_dir().join(format!("app-test-{}", std::process::id()));
-        let (state, events) = tokio.block_on(app_core::start(&data_dir)).unwrap();
+        // Each test gets its own database: tests run in parallel, and two of them
+        // migrating the same file would race
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, events) = tokio.block_on(app_core::start(data_dir.path())).unwrap();
         let handle = tokio.handle().clone();
         cx.update(|cx| {
             let sync = cx.new(|cx| SyncBridge::new(events, cx));
@@ -72,7 +74,7 @@ mod tests {
                 sync,
             });
         });
-        tokio
+        (tokio, data_dir)
     }
 
     struct Probe {
@@ -98,7 +100,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn spawn_runs_a_future_on_tokio_and_returns_its_result(cx: &mut TestAppContext) {
-        let _tokio = init_core(cx);
+        let _core = init_core(cx);
         // The tokio side is outside GPUI's deterministic scheduler
         cx.executor().allow_parking();
 
@@ -114,7 +116,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn a_core_event_reaches_a_view_subscribed_to_the_bridge(cx: &mut TestAppContext) {
-        let _tokio = init_core(cx);
+        let _core = init_core(cx);
         let probe = cx.new(Probe::new);
 
         cx.update(|cx| cx.global::<Core>().state.emit(SyncEvent::Started));

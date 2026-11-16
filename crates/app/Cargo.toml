@@ -14,3 +14,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 [dev-dependencies]
 app-core = { path = "../core", features = ["test-support"] }
 gpui-kit = { version = "0.9.1", features = ["test-support"] }
+tempfile = "3"

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT i.id AS \"id!\", i.key AS \"key: IssueKey\", i.summary, i.status,\n               i.status_category AS \"status_category: StatusCategory\",\n               i.assignee_name, i.project_key,\n               i.sync_status AS \"sync_status: SyncStatus\"\n        FROM issues i\n        JOIN issues_fts ON i.rowid = issues_fts.rowid\n        WHERE issues_fts MATCH ?\n          AND (? IS NULL OR i.project_key = ?)\n        ORDER BY issues_fts.rank\n        LIMIT ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key: IssueKey",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "summary",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "status_category: StatusCategory",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "assignee_name",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_key",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "sync_status: SyncStatus",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "c8b45e067e884071da80993850b72965d746a769674f8d4ea64e759e9647a0d8"
+}

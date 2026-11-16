@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id AS \"id!\", key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, project_key,\n               sync_status AS \"sync_status: SyncStatus\"\n        FROM issues\n        WHERE key = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key: IssueKey",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "summary",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "status_category: StatusCategory",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "assignee_name",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_key",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "sync_status: SyncStatus",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "2c83492aa01eb001e7c4059142d9fc7548cde06947783e33110b54be3120ffbb"
+}

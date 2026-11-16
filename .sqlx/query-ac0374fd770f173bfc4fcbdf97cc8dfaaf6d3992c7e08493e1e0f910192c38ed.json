@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM issues WHERE id = '1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "ac0374fd770f173bfc4fcbdf97cc8dfaaf6d3992c7e08493e1e0f910192c38ed"
+}
