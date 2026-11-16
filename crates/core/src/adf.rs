@@ -1,14 +1,6 @@
 //! Atlassian Document Format, the JSON that Jira v3 uses for descriptions and
 //! comments, converted to plain text for the FTS index and to Markdown for display.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the issue detail does not convert ADF to Markdown yet"
-    )
-)]
-
 use serde_json::Value;
 
 /// The text of every text node, one block per line.

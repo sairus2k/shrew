@@ -3,20 +3,28 @@
 use crate::runtime::{Core, spawn};
 use app_core::{
     SyncEvent, api,
-    models::{IssueRow, StatusCategory},
+    models::{IssueKey, IssueRow, StatusCategory},
 };
 use gpui_kit::component::{
     ActiveTheme,
     input::{Input, InputEvent, InputState},
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::ops::Range;
+
+/// Emitted when the user picks an issue to read.
+pub struct IssueOpened(pub IssueKey);
 
 pub struct IssueList {
     query: Entity<InputState>,
     issues: Vec<IssueRow>,
+    // The issue shown beside the list
+    opened: Option<IssueKey>,
     loading: Task<()>,
 }
+
+impl EventEmitter<IssueOpened> for IssueList {}
 
 impl IssueList {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -38,10 +46,23 @@ impl IssueList {
         let mut this = Self {
             query,
             issues: Vec::new(),
+            opened: None,
             loading: Task::ready(()),
         };
         this.reload(cx);
         this
+    }
+
+    fn open(&mut self, key: IssueKey, cx: &mut Context<Self>) {
+        self.opened = Some(key.clone());
+        cx.emit(IssueOpened(key));
+        cx.notify();
+    }
+
+    /// The issue beside the list was closed.
+    pub fn closed(&mut self, cx: &mut Context<Self>) {
+        self.opened = None;
+        cx.notify();
     }
 
     // No debounce: an FTS5 query takes a few milliseconds and there is no IPC hop
@@ -74,13 +95,18 @@ impl IssueList {
     fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         self.issues[range]
             .iter()
-            .map(|issue| row(issue, cx).into_any_element())
+            .map(|issue| row(issue, self.opened.as_ref(), cx).into_any_element())
             .collect()
     }
 }
 
-fn row(issue: &IssueRow, cx: &App) -> impl IntoElement + use<> {
+fn row(
+    issue: &IssueRow,
+    opened: Option<&IssueKey>,
+    cx: &mut Context<IssueList>,
+) -> impl IntoElement + use<> {
     let muted = cx.theme().muted_foreground;
+    let key = issue.key.clone();
     let assignee = issue.assignee_name.as_deref().unwrap_or("Unassigned");
     let label = format!(
         "{}: {}, {}, {assignee}",
@@ -98,6 +124,10 @@ fn row(issue: &IssueRow, cx: &App) -> impl IntoElement + use<> {
         .flex()
         .items_center()
         .gap_3()
+        .when(opened == Some(&issue.key), |row| {
+            row.bg(cx.theme().list_active)
+        })
+        .on_click(cx.listener(move |this, _, _, cx| this.open(key.clone(), cx)))
         .child(
             div()
                 .w(px(96.))
@@ -113,25 +143,29 @@ fn row(issue: &IssueRow, cx: &App) -> impl IntoElement + use<> {
                 .truncate()
                 .child(issue.summary.clone()),
         )
-        .child(
-            div()
-                .w(px(120.))
-                .flex_none()
-                .truncate()
-                .text_color(match issue.status_category {
-                    StatusCategory::Done => muted,
-                    StatusCategory::Todo | StatusCategory::InProgress => cx.theme().foreground,
-                })
-                .child(issue.status.clone()),
-        )
-        .child(
-            div()
-                .w(px(140.))
-                .flex_none()
-                .truncate()
-                .text_color(muted)
-                .child(assignee.to_owned()),
-        )
+        // Beside an open issue the list is too narrow for these two, and the
+        // issue itself shows them
+        .when(opened.is_none(), |row| {
+            row.child(
+                div()
+                    .w(px(120.))
+                    .flex_none()
+                    .truncate()
+                    .text_color(match issue.status_category {
+                        StatusCategory::Done => muted,
+                        StatusCategory::Todo | StatusCategory::InProgress => cx.theme().foreground,
+                    })
+                    .child(issue.status.clone()),
+            )
+            .child(
+                div()
+                    .w(px(140.))
+                    .flex_none()
+                    .truncate()
+                    .text_color(muted)
+                    .child(assignee.to_owned()),
+            )
+        })
 }
 
 impl Render for IssueList {
@@ -162,7 +196,7 @@ impl Render for IssueList {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::IssueList;
     use crate::runtime::{Core, tests::init_core};
     use crate::sign_in::tests::{in_window, launch, tokio_runtime, wait_until};
@@ -177,7 +211,7 @@ mod tests {
     use tokio::{runtime::Runtime, sync::oneshot};
 
     /// An unassigned WEB issue in To Do. A higher `id` was changed later.
-    fn issue(id: u32, summary: &str) -> Value {
+    pub(crate) fn issue(id: u32, summary: &str) -> Value {
         json!({
             "id": id.to_string(),
             "key": format!("WEB-{id}"),
@@ -200,7 +234,7 @@ mod tests {
 
     /// The data dir of an app that has finished its initial sync and has
     /// `issues` in its cache.
-    fn synced(tokio: &Runtime, issues: &[Value]) -> tempfile::TempDir {
+    pub(crate) fn synced(tokio: &Runtime, issues: &[Value]) -> tempfile::TempDir {
         let data_dir = tempfile::tempdir().unwrap();
         let config = json!({
             "site_url": "http://localhost",
@@ -221,7 +255,7 @@ mod tests {
     }
 
     /// What the sync engine does when Jira reports a new or changed issue.
-    fn sync_brings(cx: &mut TestAppContext, tokio: &Runtime, issue: Value) {
+    pub(crate) fn sync_brings(cx: &mut TestAppContext, tokio: &Runtime, issue: Value) {
         let state = cx.update(|cx| cx.global::<Core>().state.clone());
         let key = issue["key"].as_str().unwrap().into();
         tokio.block_on(state.store_issues(&[issue])).unwrap();
@@ -229,7 +263,7 @@ mod tests {
     }
 
     /// The rows on screen, top to bottom.
-    fn rows(window: &Window) -> Vec<String> {
+    pub(crate) fn rows(window: &Window) -> Vec<String> {
         window
             .find_all_by_role(Role::ListItem)
             .iter()

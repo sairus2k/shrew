@@ -2,7 +2,7 @@
 
 use crate::{
     AppState, auth, db,
-    models::{Account, IssueRow, Project, SetupStep},
+    models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep},
     sync::{
         inbound,
         jira_client::{JiraClient, JiraError},
@@ -110,6 +110,17 @@ pub async fn list_issues(state: &AppState) -> anyhow::Result<Vec<IssueRow>> {
     Ok(db::issues::list(&state.pool).await?)
 }
 
+/// One issue from the local cache, with its description and comments as Markdown.
+pub async fn get_issue(state: &AppState, key: &IssueKey) -> anyhow::Result<IssueDetail> {
+    let site_url = match &*state.config.read().await {
+        Some(config) => config.site_url.clone(),
+        None => bail!("Sign in first"),
+    };
+    db::issues::get_detail(&state.pool, key, &site_url)
+        .await?
+        .with_context(|| format!("issue {key} not found"))
+}
+
 /// The 50 best matches of `query` in the local cache, best first. Every word
 /// must match a key, a summary or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
@@ -123,7 +134,10 @@ pub async fn search_issues(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::start_without_keychain;
+    use crate::{
+        models::{Comment, StatusCategory},
+        start_without_keychain,
+    };
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -298,6 +312,129 @@ mod tests {
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
 
         assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+    }
+
+    fn paragraph(text: &str) -> serde_json::Value {
+        json!({
+            "type": "doc",
+            "version": 1,
+            "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": text }] }],
+        })
+    }
+
+    /// A signed-in core whose cache holds `issue`, an element of a search page.
+    async fn core_with(issue: serde_json::Value) -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        let record = inbound::issue_record(&issue).unwrap();
+        db::issues::upsert(&state.pool, &record).await.unwrap();
+        (data_dir, state)
+    }
+
+    #[tokio::test]
+    async fn an_issue_is_read_with_its_fields_description_and_comments() {
+        let (_data_dir, state) = core_with(json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "description": paragraph("Login *fails*"),
+                "status": { "name": "In Review", "statusCategory": { "key": "indeterminate" } },
+                "assignee": { "accountId": "5b10a", "displayName": "Ada Lovelace" },
+                "reporter": { "accountId": "7c20b", "displayName": "Grace Hopper" },
+                "priority": { "name": "High" },
+                "labels": ["auth", "regression"],
+                "comment": {
+                    "total": 3,
+                    "comments": [
+                        {
+                            "author": { "accountId": "7c20b", "displayName": "Grace Hopper" },
+                            "created": "2026-03-28T09:15:00.000+0100",
+                            "body": paragraph("Seen on staging"),
+                        },
+                        {
+                            "author": { "accountId": "5b10a", "displayName": "Ada Lovelace" },
+                            "created": "2026-03-29T01:30:00.000+0100",
+                            "body": paragraph("Fixed"),
+                        },
+                    ],
+                },
+                "project": { "key": "WEB" },
+                "issuetype": { "name": "Bug" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        }))
+        .await;
+        let site_url = account(&state).await.unwrap().site_url;
+
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+
+        let comment = |author: &str, created: &str, body: &str| Comment {
+            author_name: author.to_owned(),
+            created: created.to_owned(),
+            body_md: body.to_owned(),
+        };
+        assert_eq!(
+            issue,
+            IssueDetail {
+                key: "WEB-1".into(),
+                summary: "Fix login".to_owned(),
+                status: "In Review".to_owned(),
+                status_category: StatusCategory::InProgress,
+                issue_type: Some("Bug".to_owned()),
+                assignee_name: Some("Ada Lovelace".to_owned()),
+                reporter_name: Some("Grace Hopper".to_owned()),
+                priority: Some("High".to_owned()),
+                labels: vec!["auth".to_owned(), "regression".to_owned()],
+                description_md: "Login \\*fails\\*".to_owned(),
+                comments: vec![
+                    comment(
+                        "Grace Hopper",
+                        "2026-03-28T09:15:00.000+0100",
+                        "Seen on staging"
+                    ),
+                    comment("Ada Lovelace", "2026-03-29T01:30:00.000+0100", "Fixed"),
+                ],
+                comment_total: 3,
+                url: format!("{site_url}/browse/WEB-1"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_issue_without_the_optional_fields_is_read_with_them_empty() {
+        // What a cache filled before the detail view existed holds, too
+        let (_data_dir, state) = core_with(json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "description": null,
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "assignee": null,
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        }))
+        .await;
+
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+
+        assert_eq!(issue.issue_type, None);
+        assert_eq!(issue.assignee_name, None);
+        assert_eq!(issue.reporter_name, None);
+        assert_eq!(issue.priority, None);
+        assert_eq!(issue.labels, [] as [&str; 0]);
+        assert_eq!(issue.description_md, "");
+        assert_eq!(issue.comments, []);
+        assert_eq!(issue.comment_total, 0);
+
+        let error = get_issue(&state, &"WEB-2".into()).await.unwrap_err();
+        assert_eq!(error.to_string(), "issue WEB-2 not found");
     }
 
     #[tokio::test]

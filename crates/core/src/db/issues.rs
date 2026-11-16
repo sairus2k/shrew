@@ -1,5 +1,9 @@
-use crate::models::{IssueKey, IssueRow, StatusCategory, SyncStatus};
+use crate::{
+    adf,
+    models::{Comment, IssueDetail, IssueKey, IssueRow, StatusCategory, SyncStatus},
+};
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde_json::Value;
 use sqlx::SqlitePool;
 
 /// The moment Jira last changed an issue.
@@ -87,7 +91,7 @@ pub(crate) async fn upsert(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the issue detail view is not built yet")
+    expect(dead_code, reason = "only the tests read one issue as a list row")
 )]
 pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Option<IssueRow>> {
     sqlx::query_as!(
@@ -104,6 +108,64 @@ pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Optio
     )
     .fetch_optional(pool)
     .await
+}
+
+/// `site_url` is the Jira site the cache was filled from.
+pub(crate) async fn get_detail(
+    pool: &SqlitePool,
+    key: &IssueKey,
+    site_url: &str,
+) -> sqlx::Result<Option<IssueDetail>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT key AS "key: IssueKey", summary, status,
+               status_category AS "status_category: StatusCategory",
+               assignee_name, issue_type, raw_json
+        FROM issues
+        WHERE key = ?
+        "#,
+        key
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    // The columns win over `raw_json` where both have a value: a local change
+    // updates the columns before Jira confirms it. The rest has no column.
+    let raw: Value = serde_json::from_str(&row.raw_json).unwrap_or_default();
+    let fields = &raw["fields"];
+    let name = |value: &Value| value.as_str().map(str::to_owned);
+    let url = format!("{site_url}/browse/{}", row.key);
+    let comments = fields["comment"]["comments"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    Ok(Some(IssueDetail {
+        summary: row.summary,
+        status: row.status,
+        status_category: row.status_category,
+        issue_type: row.issue_type,
+        assignee_name: row.assignee_name,
+        reporter_name: name(&fields["reporter"]["displayName"]),
+        priority: name(&fields["priority"]["name"]),
+        labels: fields["labels"]
+            .as_array()
+            .map(|labels| labels.iter().filter_map(name).collect())
+            .unwrap_or_default(),
+        description_md: adf::to_markdown(fields.get("description"), &url),
+        comment_total: fields["comment"]["total"]
+            .as_u64()
+            .map_or(comments.len(), |total| total as usize),
+        comments: comments
+            .iter()
+            .map(|comment| Comment {
+                author_name: name(&comment["author"]["displayName"]).unwrap_or_default(),
+                created: name(&comment["created"]).unwrap_or_default(),
+                body_md: adf::to_markdown(comment.get("body"), &url),
+            })
+            .collect(),
+        key: row.key,
+        url,
+    }))
 }
 
 /// Every cached issue, the one Jira changed last first.

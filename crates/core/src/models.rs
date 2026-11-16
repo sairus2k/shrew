@@ -46,6 +46,38 @@ pub struct IssueRow {
     pub sync_status: SyncStatus,
 }
 
+/// One issue with everything the detail view shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueDetail {
+    pub key: IssueKey,
+    pub summary: String,
+    pub status: String,
+    pub status_category: StatusCategory,
+    pub issue_type: Option<String>,
+    pub assignee_name: Option<String>,
+    pub reporter_name: Option<String>,
+    pub priority: Option<String>,
+    pub labels: Vec<String>,
+    /// Markdown. Empty when the issue has no description.
+    pub description_md: String,
+    /// Oldest first.
+    pub comments: Vec<Comment>,
+    /// How many comments the issue has in Jira. Jira sends only part of a long
+    /// thread with a search page, so this can be more than `comments.len()`.
+    pub comment_total: usize,
+    /// The page of the issue in Jira.
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    pub author_name: String,
+    /// As Jira sent it, in the time zone of the account: `2026-03-29T01:30:00.000+0100`.
+    pub created: String,
+    /// Markdown.
+    pub body_md: String,
+}
+
 /// The Jira account the app is signed in to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
