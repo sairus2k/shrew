@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sync_queue SET status = 'synced', error_msg = NULL, synced_at = datetime('now')\n         WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d600be2b81ab69ec9c5f9894af7e5676437e7e7e0ef6882c1718fbaaa8d212c4"
+}

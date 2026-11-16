@@ -1,0 +1,511 @@
+//! Local changes going out to Jira: the processor of the `sync_queue` outbox.
+
+use crate::{
+    AppState, SyncEvent,
+    auth::Config,
+    db::sync_queue::{self, QueueEntry},
+    models::IssueKey,
+    sync::jira_client::{JiraClient, JiraError},
+};
+use reqwest::StatusCode;
+use std::time::Duration;
+
+const MAX_RETRIES: i64 = 3;
+// The wait before the first retry; each later one waits twice as long. The
+// tests go through every retry, so they cannot wait whole seconds.
+const BACKOFF_BASE: Duration = Duration::from_millis(if cfg!(test) { 10 } else { 1000 });
+
+enum Failure {
+    /// Jira could not be asked: the entry is as deliverable as before.
+    NotAsked,
+    /// Jira may accept the same request later.
+    Transient,
+    /// Jira will answer the same request the same way.
+    Rejected,
+}
+
+/// Sends the queued changes to Jira, oldest first, and adds the keys of the
+/// issues whose changes Jira accepted to `delivered`. An entry Jira rejects is
+/// marked `failed` and announced with `SyncEvent::Error`, and the pass goes on.
+/// The pass ends with an error when Jira cannot be reached or rejects the
+/// token: the entries then stay `pending` for a later pass.
+pub(crate) async fn process_queue(
+    state: &AppState,
+    config: &Config,
+    delivered: &mut Vec<IssueKey>,
+) -> anyhow::Result<()> {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    // A retried entry is claimed again: it is still the oldest one
+    while let Some(entry) = sync_queue::claim_next(&state.pool).await? {
+        let Err(error) = deliver(&client, &entry).await else {
+            sync_queue::mark_synced(&state.pool, entry.id).await?;
+            if !delivered.contains(&entry.issue_key) {
+                delivered.push(entry.issue_key);
+            }
+            continue;
+        };
+        let message = format!("{error:#}");
+        match failure(&error) {
+            Failure::NotAsked => {
+                sync_queue::release(&state.pool, entry.id).await?;
+                return Err(error);
+            }
+            Failure::Transient if entry.retry_count < MAX_RETRIES => {
+                sync_queue::release_for_retry(&state.pool, entry.id, &message).await?;
+                tokio::time::sleep(BACKOFF_BASE * 2u32.pow(entry.retry_count as u32)).await;
+            }
+            Failure::Transient | Failure::Rejected => {
+                sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
+                let event = SyncEvent::Error(format!("{}: {message}", entry.issue_key));
+                state.events.send(event).ok();
+            }
+        }
+    }
+    Ok(())
+}
+
+// The request is built here, not when the entry is queued: the entry holds
+// what the user did, and how that reaches Jira can depend on the settings at
+// the time of delivery.
+async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<()> {
+    let payload = serde_json::from_str(&entry.payload)?;
+    match entry.entity_type.as_str() {
+        "transition" => client.transition_issue(&entry.issue_key, &payload).await?,
+        other => anyhow::bail!("unknown outbox entry type `{other}`"),
+    }
+    Ok(())
+}
+
+fn failure(error: &anyhow::Error) -> Failure {
+    match error.downcast_ref() {
+        Some(JiraError::Unauthorized | JiraError::Http(_)) => Failure::NotAsked,
+        Some(JiraError::Status(status, _))
+            if status.is_server_error()
+                || matches!(
+                    *status,
+                    StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+                ) =>
+        {
+            Failure::Transient
+        }
+        _ => Failure::Rejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{api, start_syncing_without_keychain, start_without_keychain, sync::inbound};
+    use serde_json::{Value, json};
+    use std::{path::Path, sync::Arc};
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{basic_auth, method, path},
+    };
+
+    const TOKEN: &str = "secret-token";
+
+    fn config(site_url: &str) -> Config {
+        Config {
+            site_url: site_url.to_owned(),
+            email: "ada@example.com".to_owned(),
+            account_id: "5b10a".to_owned(),
+            watched_projects: vec!["WEB".to_owned()],
+            last_sync_at: Some(inbound::now_ms().unwrap()),
+            last_reconcile_at: 0,
+            api_token: TOKEN.to_owned(),
+        }
+    }
+
+    /// Queues the transition `transition_id` of `key` and returns the entry's id.
+    async fn enqueue(state: &AppState, key: &str, transition_id: &str) -> i64 {
+        let payload = json!({ "transition": { "id": transition_id }, "fields": {} });
+        sqlx::query_scalar(
+            "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)
+             VALUES ('transition', ?, 'create', ?) RETURNING id",
+        )
+        .bind(key)
+        .bind(payload.to_string())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// The status, the retry count and the error of an entry.
+    async fn entry(state: &AppState, id: i64) -> (String, i64, Option<String>) {
+        sqlx::query_as("SELECT status, retry_count, error_msg FROM sync_queue WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Jira's transition call for `key`.
+    fn transition(key: &str) -> wiremock::MockBuilder {
+        Mock::given(method("POST")).and(path(format!("/rest/api/3/issue/{key}/transitions")))
+    }
+
+    /// The paths and bodies of the requests Jira received, in order.
+    async fn requests(server: &MockServer) -> Vec<(String, Value)> {
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .map(|request| {
+                let body = serde_json::from_slice(&request.body).unwrap_or_default();
+                (request.url.path().to_owned(), body)
+            })
+            .collect()
+    }
+
+    fn received(events: &mut UnboundedReceiver<SyncEvent>) -> Vec<String> {
+        let mut received = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            received.push(format!("{event:?}"));
+        }
+        received
+    }
+
+    fn keys(keys: &[&str]) -> Vec<IssueKey> {
+        keys.iter().map(|key| IssueKey::from(*key)).collect()
+    }
+
+    #[tokio::test]
+    async fn entries_are_delivered_in_creation_order() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        for key in ["WEB-1", "WEB-2"] {
+            transition(key)
+                .and(basic_auth("ada@example.com", TOKEN))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+        }
+        let first = enqueue(&state, "WEB-2", "11").await;
+        let second = enqueue(&state, "WEB-1", "21").await;
+        let third = enqueue(&state, "WEB-2", "31").await;
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        let sent: Vec<_> = requests(&server)
+            .await
+            .into_iter()
+            .map(|(path, body)| (path, body["transition"]["id"].clone()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    "/rest/api/3/issue/WEB-2/transitions".to_owned(),
+                    json!("11")
+                ),
+                (
+                    "/rest/api/3/issue/WEB-1/transitions".to_owned(),
+                    json!("21")
+                ),
+                (
+                    "/rest/api/3/issue/WEB-2/transitions".to_owned(),
+                    json!("31")
+                ),
+            ]
+        );
+        assert_eq!(delivered, keys(&["WEB-2", "WEB-1"]));
+        for id in [first, second, third] {
+            assert_eq!(entry(&state, id).await, ("synced".to_owned(), 0, None));
+        }
+        let unstamped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue WHERE synced_at IS NULL")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(unstamped, 0);
+        assert!(received(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_entry_is_retried_until_jira_accepts_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let id = enqueue(&state, "WEB-1", "11").await;
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(entry(&state, id).await, ("synced".to_owned(), 2, None));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert!(received(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_entry_that_keeps_failing_is_given_up_after_three_retries() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        // The first attempt and three retries
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(503).set_body_string("down for maintenance"))
+            .expect(4)
+            .mount(&server)
+            .await;
+        transition("WEB-2")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let failing = enqueue(&state, "WEB-1", "11").await;
+        let next = enqueue(&state, "WEB-2", "21").await;
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        let error = "Jira returned 503 Service Unavailable: down for maintenance";
+        assert_eq!(
+            entry(&state, failing).await,
+            ("failed".to_owned(), 3, Some(error.to_owned()))
+        );
+        assert_eq!(
+            received(&mut events),
+            [format!("Error({:?})", format!("WEB-1: {error}"))]
+        );
+        // The entries behind it are not held up
+        assert_eq!(entry(&state, next).await.0, "synced");
+        assert_eq!(delivered, keys(&["WEB-2"]));
+
+        // A later pass leaves the failed entry alone
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_entry_jira_rejects_fails_without_a_retry() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("no such transition"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let id = enqueue(&state, "WEB-1", "11").await;
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        let error = "Jira returned 400 Bad Request: no such transition";
+        assert_eq!(
+            entry(&state, id).await,
+            ("failed".to_owned(), 0, Some(error.to_owned()))
+        );
+        assert_eq!(
+            received(&mut events),
+            [format!("Error({:?})", format!("WEB-1: {error}"))]
+        );
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn entries_wait_while_jira_is_unreachable() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        let id = enqueue(&state, "WEB-1", "11").await;
+        // A port that was free a moment ago: nothing listens on it. A dropped
+        // `MockServer` would not do, wiremock keeps its listener for reuse.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let offline = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut delivered = Vec::new();
+        let error = process_queue(&state, &config(&offline), &mut delivered)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error.downcast_ref(), Some(JiraError::Http(_))));
+        assert_eq!(entry(&state, id).await, ("pending".to_owned(), 0, None));
+
+        let server = MockServer::start().await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(entry(&state, id).await, ("synced".to_owned(), 0, None));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert!(received(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_entry_interrupted_by_a_crash_is_delivered_after_the_restart() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        let interrupted = enqueue(&state, "WEB-1", "11").await;
+        let waiting = enqueue(&state, "WEB-2", "21").await;
+        // The app went down between claiming the first entry and Jira's answer
+        claim(&state).await;
+        state.pool.close().await;
+
+        for key in ["WEB-1", "WEB-2"] {
+            transition(key)
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(entry(&state, interrupted).await.0, "synced");
+        assert_eq!(entry(&state, waiting).await.0, "synced");
+        assert_eq!(delivered, keys(&["WEB-1", "WEB-2"]));
+    }
+
+    async fn claim(state: &AppState) {
+        let claimed = sync_queue::claim_next(&state.pool).await.unwrap().unwrap();
+        assert_eq!(entry(state, claimed.id).await.0, "in_progress");
+    }
+
+    /// A core with a running sync engine that has finished the initial sync
+    /// with `server`, where no search finds anything. The engine sees the
+    /// account only once `sign_in` is called, so a test can queue entries first.
+    async fn syncing(
+        server: &MockServer,
+        data_dir: &Path,
+    ) -> (Arc<AppState>, UnboundedReceiver<SyncEvent>) {
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [] })))
+            .mount(server)
+            .await;
+        start_syncing_without_keychain(data_dir).await.unwrap()
+    }
+
+    async fn sign_in(state: &AppState, server: &MockServer) {
+        *state.config.write().await = Some(config(&server.uri()));
+        state.sync_waker.send(()).unwrap();
+    }
+
+    /// The events of one sync cycle, up to the one that ends it.
+    async fn cycle(events: &mut UnboundedReceiver<SyncEvent>) -> Vec<String> {
+        let mut cycle = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("the sync cycle did not end")
+                .unwrap();
+            let last = matches!(event, SyncEvent::Completed | SyncEvent::TokenRejected);
+            cycle.push(format!("{event:?}"));
+            if last {
+                return cycle;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_cycle_flushes_the_queue_before_it_polls() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = syncing(&server, data_dir.path()).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let id = enqueue(&state, "WEB-1", "11").await;
+
+        sign_in(&state, &server).await;
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(entry(&state, id).await.0, "synced");
+        let paths: Vec<String> = requests(&server)
+            .await
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            paths[..2],
+            [
+                "/rest/api/3/issue/WEB-1/transitions",
+                "/rest/api/3/search/jql"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_wait_for_a_new_token_after_a_401() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = syncing(&server, data_dir.path()).await;
+        // Jira has stopped accepting the saved token. It is asked once: a
+        // second request with that token would fail the test.
+        transition("WEB-1")
+            .and(basic_auth("ada@example.com", TOKEN))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        transition("WEB-1")
+            .and(basic_auth("ada@example.com", "new-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/rest/api/3/myself"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "accountId": "5b10a", "displayName": "Ada" })),
+            )
+            .mount(&server)
+            .await;
+        let id = enqueue(&state, "WEB-1", "11").await;
+
+        sign_in(&state, &server).await;
+
+        assert_eq!(cycle(&mut events).await, ["Started", "TokenRejected"]);
+        assert_eq!(entry(&state, id).await, ("pending".to_owned(), 0, None));
+
+        api::renew_token(&state, "new-token").await.unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        assert_eq!(entry(&state, id).await, ("synced".to_owned(), 0, None));
+    }
+}

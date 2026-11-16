@@ -1,0 +1,79 @@
+//! The outbox: local changes that Jira has not confirmed yet.
+
+use crate::models::IssueKey;
+use sqlx::SqlitePool;
+
+pub(crate) struct QueueEntry {
+    pub id: i64,
+    pub entity_type: String,
+    pub issue_key: IssueKey,
+    pub payload: String,
+    pub retry_count: i64,
+}
+
+/// Marks the oldest entry that still has to be sent as `in_progress` and
+/// returns it.
+// `created_at` has a resolution of one second; the id is the creation order.
+// Only one processor runs, so an entry that is `in_progress` here was left by
+// a crash or a quit in the middle of its delivery.
+pub(crate) async fn claim_next(pool: &SqlitePool) -> sqlx::Result<Option<QueueEntry>> {
+    sqlx::query_as!(
+        QueueEntry,
+        r#"
+        UPDATE sync_queue SET status = 'in_progress'
+        WHERE id = (
+            SELECT id FROM sync_queue
+            WHERE status IN ('pending', 'in_progress')
+            ORDER BY id
+            LIMIT 1
+        )
+        RETURNING id AS "id!", entity_type, issue_key AS "issue_key: IssueKey",
+                  payload, retry_count
+        "#
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+pub(crate) async fn mark_synced(pool: &SqlitePool, id: i64) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE sync_queue SET status = 'synced', error_msg = NULL, synced_at = datetime('now')
+         WHERE id = ?",
+        id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Puts a claimed entry back without counting the attempt.
+pub(crate) async fn release(pool: &SqlitePool, id: i64) -> sqlx::Result<()> {
+    sqlx::query!("UPDATE sync_queue SET status = 'pending' WHERE id = ?", id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Puts a claimed entry back for another attempt and counts this one.
+pub(crate) async fn release_for_retry(pool: &SqlitePool, id: i64, error: &str) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE sync_queue SET status = 'pending', retry_count = retry_count + 1, error_msg = ?
+         WHERE id = ?",
+        error,
+        id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn mark_failed(pool: &SqlitePool, id: i64, error: &str) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE sync_queue SET status = 'failed', error_msg = ? WHERE id = ?",
+        error,
+        id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}

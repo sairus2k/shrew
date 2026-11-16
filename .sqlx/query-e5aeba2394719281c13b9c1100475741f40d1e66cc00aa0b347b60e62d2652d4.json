@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE sync_queue SET status = 'in_progress'\n        WHERE id = (\n            SELECT id FROM sync_queue\n            WHERE status IN ('pending', 'in_progress')\n            ORDER BY id\n            LIMIT 1\n        )\n        RETURNING id AS \"id!\", entity_type, issue_key AS \"issue_key: IssueKey\",\n                  payload, retry_count\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "entity_type",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "issue_key: IssueKey",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "payload",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "retry_count",
+        "ordinal": 4,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e5aeba2394719281c13b9c1100475741f40d1e66cc00aa0b347b60e62d2652d4"
+}

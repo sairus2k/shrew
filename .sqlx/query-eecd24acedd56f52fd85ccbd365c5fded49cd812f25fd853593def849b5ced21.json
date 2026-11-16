@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sync_queue SET status = 'failed', error_msg = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "eecd24acedd56f52fd85ccbd365c5fded49cd812f25fd853593def849b5ced21"
+}

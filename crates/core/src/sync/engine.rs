@@ -2,7 +2,7 @@
 
 use crate::{
     AppState, SyncEvent,
-    sync::{inbound, jira_client::JiraError},
+    sync::{inbound, jira_client::JiraError, outbound},
 };
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
@@ -50,6 +50,8 @@ async fn sync_cycle(
     state.events.send(SyncEvent::Started).ok();
     let mut changed = Vec::new();
     let synced = async {
+        // Local changes go out first: the poll then reads what Jira made of them
+        outbound::process_queue(state, &config, &mut changed).await?;
         inbound::poll_updated_issues(state, &config, last_sync_at, &mut changed).await?;
         // Deleted and moved issues never match `updated >=`: the poll cannot see them
         if inbound::reconcile_due(&config, *reconciled, inbound::now_ms()?) {

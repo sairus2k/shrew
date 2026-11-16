@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sync_queue SET status = 'pending', retry_count = retry_count + 1, error_msg = ?\n         WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "4639b6fc89db9efe88af931d746d89aaa0b18acccf8e8128e28e15ae781062b3"
+}

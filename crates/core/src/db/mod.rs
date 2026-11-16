@@ -5,6 +5,7 @@ use sqlx::{
 use std::path::Path;
 
 pub(crate) mod issues;
+pub(crate) mod sync_queue;
 
 const DB_FILE: &str = "shrew.db";
 

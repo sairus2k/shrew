@@ -3,6 +3,7 @@
     expect(dead_code, reason = "neither auth nor the sync engine calls Jira yet")
 )]
 
+use crate::models::IssueKey;
 use reqwest::{RequestBuilder, Response, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -203,11 +204,29 @@ impl JiraClient {
         Ok(count.count)
     }
 
+    /// `body` is the request body of Jira's transition call: the transition id
+    /// and the fields its screen requires.
+    pub(crate) async fn transition_issue(
+        &self,
+        key: &IssueKey,
+        body: &Value,
+    ) -> Result<(), JiraError> {
+        let url = self.url(&format!("/issue/{key}/transitions"));
+        // Jira answers 204 with no body
+        self.execute(self.http.post(url).json(body)).await?;
+        Ok(())
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
 
     async fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, JiraError> {
+        Ok(self.execute(request).await?.json().await?)
+    }
+
+    /// Returns the response once Jira has answered with a success status.
+    async fn execute(&self, request: RequestBuilder) -> Result<Response, JiraError> {
         let request = request.basic_auth(&self.email, Some(&self.api_token));
         let mut retries = 0;
         loop {
@@ -226,7 +245,7 @@ impl JiraClient {
                     let body = response.text().await.unwrap_or_default();
                     return Err(JiraError::Status(status, body));
                 }
-                _ => return Ok(response.json().await?),
+                _ => return Ok(response),
             }
         }
     }
