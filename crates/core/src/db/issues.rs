@@ -248,7 +248,10 @@ pub(crate) async fn delete(executor: impl sqlx::SqliteExecutor<'_>, id: &str) ->
 }
 
 /// Every cached issue, the one Jira changed last first.
-pub(crate) async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<IssueRow>> {
+pub(crate) async fn list(
+    pool: &SqlitePool,
+    project_filter: Option<&str>,
+) -> sqlx::Result<Vec<IssueRow>> {
     sqlx::query_as!(
         IssueRow,
         r#"
@@ -257,9 +260,12 @@ pub(crate) async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<IssueRow>> {
                assignee_name, project_key,
                sync_status AS "sync_status: SyncStatus"
         FROM issues
+        WHERE ? IS NULL OR project_key = ?
         -- Both columns come from idx_issues_updated, so nothing is sorted
         ORDER BY remote_updated_at DESC, rowid DESC
-        "#
+        "#,
+        project_filter,
+        project_filter
     )
     .fetch_all(pool)
     .await
@@ -508,9 +514,26 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = list(&pool).await.unwrap();
+        let rows = list(&pool, None).await.unwrap();
         let keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
         assert_eq!(keys, ["PROJ-2", "PROJ-3", "PROJ-1"]);
+    }
+
+    #[sqlx::test]
+    async fn list_can_be_narrowed_to_one_project(pool: SqlitePool) {
+        upsert(&pool, &issue("1", "PROJ-1", T1, "Older"))
+            .await
+            .unwrap();
+        upsert(&pool, &issue("2", "OTHER-1", T2, "Newer"))
+            .await
+            .unwrap();
+        upsert(&pool, &issue("3", "PROJ-2", T2, "Newest"))
+            .await
+            .unwrap();
+
+        let rows = list(&pool, Some("PROJ")).await.unwrap();
+        let keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
+        assert_eq!(keys, ["PROJ-2", "PROJ-1"]);
     }
 
     #[sqlx::test]

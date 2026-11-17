@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id AS \"id!\", key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, project_key,\n               sync_status AS \"sync_status: SyncStatus\"\n        FROM issues\n        -- Both columns come from idx_issues_updated, so nothing is sorted\n        ORDER BY remote_updated_at DESC, rowid DESC\n        ",
+  "query": "\n        SELECT id AS \"id!\", key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, project_key,\n               sync_status AS \"sync_status: SyncStatus\"\n        FROM issues\n        WHERE ? IS NULL OR project_key = ?\n        -- Both columns come from idx_issues_updated, so nothing is sorted\n        ORDER BY remote_updated_at DESC, rowid DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -45,7 +45,7 @@
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 2
     },
     "nullable": [
       false,
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "3ced65c027443c8c32db1c9c828be551043ca830ab24369667e0907a80aa7c0e"
+  "hash": "ed1d65831b659011cd079455a82f14d12566e25e956f14170fc8a9e61c7cb88f"
 }

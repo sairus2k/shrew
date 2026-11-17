@@ -163,9 +163,18 @@ pub async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
     inbound::initial_sync(state).await
 }
 
-/// Every issue in the local cache, the one Jira changed last first.
-pub async fn list_issues(state: &AppState) -> anyhow::Result<Vec<IssueRow>> {
-    Ok(db::issues::list(&state.pool).await?)
+/// The projects whose issues the app keeps locally, in the order they were chosen.
+pub async fn watched_projects(state: &AppState) -> Vec<String> {
+    match &*state.config.read().await {
+        Some(config) => config.watched_projects.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// Every issue in the local cache, or only those of `project`, the one Jira
+/// changed last first.
+pub async fn list_issues(state: &AppState, project: Option<&str>) -> anyhow::Result<Vec<IssueRow>> {
+    Ok(db::issues::list(&state.pool, project).await?)
 }
 
 /// One issue from the local cache, with its description and comments as Markdown.
@@ -375,8 +384,10 @@ mod tests {
                 },
             ]
         );
+        assert!(watched_projects(&state).await.is_empty());
         watch_projects(&state, &["WEB".to_owned()]).await.unwrap();
 
+        assert_eq!(watched_projects(&state).await, ["WEB"]);
         assert_eq!(setup_step(&state).await, SetupStep::InitialSync);
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
@@ -652,7 +663,7 @@ mod tests {
         nothing_is_saved(data_dir.path(), &state);
         assert_eq!(account(&state).await, None);
         assert_eq!(setup_step(&state).await, SetupStep::SignIn);
-        assert!(list_issues(&state).await.unwrap().is_empty());
+        assert!(list_issues(&state, None).await.unwrap().is_empty());
         assert!(
             search_issues(&state, "login", None)
                 .await
@@ -701,7 +712,7 @@ mod tests {
 
         assert_eq!(signed_in.account_id, "7c20b");
         assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
-        assert!(list_issues(&state).await.unwrap().is_empty());
+        assert!(list_issues(&state, None).await.unwrap().is_empty());
         assert!(
             search_issues(&state, "login", None)
                 .await
@@ -718,14 +729,14 @@ mod tests {
         std::fs::remove_file(data_dir.path().join("config.json")).unwrap();
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(list_issues(&state).await.unwrap().len(), 1);
+        assert_eq!(list_issues(&state, None).await.unwrap().len(), 1);
         let server = jira(myself()).await;
 
         sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
 
-        assert!(list_issues(&state).await.unwrap().is_empty());
+        assert!(list_issues(&state, None).await.unwrap().is_empty());
     }
 
     #[tokio::test]

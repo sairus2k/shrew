@@ -6,8 +6,10 @@ use app_core::{
     models::{IssueKey, IssueRow, StatusCategory, SyncStatus},
 };
 use gpui_kit::component::{
-    ActiveTheme,
+    ActiveTheme, Sizable,
+    button::Button,
     input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -18,6 +20,10 @@ pub struct IssueOpened(pub IssueKey);
 
 pub struct IssueList {
     query: Entity<InputState>,
+    // The watched projects; the filter is offered when there are several
+    projects: Vec<String>,
+    // `None` shows every watched project
+    project: Option<String>,
     issues: Vec<IssueRow>,
     // The issue shown beside the list
     opened: Option<IssueKey>,
@@ -45,12 +51,36 @@ impl IssueList {
 
         let mut this = Self {
             query,
+            projects: Vec::new(),
+            project: None,
             issues: Vec::new(),
             opened: None,
             loading: Task::ready(()),
         };
         this.reload(cx);
+        this.load_projects(cx);
         this
+    }
+
+    fn load_projects(&mut self, cx: &mut Context<Self>) {
+        let load = spawn(cx, |state| async move {
+            Ok(api::watched_projects(&state).await)
+        });
+        cx.spawn(async move |this, cx| {
+            let projects = load.await;
+            this.update(cx, |this, cx| {
+                this.projects = projects.unwrap_or_default();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn choose_project(&mut self, project: Option<String>, cx: &mut Context<Self>) {
+        self.project = project;
+        self.reload(cx);
+        cx.notify();
     }
 
     fn open(&mut self, key: IssueKey, cx: &mut Context<Self>) {
@@ -68,11 +98,12 @@ impl IssueList {
     // No debounce: an FTS5 query takes a few milliseconds and there is no IPC hop
     fn reload(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().trim().to_owned();
+        let project = self.project.clone();
         let load = spawn(cx, move |state| async move {
             if query.chars().count() < 2 {
-                api::list_issues(&state).await
+                api::list_issues(&state, project.as_deref()).await
             } else {
-                api::search_issues(&state, &query, None).await
+                api::search_issues(&state, &query, project.as_deref()).await
             }
         });
         self.show(load, cx);
@@ -179,16 +210,46 @@ fn row(
 
 impl Render for IssueList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let projects = self.projects.clone();
+        let choosable = projects.len() > 1;
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(
-                div().p_3().child(
-                    Input::new(&self.query)
-                        .id("search")
-                        .aria_label("Search issues"),
-                ),
+                div()
+                    .p_3()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Input::new(&self.query)
+                                .id("search")
+                                .aria_label("Search issues"),
+                        ),
+                    )
+                    .when(choosable, |bar| {
+                        bar.child(
+                            Button::new("project-filter")
+                                .small()
+                                .label(self.project.clone().unwrap_or("All projects".to_owned()))
+                                .dropdown_menu(move |mut menu, window, _| {
+                                    let choices = std::iter::once(None)
+                                        .chain(projects.iter().cloned().map(Some));
+                                    for choice in choices {
+                                        let label =
+                                            choice.clone().unwrap_or("All projects".to_owned());
+                                        menu = menu.item(PopupMenuItem::new(label).on_click(
+                                            window.listener_for(&view, move |this, _, _, cx| {
+                                                this.choose_project(choice.clone(), cx)
+                                            }),
+                                        ));
+                                    }
+                                    menu
+                                }),
+                        )
+                    }),
             )
             .child(
                 // Only the rows in view are built, so the cost of a frame does
@@ -213,8 +274,10 @@ pub(crate) mod tests {
         SyncEvent,
         models::{IssueRow, StatusCategory, SyncStatus},
     };
-    use gpui_kit::test::{TestQueryExt, TestWindowExt};
-    use gpui_kit::{AnyWindowHandle, AppContext, Role, TestAppContext, Window, WindowOptions, px};
+    use gpui_kit::test::{TestEventExt, TestQueryExt, TestWindowExt};
+    use gpui_kit::{
+        AnyWindowHandle, AppContext, MouseButton, Role, TestAppContext, Window, WindowOptions, px,
+    };
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
     use tokio::{runtime::Runtime, sync::oneshot};
@@ -278,6 +341,24 @@ pub(crate) mod tests {
         let key = issue["key"].as_str().unwrap().into();
         tokio.block_on(state.store_issues(&[issue])).unwrap();
         state.emit(SyncEvent::IssuesUpdated(vec![key]));
+    }
+
+    /// `synced` for an app that watches WEB and API. API-1 and API-2 hold the
+    /// ids 101 and 102 so that they are newer than the WEB issues.
+    fn synced_two_projects(tokio: &Runtime, issues: &[Value]) -> tempfile::TempDir {
+        let data_dir = synced(tokio, issues);
+        let path = data_dir.path().join("config.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["watched_projects"] = json!(["WEB", "API"]);
+        std::fs::write(path, config.to_string()).unwrap();
+        data_dir
+    }
+
+    fn api_issue(id: u32, summary: &str) -> Value {
+        let mut issue = issue(id, summary);
+        issue["key"] = json!(format!("API-{id}"));
+        issue["fields"]["project"] = json!({ "key": "API" });
+        issue
     }
 
     /// The rows on screen, top to bottom.
@@ -412,6 +493,129 @@ pub(crate) mod tests {
         renamed["fields"]["updated"] = json!("2026-03-30T00:00:00.000+0000");
         sync_brings(cx, &tokio, renamed);
         wait_for_rows(cx, window, &["WEB-5: Checkout button, To Do, Unassigned"]);
+    }
+
+    const API_LOGIN: &str = "API-101: Login endpoint, To Do, Unassigned";
+    const API_TOKEN: &str = "API-102: Token refresh, To Do, Unassigned";
+
+    fn two_projects() -> Vec<Value> {
+        let mut issues = three_issues().to_vec();
+        issues.extend([
+            api_issue(101, "Login endpoint"),
+            api_issue(102, "Token refresh"),
+        ]);
+        issues
+    }
+
+    /// Opens the project menu and clicks the item `name`.
+    fn choose_project(window: &mut Window, cx: &mut gpui_kit::App, name: &str) {
+        window.click("project-filter", cx);
+        window.render_frame(cx);
+        let items = window.find_all_by_role(Role::MenuItem);
+        let item = items.iter().find(|item| item.label() == Some(name));
+        let middle = item.expect("no such project").bounds().center();
+        window.pointer_down(middle, MouseButton::Left, cx);
+        window.pointer_up(middle, MouseButton::Left, cx);
+        window.render_frame(cx);
+    }
+
+    #[gpui_kit::test]
+    fn a_chosen_project_narrows_the_list_and_all_projects_widen_it(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &two_projects());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("project-filter").label(), Some("All projects"));
+        });
+
+        in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
+        wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("project-filter").label(), Some("WEB"));
+        });
+
+        in_window(cx, window, |window, cx| choose_project(window, cx, "API"));
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN]);
+
+        in_window(cx, window, |window, cx| {
+            choose_project(window, cx, "All projects")
+        });
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+    }
+
+    #[gpui_kit::test]
+    fn the_search_finds_only_the_issues_of_the_chosen_project(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &two_projects());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+
+        in_window(cx, window, |window, cx| {
+            window.click("search", cx);
+            window.input("login", cx);
+        });
+        wait_until(cx, window, |window| rows(window).len() == 2);
+        let mut all = in_window(cx, window, |window, _| rows(window));
+        all.sort();
+        assert_eq!(all, [API_LOGIN, LOGIN]);
+
+        in_window(cx, window, |window, cx| choose_project(window, cx, "API"));
+        wait_for_rows(cx, window, &[API_LOGIN]);
+
+        // Another query keeps the project
+        in_window(cx, window, |window, cx| {
+            window.click("search", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.input("tok", cx);
+        });
+        wait_for_rows(cx, window, &[API_TOKEN]);
+        in_window(cx, window, |window, cx| {
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+        });
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN]);
+    }
+
+    #[gpui_kit::test]
+    fn the_chosen_project_stays_applied_when_a_sync_brings_issues(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &two_projects());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+        in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
+        wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
+
+        sync_brings(cx, &tokio, api_issue(103, "Rate limits"));
+        sync_brings(cx, &tokio, issue(4, "Login page is slow"));
+
+        wait_for_rows(
+            cx,
+            window,
+            &[
+                "WEB-4: Login page is slow, To Do, Unassigned",
+                CHECKOUT,
+                LOGOUT,
+                LOGIN,
+            ],
+        );
+    }
+
+    #[gpui_kit::test]
+    fn with_one_watched_project_there_is_nothing_to_choose(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &three_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
+
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("project-filter").is_none());
+        });
     }
 
     fn twelve_thousand_issues() -> Vec<Value> {
