@@ -228,11 +228,19 @@ pub(crate) async fn poll_updated_issues(
             .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
             .await?;
         let mut written = Vec::new();
+        // Held until the commit: `watch_projects` changes the list and deletes
+        // the rows of a removed project under the write lock, so a page is
+        // either stored before that delete or filtered by the new list
+        let saved = state.config.read().await;
+        let watched = saved.as_ref().map_or(&[][..], |c| &c.watched_projects[..]);
         let mut tx = state.pool.begin().await?;
         for issue in &page.issues {
             let Some(record) = readable_record(state, issue) else {
                 continue;
             };
+            if !watched.contains(&record.project_key) {
+                continue;
+            }
             // The upsert overwrites the old key, so it has to be read first:
             // a view open under it would otherwise never hear of the move
             let old_key = issues::key_of(&mut *tx, &record.id).await?;
@@ -243,6 +251,7 @@ pub(crate) async fn poll_updated_issues(
             }
         }
         tx.commit().await?;
+        drop(saved);
         changed.extend(written);
 
         if page.next_page_token.is_none() {
@@ -870,6 +879,44 @@ mod tests {
         let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
         let saved: Value = serde_json::from_slice(&saved).unwrap();
         assert_eq!(saved["last_sync_at"], json!(now));
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_started_before_a_project_was_unwatched_does_not_store_its_issues() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        let polled = [changed(issue(1, "WEB"), LATER, "Renamed"), issue(5, "API")];
+        let delay = std::time::Duration::from_millis(500);
+        poll(JUST_SYNCED, page(&polled, None).set_delay(delay))
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+        // The request is out, so the cycle runs with the old project list
+        while !server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains("updated >="))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let saving = std::time::Instant::now();
+        api::watch_projects(&state, &["WEB".to_owned()])
+            .await
+            .unwrap();
+        assert!(saving.elapsed() < delay);
+        cycle(&mut events).await;
+
+        assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+        assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
+        let listed = api::list_issues(&state, None).await.unwrap();
+        assert!(listed.iter().all(|row| row.project_key == "WEB"));
+        let found = api::search_issues(&state, "flaky", None).await.unwrap();
+        assert!(found.iter().all(|row| row.project_key == "WEB"));
     }
 
     #[tokio::test]
