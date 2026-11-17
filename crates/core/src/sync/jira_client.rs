@@ -94,6 +94,21 @@ struct ApproximateCount {
 }
 
 #[derive(Deserialize)]
+struct StatusOnly {
+    fields: StatusField,
+}
+
+#[derive(Deserialize)]
+struct StatusField {
+    status: StatusName,
+}
+
+#[derive(Deserialize)]
+struct StatusName {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct TransitionList {
     transitions: Vec<JiraTransition>,
 }
@@ -240,6 +255,16 @@ impl JiraClient {
             .json(&json!({ "jql": jql }));
         let count: ApproximateCount = self.send(request).await?;
         Ok(count.count)
+    }
+
+    /// The name of the status the issue has in Jira.
+    pub(crate) async fn status(&self, key: &IssueKey) -> Result<String, JiraError> {
+        let request = self
+            .http
+            .get(self.url(&format!("/issue/{key}")))
+            .query(&[("fields", "status")]);
+        let issue: StatusOnly = self.send(request).await?;
+        Ok(issue.fields.status.name)
     }
 
     /// The transitions the issue offers from the status it has in Jira, each

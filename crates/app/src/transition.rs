@@ -173,6 +173,18 @@ mod tests {
             ),
         ];
         for (key, transitions) in offers {
+            let status = if key == "WEB-1" {
+                "To Do"
+            } else {
+                "In Progress"
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/rest/api/3/issue/{key}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({ "key": key, "fields": { "status": { "name": status } } }),
+                ))
+                .mount(&server)
+                .await;
             Mock::given(method("GET"))
                 .and(path(format!("/rest/api/3/issue/{key}/transitions")))
                 .respond_with(

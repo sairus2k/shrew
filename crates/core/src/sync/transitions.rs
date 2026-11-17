@@ -41,21 +41,38 @@ pub(crate) async fn get(
             Ok((cached.transitions, refresh))
         }
         None => {
-            let transitions = fetch_and_store(&state.pool, &client, key, &position).await?;
+            let (jira_status, transitions) =
+                fetch_and_store(&state.pool, &client, key, &position).await?;
+            anyhow::ensure!(
+                jira_status == position.status,
+                "{key} is in {jira_status} in Jira but {} here: its transitions are not known yet",
+                position.status
+            );
             Ok((transitions, None))
         }
     }
 }
 
+/// Files the answer under the status Jira reported, which is not always the
+/// local one. Returns that status with the transitions.
 async fn fetch_and_store(
     pool: &SqlitePool,
     client: &JiraClient,
     key: &IssueKey,
     position: &Position,
-) -> anyhow::Result<Vec<Transition>> {
+) -> anyhow::Result<(String, Vec<Transition>)> {
+    // The transitions endpoint does not name the status it answers for, so the
+    // status is read on both sides of it: a move in between is not confirmed
+    let before = client.status(key).await?;
     let transitions = fetch(client, key).await?;
-    cache::put(pool, position, &transitions).await?;
-    Ok(transitions)
+    let after = client.status(key).await?;
+    anyhow::ensure!(before == after, "{key} changed status while it was read");
+    let position = Position {
+        status: before.clone(),
+        ..position.clone()
+    };
+    cache::put(pool, &position, &transitions).await?;
+    Ok((before, transitions))
 }
 
 async fn fetch(client: &JiraClient, key: &IssueKey) -> anyhow::Result<Vec<Transition>> {
@@ -136,6 +153,17 @@ mod tests {
         (data_dir, state)
     }
 
+    /// Jira's status for `key`; without it Jira would answer nothing about the issue.
+    fn in_jira(key: &str, status: &str) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/api/3/issue/{key}")))
+            .and(query_param("fields", "status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "key": key,
+                "fields": { "status": { "name": status } },
+            })))
+    }
+
     /// Jira's answer for `key`: one transition per name, none with a screen.
     fn offers(key: &str, names: &[&str]) -> Mock {
         let transitions: Vec<Value> = names
@@ -172,6 +200,7 @@ mod tests {
     async fn a_miss_asks_jira_once_and_a_hit_works_offline() {
         let server = MockServer::start().await;
         let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
         offers("WEB-1", &["Start", "Close"])
             .expect(1)
             .mount(&server)
@@ -220,6 +249,9 @@ mod tests {
         ];
         let (_data_dir, state) = core_with(&server, &issues).await;
         // WEB-2 has no answer in Jira: it can only be served by the entry of WEB-1
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        in_jira("WEB-3", "In Review").mount(&server).await;
+        in_jira("WEB-4", "To Do").mount(&server).await;
         offers("WEB-1", &["Start"]).expect(1).mount(&server).await;
         offers("WEB-3", &["Approve"]).mount(&server).await;
         offers("WEB-4", &["Refine"]).mount(&server).await;
@@ -238,6 +270,7 @@ mod tests {
     async fn a_stale_entry_is_returned_at_once_and_refreshed_in_the_background() {
         let server = MockServer::start().await;
         let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
         offers("WEB-1", &["Start"])
             .up_to_n_times(1)
             .mount(&server)
@@ -264,6 +297,7 @@ mod tests {
     async fn a_stale_entry_survives_a_refresh_that_fails() {
         let server = MockServer::start().await;
         let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
         offers("WEB-1", &["Start"])
             .up_to_n_times(1)
             .mount(&server)
@@ -280,10 +314,105 @@ mod tests {
         assert_eq!(names(&state, "WEB-1").await, ["Start"]);
     }
 
+    async fn move_locally(state: &AppState, key: &str, to_status: &str) {
+        sqlx::query("UPDATE issues SET status = ? WHERE key = ?")
+            .bind(to_status)
+            .bind(key)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn stored_under(state: &AppState) -> Vec<String> {
+        sqlx::query_scalar("SELECT from_status FROM transition_cache ORDER BY from_status")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_miss_after_an_optimistic_transition_is_not_filed_under_the_local_status() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        // The outbox has not sent the move to "In Review" yet
+        move_locally(&state, "WEB-1", "In Review").await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+
+        api::get_transitions(&state, &"WEB-1".into())
+            .await
+            .unwrap_err();
+
+        assert_eq!(stored_under(&state).await, ["To Do"]);
+    }
+
+    #[tokio::test]
+    async fn a_miss_after_a_teammate_moved_the_issue_serves_the_right_status_later() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "In Review").mount(&server).await;
+        offers("WEB-1", &["Approve"]).expect(1).mount(&server).await;
+
+        api::get_transitions(&state, &"WEB-1".into())
+            .await
+            .unwrap_err();
+        assert_eq!(stored_under(&state).await, ["In Review"]);
+
+        // The poll stores the teammate's move; the entry stored above serves it
+        move_locally(&state, "WEB-1", "In Review").await;
+        assert_eq!(names(&state, "WEB-1").await, ["Approve"]);
+    }
+
+    #[tokio::test]
+    async fn a_status_that_changes_during_the_fetch_stores_nothing() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do")
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        in_jira("WEB-1", "In Review").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+
+        api::get_transitions(&state, &"WEB-1".into())
+            .await
+            .unwrap_err();
+
+        assert_eq!(cached_entries(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_after_a_teammate_moved_the_issue_leaves_the_local_entry_alone() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do")
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        offers("WEB-1", &["Start"])
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        assert_eq!(names(&state, "WEB-1").await, ["Start"]);
+        sqlx::query("UPDATE transition_cache SET fetched_at = datetime('now', '-61 minutes')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        in_jira("WEB-1", "In Review").mount(&server).await;
+        offers("WEB-1", &["Approve"]).mount(&server).await;
+
+        let (_, refresh) = get(&state, &"WEB-1".into()).await.unwrap();
+        refresh.expect("a stale entry is refreshed").await.unwrap();
+
+        assert_eq!(stored_under(&state).await, ["In Review", "To Do"]);
+        assert_eq!(names(&state, "WEB-1").await, ["Start"]);
+    }
+
     #[tokio::test]
     async fn only_the_fields_the_user_must_fill_in_are_kept() {
         let server = MockServer::start().await;
         let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "In Review")]).await;
+        in_jira("WEB-1", "In Review").mount(&server).await;
         let resolutions =
             json!([{ "id": "10000", "name": "Fixed" }, { "id": "10001", "name": "Won't Do" }]);
         Mock::given(method("GET"))

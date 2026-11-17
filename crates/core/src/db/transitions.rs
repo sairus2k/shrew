@@ -5,6 +5,7 @@ use sqlx::SqlitePool;
 
 /// What decides the transitions an issue offers: its workflow, which Jira
 /// picks by project and issue type, and the status it is in.
+#[derive(Clone)]
 pub(crate) struct Position {
     pub project_key: String,
     pub issue_type: String,
