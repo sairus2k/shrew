@@ -6,7 +6,7 @@ use app_core::models::{Comment, IssueDetail, SyncStatus};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
-    text::TextView,
+    text::{MarkdownExtensions, MarkdownNode, TextView, TextViewStyle, markdown_ast},
 };
 use gpui_kit::*;
 
@@ -71,6 +71,53 @@ fn minute(created: &str) -> String {
     created.get(..16).unwrap_or(created).replace('T', " ")
 }
 
+/// A description or a comment body. Code and tables that are wider than the
+/// pane scroll sideways.
+fn markdown(id: impl Into<ElementId>, text: &str) -> TextView {
+    let mut table = StyleRefinement::default();
+    table.overflow.x = Some(Overflow::Scroll);
+    let extensions = MarkdownExtensions::default()
+        .block_parser(|node, _| match node {
+            markdown_ast::Node::Code(code) => {
+                Some(MarkdownNode::new("code", ()).markdown(fenced(code)))
+            }
+            _ => None,
+        })
+        .block_renderer("code", code_block)
+        // The same parser on every render: the parsed document is kept
+        .parser_revision(1);
+    TextView::markdown(id, text.to_owned())
+        .style(TextViewStyle::default().table(table))
+        .markdown_extensions(extensions)
+}
+
+/// The block as Markdown of its own. Its source in the document cannot be used:
+/// inside a list or a quote every line of it carries their indent or `> `.
+fn fenced(code: &markdown_ast::Code) -> String {
+    let backticks = code.value.split(|c| c != '`').map(str::len).max();
+    let fence = "`".repeat(backticks.unwrap_or(0).max(2) + 1);
+    let language = code.lang.as_deref().unwrap_or_default();
+    format!("{fence}{language}\n{}\n{fence}", code.value)
+}
+
+// GPUI Kit 0.9.1 and 0.10.0 wrap long code lines and cannot scroll a code block
+// sideways, so each block is a view of its own that is as wide as its longest
+// line, inside a container that scrolls.
+fn code_block(node: &MarkdownNode, _: &mut Window, _: &mut App) -> Stateful<Div> {
+    let position = node.source_range().map_or(0, |range| range.start);
+    let mut one_line_each = StyleRefinement::default();
+    one_line_each.text.white_space = Some(WhiteSpace::Nowrap);
+    let code = TextView::markdown(("code", position), node.as_markdown().to_owned())
+        .style(TextViewStyle::default().code_block(one_line_each));
+    div()
+        .id(("code-scroll", position))
+        .flex()
+        .overflow_x_scroll()
+        // Without it the wheel moves the code sideways
+        .restrict_scroll_to_axis()
+        .child(div().flex_none().child(code))
+}
+
 fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
     let heading = format!("{}, {}", comment.author_name, minute(&comment.created));
     div()
@@ -86,10 +133,7 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
                 .text_color(cx.theme().muted_foreground)
                 .child(heading),
         )
-        .child(TextView::markdown(
-            ("comment-body", index),
-            comment.body_md.clone(),
-        ))
+        .child(markdown(("comment-body", index), &comment.body_md))
 }
 
 fn body(issue: &IssueDetail, status: Entity<StatusButton>, cx: &App) -> impl IntoElement {
@@ -172,7 +216,7 @@ fn body(issue: &IssueDetail, status: Entity<StatusButton>, cx: &App) -> impl Int
                 .child("No description")
                 .into_any_element()
         } else {
-            TextView::markdown("description", issue.description_md.clone()).into_any_element()
+            markdown("description", &issue.description_md).into_any_element()
         })
         .child(
             div()
@@ -220,6 +264,8 @@ impl Render for DetailPane {
             .aria_label(issue.key.to_string())
             .size_full()
             .overflow_y_scroll()
+            // Without it a sideways swipe over code or a table also moves the pane
+            .restrict_scroll_to_axis()
             .p_4()
             .child(
                 div()
@@ -252,7 +298,8 @@ mod tests {
     use gpui_kit::base::test_support::texts;
     use gpui_kit::test::{TestEventExt, TestWindowExt};
     use gpui_kit::{
-        AnyWindowHandle, ElementId, MouseButton, ScrollDelta, TestAppContext, Window, point, px,
+        AnyWindowHandle, App, Bounds, ElementId, InputEvent, MouseButton, Pixels, Point,
+        ScrollDelta, ScrollEvent, TestAppContext, Window, point, px, size,
     };
     use serde_json::{Value, json};
 
@@ -335,6 +382,26 @@ mod tests {
         texts.join("\n")
     }
 
+    fn bounds_of(window: &Window, text: &str) -> Bounds<Pixels> {
+        let found = texts(window).into_iter().find(|each| each.text() == text);
+        found
+            .unwrap_or_else(|| panic!("no {text:?} on screen"))
+            .bounds()
+    }
+
+    /// Turns the wheel or swipes over `position`.
+    fn scroll(window: &mut Window, position: Point<Pixels>, delta: Point<Pixels>, cx: &mut App) {
+        // A scroll goes to what the pointer is over
+        window.pointer_move(position, None, cx);
+        let event = ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(delta),
+            ..Default::default()
+        };
+        window.dispatch_event(event.to_platform_input(), cx);
+        window.render_frame(cx);
+    }
+
     #[gpui_kit::test]
     fn selecting_an_issue_in_the_list_opens_its_detail(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
@@ -402,6 +469,64 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn wide_code_and_a_wide_table_scroll_sideways_in_a_narrow_pane(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let mut bug = issue(1, "Fix login");
+        let wide_code = format!("src/auth/{}  # the last column\nb", "nested/".repeat(30));
+        let cell = |kind: &str, text: &str| json!({ "type": kind, "content": [paragraph(text)] });
+        let row = |kind: &str, texts: [&str; 6]| {
+            let cells: Vec<Value> = texts.iter().map(|text| cell(kind, text)).collect();
+            json!({ "type": "tableRow", "content": cells })
+        };
+        bug["fields"]["description"] = doc(json!([
+            { "type": "codeBlock", "content": [{ "type": "text", "text": wide_code }] },
+            { "type": "codeBlock", "content": [{ "type": "text", "text": "a\nb" }] },
+            { "type": "table", "content": [
+                row("tableHeader", ["Id", "Component", "Environment", "Reproducibility", "Responsible", "Last"]),
+                row("tableCell", ["1", "Authentication", "Preproduction", "Intermittently", "Administrators", "Yesterday"]),
+            ] },
+        ]));
+        let data_dir = synced(&tokio, &[bug]);
+        let window = launch(cx, &tokio, data_dir.path());
+        cx.simulate_window_resize(window, size(px(700.), px(600.)));
+        open(cx, window, "WEB-1");
+
+        in_window(cx, window, |window, cx| {
+            let pane = window.find("issue-detail").bounds();
+            assert_eq!(pane.size.width, px(419.));
+
+            let code = bounds_of(window, &wide_code);
+            assert!(code.right() > pane.right());
+            // Two source lines take as much height as two short ones
+            assert_eq!(code.size.height, bounds_of(window, "a\nb").size.height);
+            scroll(window, code.origin, point(px(-100_000.), px(0.)), cx);
+            let scrolled = bounds_of(window, &wide_code);
+            assert!(scrolled.right() <= pane.right(), "{scrolled:?} in {pane:?}");
+            // The pane did not take the same gesture as a vertical one
+            assert_eq!(scrolled.top(), code.top());
+
+            // "Id" fits on one line at any width
+            let one_line = bounds_of(window, "Id").size.height;
+            for word in ["Reproducibility", "Authentication", "Administrators"] {
+                assert_eq!(bounds_of(window, word).size.height, one_line, "{word}");
+            }
+            let last = bounds_of(window, "Yesterday");
+            assert!(last.right() > pane.right());
+            let first_column = bounds_of(window, "Id").origin;
+            scroll(window, first_column, point(px(-100_000.), px(0.)), cx);
+            let scrolled = bounds_of(window, "Yesterday");
+            assert!(scrolled.right() <= pane.right(), "{scrolled:?} in {pane:?}");
+            assert_eq!(scrolled.top(), last.top());
+
+            // The wheel over a code block still scrolls the pane, not the code
+            let code = bounds_of(window, "a\nb");
+            scroll(window, code.origin, point(px(0.), px(-20.)), cx);
+            let scrolled = bounds_of(window, "a\nb");
+            assert_eq!(scrolled.origin, point(code.left(), code.top() - px(20.)));
+        });
+    }
+
+    #[gpui_kit::test]
     fn the_description_can_be_selected_and_copied(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let mut bug = issue(1, "Fix login");
@@ -426,6 +551,43 @@ mod tests {
 
         let copied = cx.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(copied.as_deref(), Some("Login fails on Safari"));
+    }
+
+    #[gpui_kit::test]
+    fn code_is_shown_as_written_and_can_be_copied(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let mut bug = issue(1, "Fix login");
+        let code = |text: &str| {
+            let content = json!([{ "type": "text", "text": text }]);
+            json!({ "type": "codeBlock", "attrs": { "language": "rust" }, "content": content })
+        };
+        bug["fields"]["description"] = doc(json!([
+            code("let x = 1;"),
+            { "type": "bulletList", "content": [
+                { "type": "listItem", "content": [paragraph("Open the page"), code("in_a_list();")] },
+            ] },
+            { "type": "blockquote", "content": [code("quoted();")] },
+        ]));
+        let data_dir = synced(&tokio, &[bug]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+
+        in_window(cx, window, |window, cx| {
+            assert_eq!(
+                painted(window, "description"),
+                "let x = 1;\nOpen the page\nin_a_list();\nquoted();"
+            );
+            let line = bounds_of(window, "let x = 1;");
+            let middle = line.center().y;
+            let (start, end) = (point(line.left(), middle), point(line.right(), middle));
+            window.pointer_down(start, MouseButton::Left, cx);
+            window.pointer_move(end, Some(MouseButton::Left), cx);
+            window.pointer_up(end, MouseButton::Left, cx);
+            window.press("secondary-c", cx);
+        });
+
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("let x = 1;"));
     }
 
     #[gpui_kit::test]
