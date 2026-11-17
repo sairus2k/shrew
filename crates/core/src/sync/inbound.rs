@@ -110,6 +110,24 @@ pub(crate) fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
     })
 }
 
+/// An issue the sync cannot read is announced and left out: failing the page
+/// would make every later cycle fail on the same issue.
+fn readable_record(state: &AppState, issue: &Value) -> Option<IssueRecord> {
+    match issue_record(issue) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            state
+                .events
+                .send(SyncEvent::IssueSkipped {
+                    key: issue["key"].as_str().unwrap_or("unknown").to_owned(),
+                    reason: format!("{error:#}"),
+                })
+                .ok();
+            None
+        }
+    }
+}
+
 /// `key` is the key of a status category in Jira.
 pub(crate) fn status_category(key: &str) -> StatusCategory {
     match key {
@@ -153,7 +171,9 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             // the slowest part of the sync
             let mut tx = state.pool.begin().await?;
             for issue in &page.issues {
-                issues::upsert(&mut *tx, &issue_record(issue)?).await?;
+                if let Some(record) = readable_record(state, issue) {
+                    issues::upsert(&mut *tx, &record).await?;
+                }
             }
             tx.commit().await?;
             synced += page.issues.len() as u64;
@@ -195,7 +215,9 @@ pub(crate) async fn poll_updated_issues(
         let mut written = Vec::new();
         let mut tx = state.pool.begin().await?;
         for issue in &page.issues {
-            let record = issue_record(issue)?;
+            let Some(record) = readable_record(state, issue) else {
+                continue;
+            };
             if issues::upsert(&mut *tx, &record).await? {
                 written.push(record.key);
             }
@@ -474,6 +496,38 @@ mod tests {
         assert_eq!(found[0].key, "API-4".into());
     }
 
+    fn without_summary(mut issue: Value) -> Value {
+        issue["fields"].as_object_mut().unwrap().remove("summary");
+        issue
+    }
+
+    #[tokio::test]
+    async fn an_initial_sync_skips_an_unreadable_issue_and_reports_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = watching(&server, data_dir.path(), &["WEB"]).await;
+        mount_count(&server, "WEB", 3).await;
+        let issues = [
+            issue(1, "WEB"),
+            without_summary(issue(2, "WEB")),
+            issue(3, "WEB"),
+        ];
+        mount_page(&server, "WEB", None, page(&issues, None)).await;
+
+        api::initial_sync(&state).await.unwrap();
+
+        assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-3"]);
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        let received = received(&mut events);
+        assert_eq!(received.last().unwrap(), "InitialSyncComplete");
+        let skipped: Vec<_> = received
+            .iter()
+            .filter(|event| event.starts_with("IssueSkipped"))
+            .collect();
+        assert_eq!(skipped.len(), 1, "{received:?}");
+        assert!(skipped[0].contains("WEB-2") && skipped[0].contains("summary"));
+    }
+
     #[tokio::test]
     async fn an_interrupted_initial_sync_is_completed_by_the_next_start() {
         let server = MockServer::start().await;
@@ -643,6 +697,41 @@ mod tests {
         let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
         let saved: Value = serde_json::from_slice(&saved).unwrap();
         assert_eq!(saved["last_sync_at"], json!(now));
+    }
+
+    #[tokio::test]
+    async fn a_poll_skips_an_unreadable_issue_and_still_completes() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let before = last_sync_at(&state).await;
+        let mut unreadable = issue(2, "WEB");
+        unreadable["fields"]["updated"] = json!("yesterday");
+        let polled = [
+            changed(issue(1, "WEB"), LATER, "Renamed"),
+            unreadable,
+            without_summary(issue(3, "WEB")),
+            issue(5, "API"),
+        ];
+        poll(JUST_SYNCED, page(&polled, None)).mount(&server).await;
+
+        state.sync_waker.send(()).unwrap();
+
+        let cycle = cycle(&mut events).await;
+        assert_eq!(cycle.len(), 5, "{cycle:?}");
+        assert_eq!(cycle[0], "Started");
+        assert!(cycle[1].starts_with("IssueSkipped") && cycle[1].contains("WEB-2"));
+        assert!(cycle[1].contains("updated"));
+        assert!(cycle[2].starts_with("IssueSkipped") && cycle[2].contains("WEB-3"));
+        assert!(cycle[2].contains("summary"));
+        assert_eq!(
+            cycle[3],
+            r#"IssuesUpdated([IssueKey("WEB-1"), IssueKey("API-5")])"#
+        );
+        assert_eq!(cycle[4], "Completed");
+        assert_eq!(stored_keys(&state).await, ["API-5", "WEB-1"]);
+        assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+        assert!(last_sync_at(&state).await > before);
     }
 
     #[tokio::test]
