@@ -18,8 +18,11 @@ pub struct InitialSync {
     // In the order the projects are synced
     progress: Vec<ProjectProgress>,
     error: Option<SharedString>,
+    // Whether the sync is for projects added after setup. Unknown until read.
+    for_added_projects: Option<bool>,
     running: Task<()>,
     _sync: Subscription,
+    _load: Task<()>,
 }
 
 impl EventEmitter<InitialSyncDone> for InitialSync {}
@@ -52,11 +55,25 @@ impl InitialSync {
             SyncEvent::InitialSyncComplete => cx.emit(InitialSyncDone),
             _ => {}
         });
+        // The first sync of an account is the only one that runs before `last_sync_at` is set
+        let first_sync_done = spawn(cx, |state| async move {
+            Ok(api::last_sync_at(&state).await.is_some())
+        });
+        let _load = cx.spawn(async move |this, cx| {
+            let added = first_sync_done.await.unwrap_or(false);
+            this.update(cx, |this, cx| {
+                this.for_added_projects = Some(added);
+                cx.notify();
+            })
+            .ok();
+        });
         let mut this = Self {
             progress: Vec::new(),
             error: None,
+            for_added_projects: None,
             running: Task::ready(()),
             _sync,
+            _load,
         };
         this.run(cx);
         this
@@ -122,12 +139,20 @@ impl Render for InitialSync {
                     .text_xl()
                     .child("Syncing issues"),
             )
-            .child(
+            .children(self.for_added_projects.map(|added| {
+                let note = if added {
+                    "Downloading the issues of the projects you added. Later syncs run in the background."
+                } else {
+                    "This happens once. Later syncs run in the background."
+                };
                 div()
+                    .id("initial-sync-note")
+                    .test_support()
+                    .aria_label(note)
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("This happens once. Later syncs run in the background."),
-            )
+                    .child(note)
+            }))
             .children(rows)
             .children(self.error.clone().map(|error| {
                 div()
@@ -233,8 +258,15 @@ mod tests {
         let data_dir = watching_web(&server);
 
         let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            window.try_find("initial-sync-note").is_some()
+        });
         in_window(cx, window, |window, _| {
             assert!(window.try_find("initial-sync").is_some());
+            assert_eq!(
+                window.find("initial-sync-note").label(),
+                Some("This happens once. Later syncs run in the background.")
+            );
             assert!(window.try_find("home").is_none());
         });
 

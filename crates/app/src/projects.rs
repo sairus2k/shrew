@@ -448,6 +448,12 @@ mod tests {
                 window.find("sync-progress-API").label(),
                 Some("API: 0 / ~1 issues")
             );
+            assert_eq!(
+                window.find("initial-sync-note").label(),
+                Some(
+                    "Downloading the issues of the projects you added. Later syncs run in the background."
+                )
+            );
         });
         wait_until(cx, window, |window| window.try_find("home").is_some());
         wait_until(cx, window, |window| rows(window) == [API_LOGIN, WEB_LOGIN]);
