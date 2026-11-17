@@ -21,6 +21,16 @@ cargo run -p app
 cargo test --workspace
 ```
 
+### Keychain prompt on every launch
+
+The API token lives in the Keychain. The linker signs a build ad hoc, and the Keychain ties "Always Allow" to the code hash of an ad hoc binary, so every rebuild asks for the login password again. To stop it, create a local code signing certificate once:
+
+```sh
+scripts/create-dev-cert.sh
+```
+
+The cargo runner (`scripts/dev-run.sh`, set in `.cargo/config.toml`) signs each build with this certificate before it starts. The certificate lives in a keychain of its own, `~/Library/Keychains/shrew-dev.keychain-db`, so signing brings up no dialog. The first launch asks for the token once more: answer "Always Allow". Without the certificate the builds run as before.
+
 ### UI integration tests
 
 The tests of the `app` crate run the real views in a headless GPUI window on a fresh SQLite file, with a [wiremock](https://docs.rs/wiremock) server as the Jira site. They need macOS, as the app itself does, so CI needs a macOS runner. They touch neither the Keychain nor the network.
