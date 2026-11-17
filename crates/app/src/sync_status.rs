@@ -3,7 +3,9 @@
 
 use crate::runtime::{Core, spawn};
 use app_core::{SyncEvent, api};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::*;
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SyncStatus {
@@ -11,6 +13,8 @@ pub struct SyncStatus {
     last_failed: bool,
     // Unix milliseconds
     last_completed: Option<i64>,
+    // Issues the sync could not read, with the reason, until a later sync stores them
+    skipped: BTreeMap<String, String>,
     _load: Task<()>,
     _tick: Task<()>,
 }
@@ -29,6 +33,17 @@ impl SyncStatus {
                 SyncEvent::Error(_) | SyncEvent::TokenRejected => {
                     this.running = false;
                     this.last_failed = true;
+                }
+                SyncEvent::IssueSkipped { key, reason } => {
+                    this.skipped.insert(key.clone(), reason.clone());
+                }
+                SyncEvent::IssuesUpdated(keys) => {
+                    let before = this.skipped.len();
+                    this.skipped
+                        .retain(|skipped, _| !keys.contains(&skipped.as_str().into()));
+                    if this.skipped.len() == before {
+                        return;
+                    }
                 }
                 _ => return,
             }
@@ -64,10 +79,19 @@ impl SyncStatus {
             running: false,
             last_failed: false,
             last_completed: None,
+            skipped: BTreeMap::new(),
             _load,
             _tick,
         }
     }
+}
+
+fn skipped_reasons(skipped: &BTreeMap<String, String>) -> String {
+    let lines: Vec<_> = skipped
+        .iter()
+        .map(|(key, reason)| format!("{key}: {reason}"))
+        .collect();
+    lines.join("\n")
 }
 
 fn now_ms() -> i64 {
@@ -110,18 +134,30 @@ impl Render for SyncStatus {
             self.last_completed,
             now_ms(),
         ));
-        div()
+        let status = div()
             .id("sync-status")
             .role(Role::Status)
             .test_support()
             .aria_label(text.clone())
-            .child(text)
+            .child(text);
+        let skipped = (!self.skipped.is_empty()).then(|| {
+            let keys = self.skipped.keys().cloned().collect::<Vec<_>>().join(", ");
+            let label = SharedString::from(format!("Skipped {keys}"));
+            let reasons = SharedString::from(skipped_reasons(&self.skipped));
+            div()
+                .id("skipped-issues")
+                .test_support()
+                .aria_label(label.clone())
+                .tooltip(move |window, cx| Tooltip::new(reasons.clone()).build(window, cx))
+                .child(label)
+        });
+        div().flex().gap_2().child(status).children(skipped)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::status_text;
+    use super::{skipped_reasons, status_text};
     use crate::{
         harness::{in_window, launch, tokio_runtime, wait_until},
         issue_list::tests::synced,
@@ -131,6 +167,7 @@ mod tests {
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext};
+    use std::collections::BTreeMap;
 
     fn emit(cx: &mut TestAppContext, event: SyncEvent) {
         cx.update(|cx| cx.global::<Core>().state.emit(event));
@@ -212,5 +249,78 @@ mod tests {
         emit(cx, SyncEvent::Error("Jira returned 502".to_owned()));
         wait_for_status(cx, window, "Last sync failed · last synced just now");
         assert_eq!(notifications(cx), 3);
+    }
+
+    fn skip(cx: &mut TestAppContext, key: &str, reason: &str) {
+        emit(
+            cx,
+            SyncEvent::IssueSkipped {
+                key: key.to_owned(),
+                reason: reason.to_owned(),
+            },
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_window_names_the_skipped_issues_until_a_sync_reads_them(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[]);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            window.try_find("sync-status").is_some()
+        });
+        let skipped = |cx: &mut TestAppContext| {
+            in_window(cx, window, |window, _| {
+                window
+                    .try_find("skipped-issues")
+                    .and_then(|skipped| skipped.label().map(str::to_owned))
+            })
+        };
+        assert_eq!(skipped(cx), None);
+
+        skip(
+            cx,
+            "WEB-2",
+            "unexpected issue from Jira: missing field `summary`",
+        );
+        wait_until(cx, window, |window| {
+            window.try_find("skipped-issues").is_some()
+        });
+        assert_eq!(skipped(cx).as_deref(), Some("Skipped WEB-2"));
+
+        // The same issue is skipped again by every cycle: nothing new to tell
+        skip(
+            cx,
+            "WEB-2",
+            "unexpected issue from Jira: missing field `summary`",
+        );
+        skip(cx, "WEB-3", "WEB-3 has an unreadable `updated`");
+        wait_until(cx, window, |window| {
+            window.find("skipped-issues").label() == Some("Skipped WEB-2, WEB-3")
+        });
+        let notifications = in_window(cx, window, |window, cx| window.notifications(cx).len());
+        assert_eq!(notifications, 0);
+
+        // A later sync stored WEB-2
+        emit(cx, SyncEvent::IssuesUpdated(vec!["WEB-2".into()]));
+        wait_until(cx, window, |window| {
+            window.find("skipped-issues").label() == Some("Skipped WEB-3")
+        });
+        emit(cx, SyncEvent::IssuesUpdated(vec!["WEB-3".into()]));
+        wait_until(cx, window, |window| {
+            window.try_find("skipped-issues").is_none()
+        });
+    }
+
+    #[test]
+    fn the_reasons_name_each_skipped_issue() {
+        let skipped = BTreeMap::from([
+            ("WEB-2".to_owned(), "no summary".to_owned()),
+            ("WEB-3".to_owned(), "bad date".to_owned()),
+        ]);
+        assert_eq!(
+            skipped_reasons(&skipped),
+            "WEB-2: no summary\nWEB-3: bad date"
+        );
     }
 }
