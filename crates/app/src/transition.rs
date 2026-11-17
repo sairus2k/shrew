@@ -880,4 +880,69 @@ mod tests {
             json!({ "transition": { "id": "21" }, "fields": {} })
         );
     }
+
+    /// Jira after it has said no to a transition of WEB-1: the issue is still
+    /// in To Do, and the menu of To Do is asked for again after the rejection.
+    async fn jira_rejects_the_transition(server: &MockServer) {
+        server.reset().await;
+        let [(_, to_do), _] = offers();
+        let mut web_1 = two_issues()[0].clone();
+        web_1["fields"]["status"] = to("To Do", "new");
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(web_1))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1/transitions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "transitions": to_do })))
+            // The menu of the status the issue is moved to, which Jira has not
+            // seen, and the menu of To Do again, as the cache dropped it
+            .expect(2)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/WEB-1/transitions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[gpui_kit::test]
+    fn a_transition_jira_rejects_is_undone_and_reported(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port()));
+        let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        tokio.block_on(jira_rejects_the_transition(&server));
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "Start");
+            assert_eq!(status(window), "Status: In Progress");
+            assert!(pending(window));
+            assert_eq!(window.notifications(cx).len(), 0);
+        });
+
+        // A sync cycle sends it and Jira says no
+        let state = core(cx);
+        tokio.block_on(state.sync_once()).unwrap();
+
+        wait_until(cx, window, |window| status(window) == "Status: To Do");
+        in_window(cx, window, |window, cx| {
+            assert!(!pending(window));
+            assert_eq!(window.find("status-button").label(), Some("To Do"));
+            assert_eq!(window.notifications(cx).len(), 1);
+        });
+        close(cx, window);
+        wait_until(cx, window, |window| {
+            rows(window).contains(&"WEB-1: Fix login, To Do, Unassigned".to_owned())
+        });
+    }
 }

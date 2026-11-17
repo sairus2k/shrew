@@ -6,9 +6,13 @@ use crate::{
     db::{
         issues,
         sync_queue::{self, QueueEntry},
+        transitions::{self, Position},
     },
     models::IssueKey,
-    sync::jira_client::{JiraClient, JiraError},
+    sync::{
+        inbound,
+        jira_client::{JiraClient, JiraError},
+    },
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -30,7 +34,8 @@ enum Failure {
 
 /// Sends the queued changes to Jira, oldest first, and adds the keys of the
 /// issues whose changes Jira accepted to `delivered`. An entry Jira rejects is
-/// marked `failed` and announced with `SyncEvent::Error`, and the pass goes on.
+/// marked `failed`, rolled back and announced with `SyncEvent::ChangeRejected`,
+/// and the pass goes on.
 /// The pass ends with an error when Jira cannot be reached or rejects the
 /// token: the entries then stay `pending` for a later pass.
 pub(crate) async fn process_queue(
@@ -71,11 +76,70 @@ pub(crate) async fn process_queue(
             }
             Failure::Transient | Failure::Rejected => {
                 sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
-                let event = SyncEvent::Error(format!("{}: {message}", entry.issue_key));
+                if entry.entity_type == "transition" {
+                    // The entry is failed whether or not the rollback works: with
+                    // Jira out of reach the status stays as the user left it
+                    let refused = matches!(
+                        error.downcast_ref(),
+                        Some(JiraError::Status(status, _)) if status.is_client_error()
+                    );
+                    roll_back(state, &client, &entry.issue_key, refused)
+                        .await
+                        .ok();
+                }
+                // A refused comment moves from the pending ones to the refused ones
+                let updated = SyncEvent::IssuesUpdated(vec![entry.issue_key.clone()]);
+                state.events.send(updated).ok();
+                let event = rejection(&entry.issue_key, &entry.entity_type, &message);
                 state.events.send(event).ok();
             }
         }
     }
+    Ok(())
+}
+
+/// What the user is told about an entry that will not reach Jira.
+pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> SyncEvent {
+    let action = match entity_type {
+        "transition" => "status change",
+        other => other,
+    };
+    SyncEvent::ChangeRejected {
+        key: key.clone(),
+        action: action.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// Reads the issue again and stores it as Jira has it, so that a status the
+/// user chose and Jira refused does not stay on screen. Jira has not changed
+/// the issue, so its `updated` is no newer than the stored row's.
+///
+/// With `refused` (Jira answered with a 4xx) the cached menu of the status the
+/// issue is in is dropped, because a field or a validator it did not know about
+/// may be the reason. That is the status the transition started from, unless a
+/// teammate moved the issue first, and then the menu of that status is as good
+/// as any to refetch.
+async fn roll_back(
+    state: &AppState,
+    client: &JiraClient,
+    key: &IssueKey,
+    refused: bool,
+) -> anyhow::Result<()> {
+    let issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
+    let record = inbound::issue_record(&issue)?;
+    let mut tx = state.pool.begin().await?;
+    issues::mark_stale(&mut *tx, &record.id).await?;
+    issues::upsert(&mut *tx, &record).await?;
+    if refused && let Some(issue_type) = &record.issue_type {
+        let position = Position {
+            project_key: record.project_key.clone(),
+            issue_type: issue_type.clone(),
+            status: record.status.clone(),
+        };
+        transitions::forget(&mut *tx, &position).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -199,6 +263,12 @@ mod tests {
         received
     }
 
+    fn rejected(key: &str, action: &str, reason: &str) -> String {
+        format!(
+            "ChangeRejected {{ key: IssueKey({key:?}), action: {action:?}, reason: {reason:?} }}"
+        )
+    }
+
     fn keys(keys: &[&str]) -> Vec<IssueKey> {
         keys.iter().map(|key| IssueKey::from(*key)).collect()
     }
@@ -317,7 +387,10 @@ mod tests {
         );
         assert_eq!(
             received(&mut events),
-            [format!("Error({:?})", format!("WEB-1: {error}"))]
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected("WEB-1", "status change", error)
+            ]
         );
         // The entries behind it are not held up
         assert_eq!(entry(&state, next).await.0, "synced");
@@ -353,7 +426,10 @@ mod tests {
         );
         assert_eq!(
             received(&mut events),
-            [format!("Error({:?})", format!("WEB-1: {error}"))]
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected("WEB-1", "status change", error)
+            ]
         );
         assert!(delivered.is_empty());
     }
@@ -550,11 +626,50 @@ mod tests {
                 "summary": "Fix login",
                 "status": { "name": "To Do", "statusCategory": { "key": "new" } },
                 "project": { "key": "WEB" },
+                "issuetype": { "name": "Bug" },
                 "updated": "2026-03-29T01:30:00.000+0100",
             },
         }))
         .unwrap();
         issues::upsert(&state.pool, &issue).await.unwrap();
+    }
+
+    /// What Jira answers when it is asked for WEB-1, which it still has in To Do.
+    fn jira_has_web_1_in_to_do() -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "10001",
+                "key": "WEB-1",
+                "fields": {
+                    "summary": "Fix login",
+                    "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                    "project": { "key": "WEB" },
+                    "issuetype": { "name": "Bug" },
+                    "updated": "2026-03-29T01:30:00.000+0100",
+                },
+            })))
+    }
+
+    /// What the transition cache holds for WEB-1's workflow, by status.
+    async fn cached_statuses(state: &AppState) -> Vec<String> {
+        sqlx::query_scalar("SELECT from_status FROM transition_cache ORDER BY from_status")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn cache_transitions_of(state: &AppState, statuses: &[&str]) {
+        for status in statuses {
+            let position = crate::db::transitions::Position {
+                project_key: "WEB".to_owned(),
+                issue_type: "Bug".to_owned(),
+                status: (*status).to_owned(),
+            };
+            crate::db::transitions::put(&state.pool, &position, &[start()])
+                .await
+                .unwrap();
+        }
     }
 
     /// The status of WEB-1 and whether it waits for Jira.
@@ -825,5 +940,222 @@ mod tests {
         );
         assert_eq!(comments(&state).await.len(), 1);
         assert!(!comments(&state).await[0].0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_transition_shows_the_status_jira_has_and_drops_its_cached_menu() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        cache_transitions_of(&state, &["To Do", "In Progress"]).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .mount(&server)
+            .await;
+        jira_has_web_1_in_to_do().mount(&server).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            issue(&state).await,
+            ("In Progress".to_owned(), SyncStatus::Pending)
+        );
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        // Jira's `updated` did not change, and the row still goes back
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Synced)
+        );
+        // Only the menu of the status the issue is in is refetched
+        assert_eq!(cached_statuses(&state).await, ["In Progress"]);
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "status change",
+                    "Jira returned 400 Bad Request: Resolution is required"
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_given_up_on_after_server_errors_is_rolled_back_but_keeps_its_menu() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        cache_transitions_of(&state, &["To Do"]).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        jira_has_web_1_in_to_do().mount(&server).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Synced)
+        );
+        assert_eq!(cached_statuses(&state).await, ["To Do"]);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_for_an_issue_jira_no_longer_has_is_still_announced() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(404).set_body_string("Issue Does Not Exist"))
+            .mount(&server)
+            .await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        // Nothing to read the status from: the row stays as it was
+        assert_eq!(issue(&state).await.0, "In Progress");
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "status change",
+                    "Jira returned 404 Not Found: Issue Does Not Exist"
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_comment_keeps_its_text_until_it_is_retried_or_discarded() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(403).set_body_string("No permission"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        let reason = "Jira returned 403 Forbidden: No permission";
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected("WEB-1", "comment", reason)
+            ]
+        );
+        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail = detail.unwrap().unwrap();
+        assert_eq!(detail.comment_total, 1);
+        let [comment] = &detail.comments[..] else {
+            panic!("expected the refused comment, got {:?}", detail.comments)
+        };
+        assert_eq!(comment.body_md, "Seen on staging");
+        assert!(!comment.pending);
+        let refused = comment.rejected.clone().unwrap();
+        assert_eq!(refused.reason, reason);
+        // A refused comment is not a change Jira is still to receive
+        assert_eq!(api::unsent_changes(&state).await.unwrap(), 0);
+
+        api::retry_comment(&state, refused.entry_id).await.unwrap();
+        assert_eq!(
+            comments(&state).await,
+            [(true, "Seen on staging".to_owned())]
+        );
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(
+            comments(&state).await,
+            [(false, "Seen on staging\\\nand in production".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_comment_can_be_discarded_and_only_a_refused_one() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+        api::add_comment(&state, &"WEB-1".into(), "Second")
+            .await
+            .unwrap();
+        let second: i64 = sqlx::query_scalar("SELECT MAX(id) FROM sync_queue")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let mut delivered = Vec::new();
+        // Both are refused; a third one is queued after the pass
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        api::add_comment(&state, &"WEB-1".into(), "Third")
+            .await
+            .unwrap();
+        let third: i64 = sqlx::query_scalar("SELECT MAX(id) FROM sync_queue")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        api::discard_comment(&state, second).await.unwrap();
+
+        let left: Vec<String> = comments(&state)
+            .await
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(left, ["Seen on staging", "Third"]);
+        // Not refused: it is still on its way
+        api::discard_comment(&state, third).await.unwrap_err();
+        api::retry_comment(&state, third).await.unwrap_err();
+        assert_eq!(comments(&state).await.len(), 2);
     }
 }

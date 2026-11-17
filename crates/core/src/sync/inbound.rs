@@ -3,9 +3,12 @@
 use crate::{
     AppState, SyncEvent, adf,
     auth::{self, Config},
-    db::issues::{self, IssueRecord, JiraTimestamp},
+    db::{
+        issues::{self, IssueRecord, JiraTimestamp},
+        sync_queue,
+    },
     models::{IssueKey, StatusCategory},
-    sync::jira_client::JiraClient,
+    sync::{jira_client::JiraClient, outbound},
 };
 use anyhow::Context;
 use serde::Deserialize;
@@ -22,7 +25,9 @@ const POLL_OVERLAP_MS: i64 = 60_000;
 
 const RECONCILE_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
-const ISSUE_FIELDS: &[&str] = &[
+const ISSUE_GONE: &str = "The issue no longer exists in Jira or is not visible to you";
+
+pub(crate) const ISSUE_FIELDS: &[&str] = &[
     "summary",
     "description",
     "status",
@@ -340,15 +345,26 @@ pub(crate) async fn reconcile_removed_issues(
     };
 
     let mut removed = Vec::new();
+    let mut rejected = Vec::new();
     let mut tx = state.pool.begin().await?;
     // Ids that only Jira has are new issues: the incremental poll stores them
     for issue in issues::cached(&mut *tx).await? {
         if config.watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
             issues::delete(&mut *tx, &issue.id).await?;
+            // Nothing is left to send them to
+            let unsent = sync_queue::fail_unsent(&mut *tx, &issue.key, ISSUE_GONE).await?;
+            rejected.extend(
+                unsent
+                    .iter()
+                    .map(|entity_type| outbound::rejection(&issue.key, entity_type, ISSUE_GONE)),
+            );
             removed.push(issue.key);
         }
     }
     tx.commit().await?;
+    for event in rejected {
+        state.events.send(event).ok();
+    }
 
     current.last_reconcile_at = started_at;
     auth::save_config(&state.data_dir, current).await?;
@@ -1264,6 +1280,58 @@ mod tests {
         state.sync_waker.send(()).unwrap();
 
         assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+    }
+
+    #[tokio::test]
+    async fn the_unsent_changes_of_a_removed_issue_fail_and_the_user_is_told() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        listing(ids(1..2)).with_priority(1).mount(&server).await;
+        let (gone, kept) = (IssueKey::from("WEB-2"), IssueKey::from("WEB-1"));
+        let payload = json!({ "transition": { "id": "11" }, "fields": {} }).to_string();
+        let comment = json!({ "text": "Seen on staging" }).to_string();
+        crate::db::sync_queue::enqueue(&state.pool, "transition", &gone, &payload)
+            .await
+            .unwrap();
+        crate::db::sync_queue::enqueue(&state.pool, "comment", &gone, &comment)
+            .await
+            .unwrap();
+        crate::db::sync_queue::enqueue(&state.pool, "comment", &kept, &comment)
+            .await
+            .unwrap();
+        let config = state.config.read().await.clone().unwrap();
+
+        let removed = reconcile_removed_issues(&state, &config).await.unwrap();
+
+        assert_eq!(removed, std::slice::from_ref(&gone));
+        let reason = "The issue no longer exists in Jira or is not visible to you";
+        assert_eq!(
+            received(&mut events),
+            [
+                format!(
+                    "ChangeRejected {{ key: IssueKey(\"WEB-2\"), action: \"status change\", reason: {reason:?} }}"
+                ),
+                format!(
+                    "ChangeRejected {{ key: IssueKey(\"WEB-2\"), action: \"comment\", reason: {reason:?} }}"
+                ),
+            ]
+        );
+        let entries: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT issue_key, status, error_msg FROM sync_queue ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        let failed = |key: &str| (key.to_owned(), "failed".to_owned(), Some(reason.to_owned()));
+        assert_eq!(
+            entries,
+            [
+                failed("WEB-2"),
+                failed("WEB-2"),
+                ("WEB-1".to_owned(), "pending".to_owned(), None)
+            ]
+        );
     }
 
     #[tokio::test]

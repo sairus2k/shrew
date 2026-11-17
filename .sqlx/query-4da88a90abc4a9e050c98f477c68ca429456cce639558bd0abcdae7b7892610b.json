@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE issues SET remote_updated_at = '' WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "4da88a90abc4a9e050c98f477c68ca429456cce639558bd0abcdae7b7892610b"
+}

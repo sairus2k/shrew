@@ -2,8 +2,12 @@
 
 use crate::comment::CommentForm;
 use crate::issue::IssueModel;
+use crate::runtime::spawn;
 use crate::transition::StatusButton;
-use app_core::models::{Comment, IssueDetail, SyncStatus};
+use app_core::{
+    api,
+    models::{Comment, IssueDetail, RejectedComment, SyncStatus},
+};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
@@ -125,6 +129,8 @@ fn code_block(node: &MarkdownNode, _: &mut Window, _: &mut App) -> Stateful<Div>
 fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
     let when = if comment.pending {
         "pending".to_owned()
+    } else if comment.rejected.is_some() {
+        "not sent".to_owned()
     } else {
         minute(&comment.created)
     };
@@ -143,6 +149,59 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
                 .child(heading),
         )
         .child(markdown(("comment-body", index), &comment.body_md))
+        .children(
+            comment
+                .rejected
+                .as_ref()
+                .map(|rejected| rejected_comment(index, rejected, cx)),
+        )
+}
+
+/// What Jira said about a comment it refused, and what the user can do about it.
+fn rejected_comment(index: usize, rejected: &RejectedComment, cx: &App) -> impl IntoElement {
+    let reason = format!("Not sent: {}", rejected.reason);
+    let entry_id = rejected.entry_id;
+    div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap_1()
+        .child(
+            div()
+                .id(SharedString::from(format!("comment-reason-{index}")))
+                .test_support()
+                .aria_label(reason.clone())
+                .text_sm()
+                .text_color(cx.theme().danger)
+                .child(reason),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new(SharedString::from(format!("retry-comment-{index}")))
+                        .small()
+                        .label("Retry")
+                        .on_click(move |_, _, cx| {
+                            spawn(cx, move |state| async move {
+                                api::retry_comment(&state, entry_id).await
+                            })
+                            .detach_and_log_err(cx)
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("discard-comment-{index}")))
+                        .small()
+                        .label("Discard")
+                        .on_click(move |_, _, cx| {
+                            spawn(cx, move |state| async move {
+                                api::discard_comment(&state, entry_id).await
+                            })
+                            .detach_and_log_err(cx)
+                        }),
+                ),
+        )
 }
 
 fn body(

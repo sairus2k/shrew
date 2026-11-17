@@ -1,6 +1,8 @@
 use crate::{
     adf,
-    models::{Comment, IssueDetail, IssueKey, IssueRow, StatusCategory, SyncStatus},
+    models::{
+        Comment, IssueDetail, IssueKey, IssueRow, RejectedComment, StatusCategory, SyncStatus,
+    },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
@@ -179,6 +181,7 @@ pub(crate) async fn get_detail(
                 created: name(&comment["created"]).unwrap_or_default(),
                 body_md: adf::to_markdown(comment.get("body"), &url),
                 pending: false,
+                rejected: None,
             })
             .chain(pending)
             .collect(),
@@ -187,30 +190,37 @@ pub(crate) async fn get_detail(
     }))
 }
 
-/// The comments of the issue that wait in the outbox, oldest first.
+/// The comments of the issue that are not in Jira: those that wait in the
+/// outbox and those Jira refused, oldest first.
 async fn pending_comments(
     pool: &SqlitePool,
     key: &IssueKey,
     issue_url: &str,
 ) -> sqlx::Result<Vec<Comment>> {
-    let payloads: Vec<String> = sqlx::query_scalar(
-        "SELECT payload FROM sync_queue
-         WHERE issue_key = ? AND entity_type = 'comment' AND status IN ('pending', 'in_progress')
+    let entries: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, payload, status, error_msg FROM sync_queue
+         WHERE issue_key = ? AND entity_type = 'comment'
+           AND status IN ('pending', 'in_progress', 'failed')
          ORDER BY id",
     )
     .bind(key)
     .fetch_all(pool)
     .await?;
-    Ok(payloads
-        .iter()
-        .map(|payload| {
-            let payload: Value = serde_json::from_str(payload).unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .map(|(entry_id, payload, status, error)| {
+            let payload: Value = serde_json::from_str(&payload).unwrap_or_default();
             let text = payload["text"].as_str().unwrap_or_default();
+            let failed = status == "failed";
             Comment {
                 author_name: "You".to_owned(),
                 created: String::new(),
                 body_md: adf::to_markdown(Some(&adf::from_plain_text(text)), issue_url),
-                pending: true,
+                pending: !failed,
+                rejected: failed.then(|| RejectedComment {
+                    entry_id,
+                    reason: error.unwrap_or_default(),
+                }),
             }
         })
         .collect())
@@ -282,6 +292,19 @@ pub(crate) async fn confirm(
     )
     .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// Lets the next upsert of the issue overwrite the row, whatever `updated` it
+/// carries: the issue is read again to undo a local change, and Jira has not
+/// touched it since the row was written.
+pub(crate) async fn mark_stale(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!("UPDATE issues SET remote_updated_at = '' WHERE id = ?", id)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 

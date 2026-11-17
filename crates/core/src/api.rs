@@ -281,6 +281,26 @@ pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow
     Ok(())
 }
 
+/// Queues a comment Jira refused again, as it was written. `entry_id` comes
+/// from `Comment::rejected`.
+pub async fn retry_comment(state: &AppState, entry_id: i64) -> anyhow::Result<()> {
+    let key = db::sync_queue::retry_comment(&state.pool, entry_id)
+        .await?
+        .with_context(|| format!("entry {entry_id} is not a refused comment"))?;
+    state.events.send(SyncEvent::IssuesUpdated(vec![key])).ok();
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+/// Throws away a comment Jira refused. `entry_id` comes from `Comment::rejected`.
+pub async fn discard_comment(state: &AppState, entry_id: i64) -> anyhow::Result<()> {
+    let key = db::sync_queue::discard_comment(&state.pool, entry_id)
+        .await?
+        .with_context(|| format!("entry {entry_id} is not a refused comment"))?;
+    state.events.send(SyncEvent::IssuesUpdated(vec![key])).ok();
+    Ok(())
+}
+
 /// The 50 best matches of `query` in the local cache, best first. Every word
 /// must match a key, a summary or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
@@ -542,6 +562,7 @@ mod tests {
             created: created.to_owned(),
             body_md: body.to_owned(),
             pending: false,
+            rejected: None,
         };
         assert_eq!(
             issue,
@@ -710,6 +731,7 @@ mod tests {
                 created: String::new(),
                 body_md: "Seen on staging\\\nand \\*prod\\*".to_owned(),
                 pending: true,
+                rejected: None,
             }]
         );
         assert_eq!(issue.comment_total, 1);

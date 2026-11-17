@@ -267,6 +267,15 @@ impl JiraClient {
         Ok(issue.fields.status.name)
     }
 
+    /// The issue as Jira has it now, with `fields`.
+    pub(crate) async fn issue(&self, key: &IssueKey, fields: &[&str]) -> Result<Value, JiraError> {
+        let request = self
+            .http
+            .get(self.url(&format!("/issue/{key}")))
+            .query(&[("fields", fields.join(","))]);
+        self.send(request).await
+    }
+
     /// The transitions the issue offers from the status it has in Jira, each
     /// with the fields of its screen.
     pub(crate) async fn transitions(

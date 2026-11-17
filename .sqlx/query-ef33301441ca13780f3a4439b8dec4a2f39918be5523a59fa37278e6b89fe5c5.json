@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sync_queue SET status = 'pending', retry_count = 0, error_msg = NULL\n           WHERE id = ? AND entity_type = 'comment' AND status = 'failed'\n           RETURNING issue_key AS \"issue_key: IssueKey\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "issue_key: IssueKey",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ef33301441ca13780f3a4439b8dec4a2f39918be5523a59fa37278e6b89fe5c5"
+}

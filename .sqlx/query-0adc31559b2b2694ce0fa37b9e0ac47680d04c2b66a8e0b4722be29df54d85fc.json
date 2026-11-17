@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM sync_queue\n           WHERE id = ? AND entity_type = 'comment' AND status = 'failed'\n           RETURNING issue_key AS \"issue_key: IssueKey\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "issue_key: IssueKey",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0adc31559b2b2694ce0fa37b9e0ac47680d04c2b66a8e0b4722be29df54d85fc"
+}

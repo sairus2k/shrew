@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE sync_queue SET status = 'failed', error_msg = ?\n         WHERE issue_key = ? AND status IN ('pending', 'in_progress')\n         RETURNING entity_type",
+  "describe": {
+    "columns": [
+      {
+        "name": "entity_type",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "37525f0249ca92212b23842e8f8172ce9bc4cad8d78c48a3669cb5a3e26fecb8"
+}

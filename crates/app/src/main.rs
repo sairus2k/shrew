@@ -1,5 +1,8 @@
 use account::{Account, SignedOut};
-use app_core::{SyncEvent, models::SetupStep};
+use app_core::{
+    SyncEvent,
+    models::{IssueKey, SetupStep},
+};
 use gpui_kit::component::{
     ActiveTheme, Sizable, WindowExt as _,
     button::{Button, ButtonVariants},
@@ -79,6 +82,14 @@ impl Root {
             SyncEvent::Error(error) if self.notified_error.as_ref() != Some(error) => {
                 self.notified_error = Some(error.clone());
                 window.push_notification(Notification::error(error.clone()), cx);
+            }
+            SyncEvent::ChangeRejected {
+                key,
+                action,
+                reason,
+            } => {
+                let message = rejection_message(key, action, reason);
+                window.push_notification(Notification::error(message), cx);
             }
             SyncEvent::TokenRejected => self.ask_for_token(window, cx),
             _ => {}
@@ -272,6 +283,10 @@ impl Render for Root {
     }
 }
 
+fn rejection_message(key: &IssueKey, action: &str, reason: &str) -> String {
+    format!("{key}: {action} rejected: {reason}")
+}
+
 fn main() -> anyhow::Result<()> {
     // sqlx and reqwest need a tokio runtime. GPUI drives the UI on its own executor,
     // so tokio runs beside it on two worker threads.
@@ -302,4 +317,17 @@ fn main() -> anyhow::Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rejection_message;
+
+    #[test]
+    fn a_rejection_names_the_issue_the_action_and_jiras_reason() {
+        assert_eq!(
+            rejection_message(&"WEB-1".into(), "status change", "Resolution is required"),
+            "WEB-1: status change rejected: Resolution is required"
+        );
+    }
 }

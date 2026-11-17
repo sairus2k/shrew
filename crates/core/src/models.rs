@@ -83,6 +83,16 @@ pub struct Comment {
     /// Written here, and Jira has not received it yet. Such a comment has no
     /// `created` time.
     pub pending: bool,
+    /// Set for a comment Jira refused. It stays until the user retries or discards it.
+    pub rejected: Option<RejectedComment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedComment {
+    /// What `api::retry_comment` and `api::discard_comment` take.
+    pub entry_id: i64,
+    /// Why Jira refused it.
+    pub reason: String,
 }
 
 /// One way out of a status: an entry of the status menu.

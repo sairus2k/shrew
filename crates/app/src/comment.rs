@@ -95,6 +95,7 @@ mod tests {
     use crate::issue_list::tests::{issue, synced_on};
     use crate::runtime::Core;
     use app_core::AppState;
+    use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext, Window};
     use serde_json::{Value, json};
@@ -322,5 +323,83 @@ mod tests {
             sent[0]["body"]["content"][0]["content"][0]["text"],
             "Written on the train"
         );
+    }
+
+    /// Jira refuses the first comment on WEB-1 and takes every later one.
+    async fn refuse_one_comment(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/WEB-1/comment"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("No permission"))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        accept_comments(server).await;
+    }
+
+    /// Writes "Seen on staging", sends it and waits until Jira has refused it.
+    fn comment_that_jira_refuses(
+        cx: &mut TestAppContext,
+        tokio: &tokio::runtime::Runtime,
+        window: AnyWindowHandle,
+    ) {
+        in_window(cx, window, |window, cx| {
+            write(window, cx, &["Seen on staging"]);
+            window.click("submit-comment", cx);
+        });
+        wait_until(cx, window, |window| headings(window) == ["You, pending"]);
+        tokio.block_on(core(cx).sync_once()).unwrap();
+        wait_until(cx, window, |window| headings(window) == ["You, not sent"]);
+    }
+
+    #[gpui_kit::test]
+    fn a_comment_jira_refuses_stays_with_its_text_and_can_be_retried(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([issue(1, "Fix login")])));
+        tokio.block_on(refuse_one_comment(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+
+        comment_that_jira_refuses(cx, &tokio, window);
+
+        in_window(cx, window, |window, cx| {
+            assert_eq!(painted(window, ("comment-body", 0usize)), "Seen on staging");
+            assert_eq!(
+                window.find("comment-reason-0").label(),
+                Some("Not sent: Jira returned 403 Forbidden: No permission")
+            );
+            // The notification of the rejection is the only one
+            assert_eq!(window.notifications(cx).len(), 1);
+            window.click("retry-comment-0", cx);
+        });
+        wait_until(cx, window, |window| headings(window) == ["You, pending"]);
+        tokio.block_on(core(cx).sync_once()).unwrap();
+
+        wait_until(cx, window, |window| {
+            headings(window) == ["Ada Lovelace, 2026-03-30 10:00"]
+        });
+        assert_eq!(posts(&tokio, &server).len(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_comment_jira_refuses_can_be_discarded(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([issue(1, "Fix login")])));
+        tokio.block_on(refuse_one_comment(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+        comment_that_jira_refuses(cx, &tokio, window);
+
+        in_window(cx, window, |window, cx| {
+            window.click("discard-comment-0", cx)
+        });
+
+        wait_until(cx, window, |window| {
+            window.try_find("no-comments").is_some()
+        });
+        // Nothing is left to send
+        tokio.block_on(core(cx).sync_once()).unwrap();
+        assert_eq!(posts(&tokio, &server).len(), 1);
     }
 }

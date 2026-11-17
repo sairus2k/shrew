@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM transition_cache\n         WHERE project_key = ? AND issue_type = ? AND from_status = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "35990d8f3d12677ea1576d3894b4e756207fd20c3d42044885f7fe87ea61fc22"
+}

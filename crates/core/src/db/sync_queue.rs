@@ -100,6 +100,50 @@ pub(crate) async fn mark_failed(pool: &SqlitePool, id: i64, error: &str) -> sqlx
     Ok(())
 }
 
+/// Gives up on the changes of an issue that have not reached Jira. Returns
+/// the entity type of each.
+pub(crate) async fn fail_unsent(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+    error: &str,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar!(
+        "UPDATE sync_queue SET status = 'failed', error_msg = ?
+         WHERE issue_key = ? AND status IN ('pending', 'in_progress')
+         RETURNING entity_type",
+        error,
+        key
+    )
+    .fetch_all(executor)
+    .await
+}
+
+/// Puts a comment Jira refused back in the queue. Returns the key of its
+/// issue, or `None` if the entry is not a refused comment.
+pub(crate) async fn retry_comment(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<IssueKey>> {
+    sqlx::query_scalar!(
+        r#"UPDATE sync_queue SET status = 'pending', retry_count = 0, error_msg = NULL
+           WHERE id = ? AND entity_type = 'comment' AND status = 'failed'
+           RETURNING issue_key AS "issue_key: IssueKey""#,
+        id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Deletes a comment Jira refused. Returns the key of its issue, or `None` if
+/// the entry is not a refused comment.
+pub(crate) async fn discard_comment(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<IssueKey>> {
+    sqlx::query_scalar!(
+        r#"DELETE FROM sync_queue
+           WHERE id = ? AND entity_type = 'comment' AND status = 'failed'
+           RETURNING issue_key AS "issue_key: IssueKey""#,
+        id
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// How many changes Jira has not received yet. A failed one is not counted:
 /// Jira refused it for good.
 pub(crate) async fn unsent(pool: &SqlitePool) -> sqlx::Result<i64> {

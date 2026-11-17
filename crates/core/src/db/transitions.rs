@@ -77,3 +77,20 @@ pub(crate) async fn put(
     .await?;
     Ok(())
 }
+
+/// Forgets what the status offers, so that the next open asks Jira again.
+pub(crate) async fn forget(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    position: &Position,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "DELETE FROM transition_cache
+         WHERE project_key = ? AND issue_type = ? AND from_status = ?",
+        position.project_key,
+        position.issue_type,
+        position.status,
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
