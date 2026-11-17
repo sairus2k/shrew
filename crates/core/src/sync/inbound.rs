@@ -178,10 +178,10 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             for issue in &page.issues {
                 if let Some(record) = readable_record(state, issue) {
                     issues::upsert(&mut *tx, &record).await?;
+                    synced += 1;
                 }
             }
             tx.commit().await?;
-            synced += page.issues.len() as u64;
             report(synced);
 
             // The approximate total is never the reason to stop
@@ -546,6 +546,26 @@ mod tests {
             .collect();
         assert_eq!(skipped.len(), 1, "{received:?}");
         assert!(skipped[0].contains("WEB-2") && skipped[0].contains("summary"));
+    }
+
+    #[tokio::test]
+    async fn the_initial_sync_progress_does_not_count_a_skipped_issue() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = watching(&server, data_dir.path(), &["WEB"]).await;
+        mount_count(&server, "WEB", 3).await;
+        let first = [issue(1, "WEB"), without_summary(issue(2, "WEB"))];
+        mount_page(&server, "WEB", None, page(&first, Some("tok"))).await;
+        mount_page(&server, "WEB", Some("tok"), page(&[issue(3, "WEB")], None)).await;
+
+        api::initial_sync(&state).await.unwrap();
+
+        let progress: Vec<_> = received(&mut events)
+            .into_iter()
+            .filter(|event| event.starts_with("WEB "))
+            .collect();
+        assert_eq!(progress, ["WEB 0 / ~3", "WEB 1 / ~3", "WEB 2 / ~3"]);
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
     }
 
     #[tokio::test]
