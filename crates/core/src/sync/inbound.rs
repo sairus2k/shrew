@@ -172,6 +172,16 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             let page = client
                 .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
                 .await?;
+            // Held until the commit, as in `poll_updated_issues`: a page is
+            // either stored before `watch_projects` deletes the rows of a
+            // removed project or not stored at all
+            let saved = state.config.read().await;
+            let watched = saved
+                .as_ref()
+                .is_some_and(|current| current.watched_projects.contains(project_key));
+            if !watched {
+                break;
+            }
             // One transaction per page: a commit per issue would make the disk
             // the slowest part of the sync
             let mut tx = state.pool.begin().await?;
@@ -182,6 +192,7 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
                 }
             }
             tx.commit().await?;
+            drop(saved);
             report(synced);
 
             // The approximate total is never the reason to stop
@@ -523,6 +534,52 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, "API-4".into());
+    }
+
+    #[tokio::test]
+    async fn an_initial_sync_stops_downloading_a_project_that_was_unwatched_meanwhile() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = watching(&server, data_dir.path(), &["API", "WEB"]).await;
+        mount_count(&server, "API", 2).await;
+        let delay = std::time::Duration::from_millis(500);
+        // The second page is not mounted: asking for it would fail the sync
+        let first = page(&[issue(4, "API")], Some("tok")).set_delay(delay);
+        mount_page(&server, "API", None, first).await;
+        mount_count(&server, "WEB", 1).await;
+        mount_page(&server, "WEB", None, page(&[issue(1, "WEB")], None)).await;
+
+        let syncing = tokio::spawn({
+            let state = state.clone();
+            async move { api::initial_sync(&state).await }
+        });
+        while !server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().ends_with("/search/jql"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let saving = std::time::Instant::now();
+        api::watch_projects(&state, &["WEB".to_owned()])
+            .await
+            .unwrap();
+        assert!(saving.elapsed() < delay);
+        syncing.await.unwrap().unwrap();
+
+        assert_eq!(stored_keys(&state).await, ["WEB-1"]);
+        assert_eq!(
+            received(&mut events),
+            [
+                "API 0 / ~2",
+                "WEB 0 / ~1",
+                "WEB 1 / ~1",
+                "InitialSyncComplete",
+            ]
+        );
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
     }
 
     fn without_summary(mut issue: Value) -> Value {
