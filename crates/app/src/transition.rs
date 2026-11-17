@@ -58,6 +58,10 @@ impl StatusButton {
         }
         self.loaded_for = status;
         let key = issue.key.clone();
+        // Until the new status answers, the button is disabled instead of
+        // offering transitions of the status the issue just left
+        self.transitions.clear();
+        cx.notify();
         let load = spawn(cx, move |state| async move {
             api::get_transitions(&state, &key).await
         });
@@ -556,7 +560,8 @@ mod tests {
         });
         // The menu follows the new status, and Jira is not asked about it
         wait_until(cx, window, |window| {
-            window.find("status-button").label() == Some("In Progress")
+            let button = window.find("status-button");
+            button.label() == Some("In Progress") && button.disabled() != Some(true)
         });
         let offered = in_window(cx, window, |window, cx| {
             let offered = open_menu(window, cx);
