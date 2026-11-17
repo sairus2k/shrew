@@ -148,7 +148,8 @@ pub async fn projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
 
 /// Saves the projects whose issues the app keeps locally. After the initial
 /// sync the added projects wait for `initial_sync` to download them, and the
-/// cached issues of the removed ones are deleted.
+/// cached issues of the removed ones are deleted. Their queued changes are
+/// still sent to Jira: the user made them on purpose.
 pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow::Result<()> {
     if project_keys.is_empty() {
         bail!("Choose at least one project");

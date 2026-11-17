@@ -129,7 +129,11 @@ async fn roll_back(
     let issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
     let record = inbound::issue_record(&issue)?;
     let mut tx = state.pool.begin().await?;
-    issues::mark_stale(&mut *tx, &record.id).await?;
+    // An issue the cache does not have belongs to a project that is no longer
+    // watched: upserting it would bring it back, and nothing syncs it there
+    if !issues::mark_stale(&mut *tx, &record.id).await? {
+        return Ok(());
+    }
     issues::upsert(&mut *tx, &record).await?;
     if refused && let Some(issue_type) = &record.issue_type {
         let position = Position {
@@ -1157,5 +1161,140 @@ mod tests {
         api::discard_comment(&state, third).await.unwrap_err();
         api::retry_comment(&state, third).await.unwrap_err();
         assert_eq!(comments(&state).await.len(), 2);
+    }
+
+    /// Stops watching WEB, which deletes its cached issues.
+    async fn unwatch_web(state: &AppState, server: &MockServer) {
+        *state.config.write().await = Some(config(&server.uri()));
+        api::watch_projects(state, &["API".to_owned()])
+            .await
+            .unwrap();
+        assert!(
+            issues::get(&state.pool, &"WEB-1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_queued_for_a_removed_project_is_still_delivered() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        unwatch_web(&state, &server).await;
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert_eq!(api::unsent_changes(&state).await.unwrap(), 0);
+        assert!(
+            issues::get(&state.pool, &"WEB-1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(received(&mut events), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_change_for_a_removed_project_is_announced_and_does_not_bring_the_issue_back()
+     {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .mount(&server)
+            .await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(403).set_body_string("No permission"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // What the rollback reads: the issue must not come back with it
+        jira_has_web_1_in_to_do().mount(&server).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+        api::add_comment(&state, &"WEB-1".into(), "and in production")
+            .await
+            .unwrap();
+        unwatch_web(&state, &server).await;
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        // The rejected entries did not stall the one behind them
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM sync_queue ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(statuses, ["failed", "failed", "synced"]);
+        assert!(
+            issues::get(&state.pool, &"WEB-1".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "status change",
+                    "Jira returned 400 Bad Request: Resolution is required"
+                ),
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "comment",
+                    "Jira returned 403 Forbidden: No permission"
+                ),
+            ]
+        );
+
+        // Watching the project again brings the refused comment back to where
+        // it can be retried or discarded
+        store_issue(&state).await;
+        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let comment = &detail.unwrap().unwrap().comments[0];
+        assert_eq!(comment.body_md, "Seen on staging");
+        assert!(comment.rejected.is_some());
     }
 }

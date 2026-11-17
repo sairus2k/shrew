@@ -297,15 +297,15 @@ pub(crate) async fn confirm(
 
 /// Lets the next upsert of the issue overwrite the row, whatever `updated` it
 /// carries: the issue is read again to undo a local change, and Jira has not
-/// touched it since the row was written.
+/// touched it since the row was written. Returns whether the cache has the issue.
 pub(crate) async fn mark_stale(
     executor: impl sqlx::SqliteExecutor<'_>,
     id: &str,
-) -> sqlx::Result<()> {
-    sqlx::query!("UPDATE issues SET remote_updated_at = '' WHERE id = ?", id)
+) -> sqlx::Result<bool> {
+    let marked = sqlx::query!("UPDATE issues SET remote_updated_at = '' WHERE id = ?", id)
         .execute(executor)
         .await?;
-    Ok(())
+    Ok(marked.rows_affected() > 0)
 }
 
 /// What identifies a cached issue, on Jira's side and on ours.
