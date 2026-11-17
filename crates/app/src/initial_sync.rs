@@ -190,7 +190,7 @@ mod tests {
     use gpui_kit::TestAppContext;
     use gpui_kit::test::TestWindowExt;
     use serde_json::{Value, json};
-    use std::path::Path;
+    use std::{path::Path, time::Duration};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_partial_json, path},
@@ -254,6 +254,18 @@ mod tests {
     fn the_sync_shows_progress_and_then_opens_the_app(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let server = tokio.block_on(MockServer::start());
+        // Mounted before the page that answers at once, so it wins: without
+        // the delay the sync can finish before the test looks at its progress
+        tokio.block_on(
+            Mock::given(path("/rest/api/3/search/jql"))
+                .and(body_partial_json(json!({ "nextPageToken": "tok" })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "issues": [issue(3)] }))
+                        .set_delay(Duration::from_millis(500)),
+                )
+                .mount(&server),
+        );
         tokio.block_on(mount_web(&server, true));
         let data_dir = watching_web(&server);
 
