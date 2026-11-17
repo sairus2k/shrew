@@ -81,17 +81,14 @@ mod tests {
 
     #[tokio::test]
     async fn start_creates_the_data_dir_and_the_event_channel() {
-        let data_dir = std::env::temp_dir()
-            .join(format!("app-core-test-{}", std::process::id()))
-            .join("nested");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("missing").join("nested");
 
         let (state, mut events) = start(&data_dir).await.unwrap();
         assert!(data_dir.is_dir());
 
         state.events.send(SyncEvent::Started).unwrap();
         assert!(matches!(events.recv().await, Some(SyncEvent::Started)));
-
-        std::fs::remove_dir_all(data_dir.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
