@@ -354,7 +354,7 @@ pub(crate) mod tests {
         data_dir
     }
 
-    fn api_issue(id: u32, summary: &str) -> Value {
+    pub(crate) fn api_issue(id: u32, summary: &str) -> Value {
         let mut issue = issue(id, summary);
         issue["key"] = json!(format!("API-{id}"));
         issue["fields"]["project"] = json!({ "key": "API" });
@@ -508,7 +508,7 @@ pub(crate) mod tests {
     }
 
     /// Opens the project menu and clicks the item `name`.
-    fn choose_project(window: &mut Window, cx: &mut gpui_kit::App, name: &str) {
+    pub(crate) fn choose_project(window: &mut Window, cx: &mut gpui_kit::App, name: &str) {
         window.click("project-filter", cx);
         window.render_frame(cx);
         let items = window.find_all_by_role(Role::MenuItem);

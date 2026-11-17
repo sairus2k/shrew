@@ -125,6 +125,7 @@ mod tests {
             account_id: "5b10a".to_owned(),
             watched_projects: vec!["WEB".to_owned()],
             last_sync_at: Some(inbound::now_ms().unwrap()),
+            pending_projects: Vec::new(),
             last_reconcile_at: 0,
             api_token: TOKEN.to_owned(),
         }

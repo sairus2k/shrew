@@ -17,6 +17,10 @@ pub(crate) struct Config {
     // sync has finished
     #[serde(default)]
     pub last_sync_at: Option<i64>,
+    // Watched projects added after the initial sync whose issues are not all
+    // downloaded yet. A quit in the middle leaves them here for the next start.
+    #[serde(default)]
+    pub pending_projects: Vec<String>,
     // When the last pass for deleted and moved issues started, in Unix
     // milliseconds. 0 until the first one
     #[serde(default)]

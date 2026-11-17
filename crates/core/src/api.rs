@@ -57,6 +57,7 @@ pub async fn sign_in(
         api_token: api_token.to_owned(),
         watched_projects: Vec::new(),
         last_sync_at: None,
+        pending_projects: Vec::new(),
         last_reconcile_at: 0,
     };
     // What a sign-out that failed halfway, or a config deleted by hand, left behind
@@ -123,7 +124,9 @@ pub async fn setup_step(state: &AppState) -> SetupStep {
     match &*state.config.read().await {
         None => SetupStep::SignIn,
         Some(config) if config.watched_projects.is_empty() => SetupStep::ChooseProjects,
-        Some(config) if config.last_sync_at.is_none() => SetupStep::InitialSync,
+        Some(config) if config.last_sync_at.is_none() || !config.pending_projects.is_empty() => {
+            SetupStep::InitialSync
+        }
         Some(_) => SetupStep::Ready,
     }
 }
@@ -143,16 +146,45 @@ pub async fn projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
         .collect())
 }
 
-/// Saves the projects whose issues the app keeps locally.
+/// Saves the projects whose issues the app keeps locally. After the initial
+/// sync the added projects wait for `initial_sync` to download them, and the
+/// cached issues of the removed ones are deleted.
 pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow::Result<()> {
     if project_keys.is_empty() {
         bail!("Choose at least one project");
     }
     let mut saved = state.config.write().await;
     let mut config = saved.clone().context("Sign in first")?;
+    if config.last_sync_at.is_some() {
+        let added = project_keys
+            .iter()
+            .filter(|key| !config.watched_projects.contains(key));
+        config
+            .pending_projects
+            .retain(|key| project_keys.contains(key));
+        for key in added {
+            if !config.pending_projects.contains(key) {
+                config.pending_projects.push(key.clone());
+            }
+        }
+    }
     config.watched_projects = project_keys.to_vec();
     auth::save_config(&state.data_dir, &config).await?;
     *saved = Some(config);
+
+    // Under the config lock, as the pass for deleted issues is
+    let mut removed = Vec::new();
+    let mut tx = state.pool.begin().await?;
+    for issue in db::issues::cached(&mut *tx).await? {
+        if !project_keys.contains(&issue.project_key) {
+            db::issues::delete(&mut *tx, &issue.id).await?;
+            removed.push(issue.key);
+        }
+    }
+    tx.commit().await?;
+    if !removed.is_empty() {
+        state.events.send(SyncEvent::IssuesUpdated(removed)).ok();
+    }
     Ok(())
 }
 
@@ -317,6 +349,7 @@ mod tests {
                 "account_id": "5b10a",
                 "watched_projects": [],
                 "last_sync_at": null,
+                "pending_projects": [],
                 "last_reconcile_at": 0,
             })
         );

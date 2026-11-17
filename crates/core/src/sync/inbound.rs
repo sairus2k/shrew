@@ -138,17 +138,22 @@ pub(crate) fn status_category(key: &str) -> StatusCategory {
     }
 }
 
-/// Downloads every issue of the watched projects. The sync counts as done only
-/// once `last_sync_at` is saved, so after an error or a quit the next call
+/// Downloads every issue of the watched projects, or after the first sync only
+/// of the pending ones. The sync counts as done only once `last_sync_at` is
+/// saved and no project is pending, so after an error or a quit the next call
 /// starts over; issues that are already stored are skipped by the upsert.
 pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
-    let mut config = state.config.read().await.clone().context("Sign in first")?;
+    let config = state.config.read().await.clone().context("Sign in first")?;
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     // An issue that changes while the pages are read can be missed by them. The
     // first incremental sync starts from this moment and picks it up.
     let started_at = now_ms()?;
 
-    for project_key in &config.watched_projects {
+    let to_download = match config.last_sync_at {
+        Some(_) => &config.pending_projects,
+        None => &config.watched_projects,
+    };
+    for project_key in to_download {
         let jql = format!("project = \"{project_key}\" ORDER BY updated DESC");
         let approximate_total = client.approximate_count(&jql).await?;
         let mut synced = 0;
@@ -185,11 +190,21 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             }
             page_token = page.next_page_token;
         }
+
+        // The saved config may have moved on meanwhile: only this project is ours to clear
+        let mut saved = state.config.write().await;
+        if let Some(current) = saved.as_mut() {
+            current.pending_projects.retain(|key| key != project_key);
+            auth::save_config(&state.data_dir, current).await?;
+        }
     }
 
-    config.last_sync_at = Some(started_at);
-    auth::save_config(&state.data_dir, &config).await?;
-    *state.config.write().await = Some(config);
+    let mut saved = state.config.write().await;
+    if let Some(current) = saved.as_mut() {
+        current.last_sync_at.get_or_insert(started_at);
+        auth::save_config(&state.data_dir, current).await?;
+    }
+    drop(saved);
     state.events.send(SyncEvent::InitialSyncComplete).ok();
     Ok(())
 }
@@ -568,6 +583,139 @@ mod tests {
         // A finished sync is not repeated by the start after it
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+    }
+
+    /// A core that watches `projects`, with every project's issues downloaded:
+    /// WEB-1 and WEB-2, API-3.
+    async fn downloaded(
+        server: &MockServer,
+        data_dir: &Path,
+        projects: &[&str],
+    ) -> (Arc<AppState>, UnboundedReceiver<SyncEvent>) {
+        let (state, mut events) = watching(server, data_dir, projects).await;
+        if projects.contains(&"WEB") {
+            mount_count(server, "WEB", 2).await;
+            mount_page(
+                server,
+                "WEB",
+                None,
+                page(&[issue(1, "WEB"), issue(2, "WEB")], None),
+            )
+            .await;
+        }
+        if projects.contains(&"API") {
+            mount_count(server, "API", 1).await;
+            mount_page(server, "API", None, page(&[issue(3, "API")], None)).await;
+        }
+        api::initial_sync(&state).await.unwrap();
+        received(&mut events);
+        (state, events)
+    }
+
+    #[tokio::test]
+    async fn a_project_added_after_setup_is_downloaded_and_the_cached_ones_are_not() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        // Each page of WEB is expected once: a second download would fail the test
+        let (state, mut events) = downloaded(&server, data_dir.path(), &["WEB"]).await;
+        let synced_at = last_sync_at(&state).await;
+        let new_projects = ["WEB".to_owned(), "API".to_owned()];
+
+        api::watch_projects(&state, &new_projects).await.unwrap();
+
+        assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
+        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        mount_count(&server, "API", 1).await;
+        mount_page(&server, "API", None, page(&[issue(3, "API")], None)).await;
+
+        api::initial_sync(&state).await.unwrap();
+
+        assert_eq!(stored_keys(&state).await, ["API-3", "WEB-1", "WEB-2"]);
+        assert_eq!(
+            received(&mut events),
+            ["API 0 / ~1", "API 1 / ~1", "InitialSyncComplete"]
+        );
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(last_sync_at(&state).await, synced_at);
+    }
+
+    #[tokio::test]
+    async fn a_download_of_an_added_project_interrupted_by_a_quit_completes_on_the_next_start() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = downloaded(&server, data_dir.path(), &["WEB"]).await;
+        api::watch_projects(&state, &["WEB".to_owned(), "API".to_owned()])
+            .await
+            .unwrap();
+        mount_count(&server, "API", 2).await;
+        mount_page(&server, "API", None, page(&[issue(3, "API")], Some("tok"))).await;
+        mount_page(&server, "API", Some("tok"), ResponseTemplate::new(503)).await;
+
+        let error = api::initial_sync(&state).await.unwrap_err();
+
+        assert!(error.to_string().contains("503"), "{error}");
+        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        state.pool.close().await;
+
+        server.reset().await;
+        mount_count(&server, "API", 2).await;
+        mount_page(&server, "API", None, page(&[issue(3, "API")], Some("tok"))).await;
+        mount_page(&server, "API", Some("tok"), page(&[issue(4, "API")], None)).await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
+        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+
+        // Only API is asked for: Jira answers 404 to any other query
+        api::initial_sync(&state).await.unwrap();
+
+        assert_eq!(
+            stored_keys(&state).await,
+            ["API-3", "API-4", "WEB-1", "WEB-2"]
+        );
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        state.pool.close().await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_project_that_is_no_longer_watched_leaves_the_list_and_the_search() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = downloaded(&server, data_dir.path(), &["WEB", "API"]).await;
+        let found = api::search_issues(&state, "flaky", None).await.unwrap();
+        assert_eq!(found.len(), 3);
+
+        api::watch_projects(&state, &["WEB".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(api::watched_projects(&state).await, ["WEB"]);
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
+        let listed = api::list_issues(&state, None).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        let found = api::search_issues(&state, "flaky", None).await.unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|row| row.project_key == "WEB"));
+        assert_eq!(
+            received(&mut events),
+            ["IssuesUpdated([IssueKey(\"API-3\")])"]
+        );
+    }
+
+    #[tokio::test]
+    async fn watching_no_project_after_setup_changes_nothing() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = downloaded(&server, data_dir.path(), &["WEB", "API"]).await;
+
+        let error = api::watch_projects(&state, &[]).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "Choose at least one project");
+        assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
+        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(stored_keys(&state).await, ["API-3", "WEB-1", "WEB-2"]);
     }
 
     /// A core that watches WEB and API and has finished the initial sync,

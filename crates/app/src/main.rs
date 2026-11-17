@@ -1,6 +1,10 @@
 use account::{Account, SignedOut};
 use app_core::{SyncEvent, models::SetupStep};
-use gpui_kit::component::{ActiveTheme, WindowExt as _, notification::Notification};
+use gpui_kit::component::{
+    ActiveTheme, Sizable, WindowExt as _,
+    button::{Button, ButtonVariants},
+    notification::Notification,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use initial_sync::{InitialSync, InitialSyncDone};
@@ -8,7 +12,7 @@ use issue::IssueModel;
 use issue_detail::{DetailClosed, DetailPane};
 use issue_list::{IssueList, IssueOpened};
 use new_token::{NewToken, TokenRenewed};
-use projects::{ProjectPicker, ProjectsChosen};
+use projects::{ProjectPicker, ProjectsCancelled, ProjectsChosen};
 use runtime::{Core, SyncBridge};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
@@ -115,18 +119,7 @@ impl Root {
                 .detach();
                 Screen::SignIn(sign_in)
             }
-            SetupStep::ChooseProjects => {
-                let picker = cx.new(ProjectPicker::new);
-                cx.subscribe_in(
-                    &picker,
-                    window,
-                    |this, _, _: &ProjectsChosen, window, cx| {
-                        this.show(SetupStep::InitialSync, window, cx)
-                    },
-                )
-                .detach();
-                Screen::ChooseProjects(picker)
-            }
+            SetupStep::ChooseProjects => Screen::ChooseProjects(Self::picker(false, window, cx)),
             SetupStep::InitialSync => {
                 let sync = cx.new(InitialSync::new);
                 cx.subscribe_in(&sync, window, |this, _, _: &InitialSyncDone, window, cx| {
@@ -153,6 +146,30 @@ impl Root {
                     new_token: None,
                 }
             }
+        }
+    }
+
+    fn picker(editing: bool, window: &mut Window, cx: &mut Context<Self>) -> Entity<ProjectPicker> {
+        let picker = cx.new(|cx| ProjectPicker::new(editing, cx));
+        cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, chosen: &ProjectsChosen, window, cx| this.show(chosen.0, window, cx),
+        )
+        .detach();
+        cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, _: &ProjectsCancelled, window, cx| this.show(SetupStep::Ready, window, cx),
+        )
+        .detach();
+        picker
+    }
+
+    fn edit_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.screen, Screen::Home { .. }) {
+            self.screen = Screen::ChooseProjects(Self::picker(true, window, cx));
+            cx.notify();
         }
     }
 
@@ -232,6 +249,15 @@ impl Render for Root {
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .child(div().flex_1().min_w_0().child(status.clone()))
+                        .child(
+                            Button::new("edit-projects")
+                                .ghost()
+                                .xsmall()
+                                .label("Projects")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit_projects(window, cx)
+                                })),
+                        )
                         .child(account.clone()),
                 )
                 .into_any_element(),
