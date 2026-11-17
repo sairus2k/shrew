@@ -1,5 +1,5 @@
 use std::{path::Path, sync::Arc};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 pub mod api;
 pub mod models;
@@ -71,6 +71,8 @@ async fn open(
         data_dir: data_dir.to_owned(),
         sync_waker,
         tokens,
+        sync_running: Mutex::new(()),
+        signed_out: watch::channel(()).0,
     };
     Ok((Arc::new(state), events_rx, wake_rx))
 }

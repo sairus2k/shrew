@@ -3,7 +3,6 @@
 
 use crate::runtime::{Core, spawn};
 use app_core::{SyncEvent, api};
-use gpui_kit::component::ActiveTheme;
 use gpui_kit::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -104,7 +103,7 @@ fn ago(ms: i64) -> String {
 }
 
 impl Render for SyncStatus {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let text = SharedString::from(status_text(
             self.running,
             self.last_failed,
@@ -116,15 +115,6 @@ impl Render for SyncStatus {
             .role(Role::Status)
             .test_support()
             .aria_label(text.clone())
-            .h(px(28.))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .border_t_1()
-            .border_color(cx.theme().border)
             .child(text)
     }
 }

@@ -4,7 +4,7 @@ use crate::{
 };
 use sqlx::SqlitePool;
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 pub struct AppState {
     pub(crate) pool: SqlitePool,
@@ -16,6 +16,12 @@ pub struct AppState {
     // Sending wakes the sync engine before its poll interval is over
     pub(crate) sync_waker: watch::Sender<()>,
     pub(crate) tokens: Arc<dyn TokenStore>,
+    // Held by a sync cycle while it runs. A sign-out takes it before it wipes
+    // the cache, so a cycle of the old account cannot write into it afterwards.
+    pub(crate) sync_running: Mutex<()>,
+    // A sign-out sends here, and the running sync cycle stops at once: its
+    // request to Jira may never return
+    pub(crate) signed_out: watch::Sender<()>,
 }
 
 #[cfg(feature = "test-support")]

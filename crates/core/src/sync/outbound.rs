@@ -440,6 +440,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sign_out_stops_a_cycle_that_waits_for_jira() {
+        let server = MockServer::start().await;
+        let never = ResponseTemplate::new(200)
+            .set_body_json(json!({ "issues": [] }))
+            .set_delay(Duration::from_secs(3600));
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(never)
+            .mount(&server)
+            .await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_syncing_without_keychain(data_dir.path())
+            .await
+            .unwrap();
+        sign_in(&state, &server).await;
+        assert!(matches!(events.recv().await, Some(SyncEvent::Started)));
+
+        tokio::time::timeout(Duration::from_secs(5), api::sign_out(&state))
+            .await
+            .expect("the sign-out waited for the sync")
+            .unwrap();
+
+        assert_eq!(api::account(&state).await, None);
+    }
+
+    #[tokio::test]
     async fn a_sync_cycle_flushes_the_queue_before_it_polls() {
         let server = MockServer::start().await;
         let data_dir = tempfile::tempdir().unwrap();

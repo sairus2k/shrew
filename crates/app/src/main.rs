@@ -1,3 +1,4 @@
+use account::{Account, SignedOut};
 use app_core::{SyncEvent, models::SetupStep};
 use gpui_kit::component::{ActiveTheme, WindowExt as _, notification::Notification};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -12,6 +13,7 @@ use runtime::{Core, SyncBridge};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
 
+mod account;
 #[cfg(test)]
 mod harness;
 mod initial_sync;
@@ -37,6 +39,7 @@ enum Screen {
         // The issue the user opened from the list
         detail: Option<Entity<DetailPane>>,
         status: Entity<SyncStatus>,
+        account: Entity<Account>,
         // Shown from the moment Jira rejects the API token until it accepts a new one
         new_token: Option<Entity<NewToken>>,
     },
@@ -135,10 +138,18 @@ impl Root {
             SetupStep::Ready => {
                 let list = cx.new(|cx| IssueList::new(window, cx));
                 cx.subscribe(&list, Self::open_issue).detach();
+                let account = cx.new(Account::new);
+                cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
+                    // The next account starts with its own sync errors
+                    this.notified_error = None;
+                    this.show(SetupStep::SignIn, window, cx)
+                })
+                .detach();
                 Screen::Home {
                     list,
                     detail: None,
                     status: cx.new(SyncStatus::new),
+                    account,
                     new_token: None,
                 }
             }
@@ -175,6 +186,7 @@ impl Render for Root {
                 list,
                 detail,
                 status,
+                account,
                 new_token,
             } => div()
                 .id("home")
@@ -208,7 +220,20 @@ impl Render for Root {
                                 .child(detail)
                         })),
                 )
-                .child(status.clone())
+                .child(
+                    div()
+                        .h(px(28.))
+                        .flex_none()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(div().flex_1().min_w_0().child(status.clone()))
+                        .child(account.clone()),
+                )
                 .into_any_element(),
         }
     }

@@ -20,3 +20,21 @@ pub(crate) async fn init(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     sqlx::migrate!().run(&pool).await?;
     Ok(pool)
 }
+
+/// Deletes everything that came from Jira: the cache belongs to the site and
+/// the account that filled it.
+pub(crate) async fn clear(pool: &SqlitePool) -> sqlx::Result<()> {
+    // The triggers on `issues` empty the search index
+    sqlx::raw_sql(
+        "BEGIN;
+         DELETE FROM issues;
+         DELETE FROM users;
+         DELETE FROM projects;
+         DELETE FROM sync_queue;
+         DELETE FROM transition_cache;
+         COMMIT;",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}

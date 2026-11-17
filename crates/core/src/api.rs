@@ -59,9 +59,28 @@ pub async fn sign_in(
         last_sync_at: None,
         last_reconcile_at: 0,
     };
+    // What a sign-out that failed halfway, or a config deleted by hand, left behind
+    db::clear(&state.pool).await?;
     auth::save(&state.data_dir, state.tokens.clone(), &config).await?;
     *state.config.write().await = Some(config);
     Ok(account(state).await.expect("the config was just set"))
+}
+
+/// How many local changes Jira has not received yet. A sign-out discards them.
+pub async fn unsent_changes(state: &AppState) -> anyhow::Result<i64> {
+    Ok(db::sync_queue::unsent(&state.pool).await?)
+}
+
+/// Forgets the account: deletes the saved credentials and everything cached
+/// from Jira, unsent changes included. `setup_step` is `SignIn` afterwards.
+pub async fn sign_out(state: &AppState) -> anyhow::Result<()> {
+    state.signed_out.send_replace(());
+    let _no_sync = state.sync_running.lock().await;
+    let mut config = state.config.write().await;
+    auth::remove(&state.data_dir, state.tokens.clone()).await?;
+    *config = None;
+    db::clear(&state.pool).await?;
+    Ok(())
 }
 
 /// Replaces the API token after `SyncEvent::TokenRejected`. The token is
@@ -609,6 +628,104 @@ mod tests {
 
         assert_eq!(error.to_string(), "issue WEB-2 not found");
         assert_eq!(queued(&state).await, []);
+    }
+
+    #[tokio::test]
+    async fn signing_out_forgets_the_account_and_a_restart_asks_to_sign_in() {
+        let (data_dir, state) = core_with(todo_issue()).await;
+        let fields = json!({});
+        transition_issue(&state, &"WEB-1".into(), &start(), &fields)
+            .await
+            .unwrap();
+        let position = db::transitions::Position {
+            project_key: "WEB".to_owned(),
+            issue_type: "Task".to_owned(),
+            status: "To Do".to_owned(),
+        };
+        db::transitions::put(&state.pool, &position, &[start()])
+            .await
+            .unwrap();
+        assert_eq!(unsent_changes(&state).await.unwrap(), 1);
+
+        sign_out(&state).await.unwrap();
+
+        nothing_is_saved(data_dir.path(), &state);
+        assert_eq!(account(&state).await, None);
+        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert!(list_issues(&state).await.unwrap().is_empty());
+        assert!(
+            search_issues(&state, "login", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(unsent_changes(&state).await.unwrap(), 0);
+        let cached = db::transitions::get(&state.pool, &position).await.unwrap();
+        assert!(cached.is_none());
+        state.pool.close().await;
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+    }
+
+    #[tokio::test]
+    async fn the_same_account_signs_in_again_without_a_restart() {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        let first = sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        sign_out(&state).await.unwrap();
+
+        let again = sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+
+        assert_eq!(again, first);
+        assert_eq!(account(&state).await, Some(first));
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+    }
+
+    #[tokio::test]
+    async fn another_account_does_not_get_the_cache_of_the_previous_one() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+        sign_out(&state).await.unwrap();
+        let other = ResponseTemplate::new(200)
+            .set_body_json(json!({ "accountId": "7c20b", "displayName": "Grace" }));
+        let server = jira(other).await;
+
+        let signed_in = sign_in(&state, &server.uri(), "grace@example.com", "her-token")
+            .await
+            .unwrap();
+
+        assert_eq!(signed_in.account_id, "7c20b");
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert!(list_issues(&state).await.unwrap().is_empty());
+        assert!(
+            search_issues(&state, "login", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state.tokens.load().unwrap().as_deref(), Some("her-token"));
+    }
+
+    #[tokio::test]
+    async fn signing_in_starts_from_an_empty_cache() {
+        // The user deleted the config by hand, as they had to before sign-out existed
+        let (data_dir, state) = core_with(todo_issue()).await;
+        std::fs::remove_file(data_dir.path().join("config.json")).unwrap();
+        state.pool.close().await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(list_issues(&state).await.unwrap().len(), 1);
+        let server = jira(myself()).await;
+
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+
+        assert!(list_issues(&state).await.unwrap().is_empty());
     }
 
     #[tokio::test]

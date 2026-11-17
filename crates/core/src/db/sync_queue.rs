@@ -99,3 +99,13 @@ pub(crate) async fn mark_failed(pool: &SqlitePool, id: i64, error: &str) -> sqlx
     .await?;
     Ok(())
 }
+
+/// How many changes Jira has not received yet. A failed one is not counted:
+/// Jira refused it for good.
+pub(crate) async fn unsent(pool: &SqlitePool) -> sqlx::Result<i64> {
+    sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM sync_queue WHERE status IN ('pending', 'in_progress')"
+    )
+    .fetch_one(pool)
+    .await
+}

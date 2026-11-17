@@ -30,7 +30,23 @@ pub(crate) async fn run(state: Arc<AppState>, mut waker: watch::Receiver<()>) {
     }
 }
 
+/// One cycle, cut short when the user signs out.
 pub(crate) async fn sync_cycle(
+    state: &AppState,
+    reconciled: &mut bool,
+    rejected_token: &mut Option<String>,
+) -> anyhow::Result<()> {
+    // Subscribed before the lock: a sign-out that comes while this waits for
+    // the lock has finished by the time the cycle starts, and a later one is seen
+    let mut signed_out = state.signed_out.subscribe();
+    let _running = state.sync_running.lock().await;
+    tokio::select! {
+        result = cycle(state, reconciled, rejected_token) => result,
+        _ = signed_out.changed() => Ok(()),
+    }
+}
+
+async fn cycle(
     state: &AppState,
     reconciled: &mut bool,
     rejected_token: &mut Option<String>,

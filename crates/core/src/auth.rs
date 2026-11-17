@@ -30,6 +30,8 @@ pub(crate) struct Config {
 pub(crate) trait TokenStore: Send + Sync {
     fn load(&self) -> anyhow::Result<Option<String>>;
     fn save(&self, token: &str) -> anyhow::Result<()>;
+    /// Succeeds when there is no token to delete.
+    fn delete(&self) -> anyhow::Result<()>;
 }
 
 /// The macOS Keychain, under the given service name.
@@ -57,6 +59,13 @@ impl TokenStore for Keychain {
     fn save(&self, token: &str) -> anyhow::Result<()> {
         Ok(self.entry()?.set_password(token)?)
     }
+
+    fn delete(&self) -> anyhow::Result<()> {
+        match self.entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// A plain file. Tests use it so that they never touch the user's Keychain.
@@ -75,6 +84,13 @@ impl TokenStore for TokenFile {
 
     fn save(&self, token: &str) -> anyhow::Result<()> {
         Ok(std::fs::write(&self.0, token)?)
+    }
+
+    fn delete(&self) -> anyhow::Result<()> {
+        match std::fs::remove_file(&self.0) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -105,6 +121,15 @@ pub(crate) async fn save(
     save_config(data_dir, config).await
 }
 
+/// Deletes the token and the config file. Succeeds when they are already gone.
+pub(crate) async fn remove(data_dir: &Path, tokens: Arc<dyn TokenStore>) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || tokens.delete()).await??;
+    match tokio::fs::remove_file(data_dir.join(CONFIG_FILE)).await {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
 /// Writes the config file only: the token store is not touched.
 pub(crate) async fn save_config(data_dir: &Path, config: &Config) -> anyhow::Result<()> {
     tokio::fs::write(
@@ -120,7 +145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keychain_keeps_the_token() {
+    fn keychain_keeps_the_token_until_it_is_deleted() {
         // A service of its own, so the token of the real app is never touched
         let keychain = Keychain("dev.shrew.app.test");
         keychain.entry().unwrap().delete_credential().ok();
@@ -130,6 +155,9 @@ mod tests {
         keychain.save("second").unwrap();
         assert_eq!(keychain.load().unwrap().as_deref(), Some("second"));
 
-        keychain.entry().unwrap().delete_credential().unwrap();
+        keychain.delete().unwrap();
+        assert_eq!(keychain.load().unwrap(), None);
+        // There is nothing left to delete
+        keychain.delete().unwrap();
     }
 }
