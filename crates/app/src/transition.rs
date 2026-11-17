@@ -2,20 +2,29 @@
 
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
-use app_core::{api, models::Transition};
+use app_core::{
+    api,
+    models::{RequiredField, Transition},
+};
 use gpui_kit::component::{
-    Disableable, Sizable, WindowExt as _,
-    button::Button,
+    ActiveTheme, Disableable, Sizable, WindowExt as _,
+    button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
+    select::{Select, SelectEvent, SelectItem, SelectState},
 };
 use gpui_kit::*;
+use serde_json::{Value, json};
 
 pub struct StatusButton {
     issue: Entity<IssueModel>,
     transitions: Vec<Transition>,
     // The status `transitions` were asked for
     loaded_for: Option<String>,
+    // Open while the user fills in the fields of a transition
+    form: Option<Entity<TransitionFieldsForm>>,
+    _form_events: Option<Subscription>,
     _load: Task<()>,
     _issue_changed: Subscription,
 }
@@ -30,6 +39,8 @@ impl StatusButton {
             issue,
             transitions: Vec::new(),
             loaded_for: None,
+            form: None,
+            _form_events: None,
             _load: Task::ready(()),
             _issue_changed,
         };
@@ -65,14 +76,38 @@ impl StatusButton {
         });
     }
 
-    fn fire(&mut self, transition: Transition, window: &mut Window, cx: &mut Context<Self>) {
+    fn ask_fields(&mut self, transition: Transition, window: &mut Window, cx: &mut Context<Self>) {
+        let form = cx.new(|cx| TransitionFieldsForm::new(&transition, window, cx));
+        self._form_events = Some(cx.subscribe_in(
+            &form,
+            window,
+            move |this, _, event: &FormEvent, window, cx| {
+                this.form = None;
+                this._form_events = None;
+                if let FormEvent::Submitted(fields) = event {
+                    this.fire(transition.clone(), fields.clone(), window, cx);
+                }
+                cx.notify();
+            },
+        ));
+        self.form = Some(form);
+        cx.notify();
+    }
+
+    fn fire(
+        &mut self,
+        transition: Transition,
+        fields: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Optimistic: every view observing the model repaints in this frame
         self.issue
             .update(cx, |issue, cx| issue.apply_transition(&transition, cx));
 
         let key = self.issue.read(cx).key.clone();
         let write = spawn(cx, move |state| async move {
-            api::transition_issue(&state, &key, &transition, &serde_json::json!({})).await
+            api::transition_issue(&state, &key, &transition, &fields).await
         });
         cx.spawn_in(window, async move |this, cx| {
             // On success the core announces the issue and the model reloads it
@@ -98,25 +133,226 @@ impl Render for StatusButton {
         let transitions = self.transitions.clone();
         let issue = self.issue.read(cx);
         let status = issue.detail.as_ref().map(|detail| detail.status.clone());
+        let url = issue.detail.as_ref().map(|detail| detail.url.clone());
 
-        Button::new("status-button")
-            .small()
-            .label(status.unwrap_or_default())
-            .disabled(transitions.is_empty())
-            .dropdown_menu(move |mut menu, window, _| {
-                for transition in transitions.iter().cloned() {
-                    // Jira refuses such a transition without the values of its fields
-                    let needs_fields = !transition.required_fields.is_empty();
-                    menu = menu.item(
-                        PopupMenuItem::new(transition.name.clone())
-                            .disabled(needs_fields)
-                            .on_click(window.listener_for(&view, move |this, _, window, cx| {
-                                this.fire(transition.clone(), window, cx)
-                            })),
-                    );
+        div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap_2()
+            .child(
+                Button::new("status-button")
+                    .small()
+                    .label(status.unwrap_or_default())
+                    .disabled(transitions.is_empty())
+                    .dropdown_menu(move |mut menu, window, _| {
+                        for transition in transitions.iter().cloned() {
+                            if !transition.required_fields.iter().all(is_supported) {
+                                menu = menu.item(
+                                    PopupMenuItem::new(transition.name.clone()).disabled(true),
+                                );
+                                if let Some(url) = &url {
+                                    menu = menu.item(PopupMenuItem::link("Open in Jira", url));
+                                }
+                                continue;
+                            }
+                            menu = menu.item(PopupMenuItem::new(transition.name.clone()).on_click(
+                                window.listener_for(&view, move |this, _, window, cx| {
+                                    if transition.required_fields.is_empty() {
+                                        this.fire(transition.clone(), json!({}), window, cx);
+                                    } else {
+                                        this.ask_fields(transition.clone(), window, cx);
+                                    }
+                                }),
+                            ));
+                        }
+                        menu
+                    }),
+            )
+            .children(self.form.clone())
+    }
+}
+
+/// What the form has controls for: a value out of a list Jira gives, or text.
+fn is_supported(field: &RequiredField) -> bool {
+    field.allowed_values.is_some() || field.schema["type"] == "string"
+}
+
+enum FormEvent {
+    Submitted(Value),
+    Cancelled,
+}
+
+/// One of the values Jira allows for a field. Jira takes it back by its `id`.
+#[derive(Clone)]
+struct Choice {
+    title: SharedString,
+    value: Value,
+}
+
+impl Choice {
+    fn new(allowed: &Value) -> Self {
+        let id = allowed["id"].as_str();
+        let title = ["name", "value"]
+            .iter()
+            .find_map(|key| allowed[key].as_str())
+            .or(id)
+            .map_or_else(|| allowed.to_string(), str::to_owned);
+        Self {
+            title: title.into(),
+            value: id.map_or_else(|| allowed.clone(), |id| json!({ "id": id })),
+        }
+    }
+}
+
+impl SelectItem for Choice {
+    type Value = Value;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
+enum Control {
+    Choice(Entity<SelectState<Vec<Choice>>>),
+    Text(Entity<InputState>),
+}
+
+struct Field {
+    id: String,
+    name: String,
+    control: Control,
+}
+
+impl Field {
+    /// `None` until the user has picked or typed something.
+    fn value(&self, cx: &App) -> Option<Value> {
+        match &self.control {
+            Control::Choice(select) => select.read(cx).selected_value().cloned(),
+            Control::Text(input) => {
+                let text = input.read(cx).value();
+                let text = text.trim();
+                (!text.is_empty()).then(|| json!(text))
+            }
+        }
+    }
+}
+
+/// Asks for the fields a transition cannot be sent without.
+struct TransitionFieldsForm {
+    fields: Vec<Field>,
+    _changes: Vec<Subscription>,
+}
+
+impl EventEmitter<FormEvent> for TransitionFieldsForm {}
+
+impl TransitionFieldsForm {
+    fn new(transition: &Transition, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut changes = Vec::new();
+        let fields = transition
+            .required_fields
+            .iter()
+            .map(|field| {
+                let control = match &field.allowed_values {
+                    Some(allowed) => {
+                        let choices = allowed.iter().map(Choice::new).collect::<Vec<_>>();
+                        let select = cx.new(|cx| SelectState::new(choices, None, window, cx));
+                        changes.push(
+                            cx.subscribe(&select, |_, _, _: &SelectEvent<Vec<Choice>>, cx| {
+                                cx.notify()
+                            }),
+                        );
+                        Control::Choice(select)
+                    }
+                    None => {
+                        let input = cx.new(|cx| InputState::new(window, cx));
+                        changes.push(cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify()));
+                        Control::Text(input)
+                    }
+                };
+                Field {
+                    id: field.id.clone(),
+                    name: field.name.clone(),
+                    control,
                 }
-                menu
             })
+            .collect();
+        Self {
+            fields,
+            _changes: changes,
+        }
+    }
+
+    /// The `fields` of the transition request, once every field has a value.
+    fn collected(&self, cx: &App) -> Option<Value> {
+        let mut collected = serde_json::Map::new();
+        for field in &self.fields {
+            collected.insert(field.id.clone(), field.value(cx)?);
+        }
+        Some(Value::Object(collected))
+    }
+}
+
+impl Render for TransitionFieldsForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let collected = self.collected(cx);
+        div()
+            .id("transition-fields")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .children(self.fields.iter().map(|field| {
+                let id = format!("field-{}", field.id);
+                let control = match &field.control {
+                    Control::Choice(select) => Select::new(select)
+                        .id(id)
+                        .accessibility_label(field.name.clone())
+                        .placeholder("Select")
+                        .into_any_element(),
+                    Control::Text(input) => Input::new(input)
+                        .id(id)
+                        .aria_label(field.name.clone())
+                        .into_any_element(),
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_sm().child(field.name.clone()))
+                    .child(control)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("submit-fields")
+                            .primary()
+                            .small()
+                            .label("Move")
+                            .disabled(collected.is_none())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(fields) = &collected {
+                                    cx.emit(FormEvent::Submitted(fields.clone()));
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-fields")
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(FormEvent::Cancelled))),
+                    ),
+            )
     }
 }
 
@@ -145,18 +381,13 @@ mod tests {
         [issue(1, "Fix login"), started]
     }
 
-    /// A mock Jira on `listener` whose project WEB has `two_issues`. It
-    /// answers the searches of a sync cycle and says what each status offers.
-    async fn jira(listener: TcpListener) -> MockServer {
-        let server = MockServer::builder().listener(listener).start().await;
-        Mock::given(path("/rest/api/3/search/jql"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),
-            )
-            .mount(&server)
-            .await;
-        let to = |name: &str, category: &str| json!({ "name": name, "statusCategory": { "key": category } });
-        let offers = [
+    fn to(name: &str, category: &str) -> Value {
+        json!({ "name": name, "statusCategory": { "key": category } })
+    }
+
+    /// What each status of `two_issues` offers.
+    fn offers() -> [(&'static str, Value); 2] {
+        [
             (
                 "WEB-1",
                 json!([
@@ -171,7 +402,26 @@ mod tests {
                     { "id": "11", "name": "Stop", "to": to("To Do", "new") },
                 ]),
             ),
-        ];
+        ]
+    }
+
+    /// A mock Jira on `listener` whose project WEB has `two_issues`. It
+    /// answers the searches of a sync cycle and says what each status offers.
+    async fn jira(listener: TcpListener) -> MockServer {
+        jira_offering(listener, offers()).await
+    }
+
+    async fn jira_offering(
+        listener: TcpListener,
+        offers: [(&'static str, Value); 2],
+    ) -> MockServer {
+        let server = MockServer::builder().listener(listener).start().await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),
+            )
+            .mount(&server)
+            .await;
         for (key, transitions) in offers {
             let status = if key == "WEB-1" {
                 "To Do"
@@ -334,6 +584,226 @@ mod tests {
         wait_until(cx, window, |window| {
             rows(window).contains(&"WEB-1: Fix login, In Progress, Unassigned".to_owned())
         });
+    }
+
+    /// WEB-1 offers a plain "Start", "Close" behind a screen asking for a
+    /// resolution and a root cause, and "Reassign" behind one asking for a user.
+    fn screens() -> [(&'static str, Value); 2] {
+        let resolutions = json!([
+            { "id": "10000", "name": "Done", "self": "http://jira/resolution/10000" },
+            { "id": "10001", "name": "Won't Do", "self": "http://jira/resolution/10001" },
+        ]);
+        let [(_, _), other] = offers();
+        [
+            (
+                "WEB-1",
+                json!([
+                    { "id": "21", "name": "Start", "to": to("In Progress", "indeterminate") },
+                    {
+                        "id": "31",
+                        "name": "Close",
+                        "to": to("Done", "done"),
+                        "fields": {
+                            "resolution": {
+                                "required": true,
+                                "hasDefaultValue": false,
+                                "name": "Resolution",
+                                "schema": { "type": "resolution", "system": "resolution" },
+                                "allowedValues": resolutions,
+                            },
+                            "customfield_10050": {
+                                "required": true,
+                                "hasDefaultValue": false,
+                                "name": "Root cause",
+                                "schema": { "type": "string" },
+                            },
+                        },
+                    },
+                    {
+                        "id": "51",
+                        "name": "Reassign",
+                        "to": to("In Progress", "indeterminate"),
+                        "fields": {
+                            "assignee": {
+                                "required": true,
+                                "hasDefaultValue": false,
+                                "name": "Assignee",
+                                "schema": { "type": "user", "system": "assignee" },
+                            },
+                        },
+                    },
+                ]),
+            ),
+            other,
+        ]
+    }
+
+    /// Chooses "Close" and waits for the form it opens.
+    fn choose_close(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        in_window(cx, window, |window, cx| choose(window, cx, "Close"));
+        wait_until(cx, window, |window| {
+            window.try_find("transition-fields").is_some()
+        });
+    }
+
+    /// Picks the first option of the select of the field `field`, which shows `option` after it.
+    fn pick_first(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        field: &'static str,
+        option: &str,
+    ) {
+        in_window(cx, window, |window, cx| {
+            window.within(format!("field-{field}")).click("input", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        });
+        // The select commits after the key has been dispatched
+        wait_until(cx, window, |window| {
+            window.find(format!("field-{field}")).value() == Some(option)
+        });
+    }
+
+    fn type_into(window: &mut Window, cx: &mut App, field: &str, text: &str) {
+        window.click(format!("field-{field}"), cx);
+        window.input(text, cx);
+        window.render_frame(cx);
+    }
+
+    fn can_submit(window: &Window) -> bool {
+        window.find("submit-fields").disabled() != Some(true)
+    }
+
+    /// The bodies of the transition requests Jira got.
+    fn posts(tokio: &tokio::runtime::Runtime, server: &MockServer) -> Vec<Value> {
+        let sent = tokio.block_on(server.received_requests()).unwrap();
+        sent.iter()
+            .filter(|request| request.url.path() == "/rest/api/3/issue/WEB-1/transitions")
+            .filter(|request| request.method.as_str() == "POST")
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn a_transition_with_required_fields_is_sent_once_the_form_is_filled_in(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira_offering(local_port(), screens()));
+        tokio.block_on(accept_one_transition(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+
+        choose_close(cx, window);
+
+        in_window(cx, window, |window, cx| {
+            // Nothing is enqueued before the form is submitted
+            assert_eq!(status(window), "Status: To Do");
+            assert!(!pending(window));
+            // One control per field: a select for the values Jira allows, an input for text
+            assert_eq!(window.find("field-resolution").role(), Some(Role::ComboBox));
+            assert_ne!(
+                window.find("field-customfield_10050").role(),
+                Some(Role::ComboBox)
+            );
+            assert!(!can_submit(window));
+
+            type_into(window, cx, "customfield_10050", "Cache never expired");
+            assert!(!can_submit(window));
+        });
+        pick_first(cx, window, "resolution", "Done");
+        in_window(cx, window, |window, cx| {
+            assert!(can_submit(window));
+
+            window.click("submit-fields", cx);
+        });
+        wait_until(cx, window, |window| {
+            window.try_find("transition-fields").is_none()
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(status(window), "Status: Done");
+            assert!(pending(window));
+        });
+
+        let state = core(cx);
+        tokio.block_on(state.sync_once()).unwrap();
+        wait_until(cx, window, |window| !pending(window));
+        assert_eq!(
+            posts(&tokio, &server),
+            [json!({
+                "transition": { "id": "31" },
+                "fields": {
+                    "resolution": { "id": "10000" },
+                    "customfield_10050": "Cache never expired",
+                },
+            })]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_the_form_changes_nothing(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira_offering(local_port(), screens()));
+        let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        choose_close(cx, window);
+        pick_first(cx, window, "resolution", "Done");
+        in_window(cx, window, |window, cx| {
+            window.click("cancel-fields", cx);
+        });
+        wait_until(cx, window, |window| {
+            window.try_find("transition-fields").is_none()
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(status(window), "Status: To Do");
+            assert!(!pending(window));
+        });
+
+        let state = core(cx);
+        tokio.block_on(state.sync_once()).unwrap();
+
+        assert_eq!(posts(&tokio, &server), Vec::<Value>::new());
+        // A form that is opened again starts empty
+        choose_close(cx, window);
+        in_window(cx, window, |window, _| assert!(!can_submit(window)));
+    }
+
+    #[gpui_kit::test]
+    fn a_transition_with_an_unsupported_field_is_disabled_and_links_to_jira(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira_offering(local_port(), screens()));
+        let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+
+        in_window(cx, window, |window, cx| {
+            open_menu(window, cx);
+            let items = window.find_all_by_role(Role::MenuItem);
+            let names: Vec<_> = items.iter().map(|item| item.label().unwrap()).collect();
+            assert_eq!(names, ["Start", "Close", "Reassign", "Open in Jira"]);
+
+            // The disabled item does nothing
+            let reassign = items[2].bounds().center();
+            window.pointer_down(reassign, MouseButton::Left, cx);
+            window.pointer_up(reassign, MouseButton::Left, cx);
+            window.render_frame(cx);
+            assert_eq!(status(window), "Status: To Do");
+            assert!(!pending(window));
+            assert!(window.try_find("transition-fields").is_none());
+
+            let link = window.find_all_by_role(Role::MenuItem)[3].bounds().center();
+            window.pointer_down(link, MouseButton::Left, cx);
+            window.pointer_up(link, MouseButton::Left, cx);
+        });
+
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some(&*format!("{}/browse/WEB-1", server.uri()))
+        );
     }
 
     #[gpui_kit::test]
