@@ -218,8 +218,13 @@ pub(crate) async fn poll_updated_issues(
             let Some(record) = readable_record(state, issue) else {
                 continue;
             };
+            // The upsert overwrites the old key, so it has to be read first:
+            // a view open under it would otherwise never hear of the move
+            let old_key = issues::key_of(&mut *tx, &record.id).await?;
             if issues::upsert(&mut *tx, &record).await? {
+                let moved_from = old_key.filter(|old| *old != record.key);
                 written.push(record.key);
+                written.extend(moved_from);
             }
         }
         tx.commit().await?;
@@ -810,7 +815,7 @@ mod tests {
             cycle(&mut events).await,
             [
                 "Started",
-                r#"IssuesUpdated([IssueKey("API-9")])"#,
+                r#"IssuesUpdated([IssueKey("API-9"), IssueKey("WEB-1")])"#,
                 "Completed"
             ]
         );

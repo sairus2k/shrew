@@ -91,6 +91,17 @@ pub(crate) async fn upsert(
     Ok(written.rows_affected() > 0)
 }
 
+/// The key the cache holds the issue under, if it has it.
+pub(crate) async fn key_of(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    id: &str,
+) -> sqlx::Result<Option<IssueKey>> {
+    sqlx::query_scalar("SELECT key FROM issues WHERE id = ?")
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+}
+
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "only the tests read one issue as a list row")

@@ -295,6 +295,8 @@ impl Render for DetailPane {
 mod tests {
     use crate::harness::{in_window, launch, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, rows, sync_brings, synced};
+    use crate::runtime::Core;
+    use app_core::SyncEvent;
     use gpui_kit::base::test_support::texts;
     use gpui_kit::test::{TestEventExt, TestWindowExt};
     use gpui_kit::{
@@ -618,6 +620,28 @@ mod tests {
             assert_eq!(painted(window, "description"), "Fixed in 2.1");
             assert_eq!(label(window, "comment-2"), "Grace Hopper, 2026-03-30 10:00");
             assert_eq!(painted(window, ("comment-body", 2usize)), "Thanks");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_detail_of_a_moved_issue_does_not_stay_under_the_old_key(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[login_bug(), issue(2, "Fix logout")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+
+        let mut moved = login_bug();
+        moved["key"] = json!("API-1");
+        moved["fields"]["updated"] = json!("2026-03-30T10:00:00.000+0100");
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        tokio.block_on(state.store_issues(&[moved])).unwrap();
+        state.emit(SyncEvent::IssuesUpdated(vec![
+            "API-1".into(),
+            "WEB-1".into(),
+        ]));
+
+        wait_until(cx, window, |window| {
+            window.try_find("detail-summary").is_none()
         });
     }
 
