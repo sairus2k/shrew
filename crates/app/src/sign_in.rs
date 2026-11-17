@@ -3,7 +3,7 @@
 use crate::runtime::spawn;
 use app_core::api;
 use gpui_kit::component::{
-    ActiveTheme,
+    ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -101,11 +101,21 @@ impl Render for SignIn {
                         .id("api-token")
                         .aria_label("API token"),
                 )
+                // A row, so the link is as wide as its text and not as the form
                 .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Create one at id.atlassian.com/manage-profile/security/api-tokens"),
+                    div().flex().child(
+                        Button::new("create-api-token")
+                            .link()
+                            .small()
+                            .label(
+                                "Create one at id.atlassian.com/manage-profile/security/api-tokens",
+                            )
+                            .on_click(|_, _, cx| {
+                                cx.open_url(
+                                    "https://id.atlassian.com/manage-profile/security/api-tokens",
+                                )
+                            }),
+                    ),
                 ),
             )
             .children(self.error.clone().map(|error| {
@@ -142,6 +152,8 @@ pub(crate) mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    const API_TOKENS_URL: &str = "https://id.atlassian.com/manage-profile/security/api-tokens";
 
     pub(crate) fn jira(tokio: &tokio::runtime::Runtime, myself: ResponseTemplate) -> MockServer {
         tokio.block_on(async {
@@ -184,6 +196,35 @@ pub(crate) mod tests {
             assert_eq!(window.find("api-token").label(), Some("API token"));
             assert!(window.try_find("choose-projects").is_none());
         });
+    }
+
+    #[gpui_kit::test]
+    fn the_token_hint_opens_the_atlassian_token_page(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = tempfile::tempdir().unwrap();
+        let window = launch(cx, &tokio, data_dir.path());
+        assert_eq!(cx.opened_url(), None);
+
+        in_window(cx, window, |window, cx| {
+            window.click("create-api-token", cx)
+        });
+
+        assert_eq!(cx.opened_url().as_deref(), Some(API_TOKENS_URL));
+    }
+
+    #[gpui_kit::test]
+    fn the_token_hint_is_reached_and_activated_from_the_keyboard(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = tempfile::tempdir().unwrap();
+        let window = launch(cx, &tokio, data_dir.path());
+
+        in_window(cx, window, |window, cx| {
+            window.click("api-token", cx);
+            window.press("tab", cx);
+            window.press("enter", cx);
+        });
+
+        assert_eq!(cx.opened_url().as_deref(), Some(API_TOKENS_URL));
     }
 
     #[gpui_kit::test]
