@@ -643,6 +643,8 @@ pub(crate) mod tests {
         let data_dir = synced(&tokio, &[]);
         cx.update(gpui_kit::init);
         init_core(cx, &tokio, data_dir.path());
+        // The core answers from the tokio runtime, outside GPUI's scheduler
+        cx.executor().allow_parking();
         let (window, list) = cx.update(|cx| {
             gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
                 cx.new(|cx| IssueList::new(window, cx))
