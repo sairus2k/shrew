@@ -153,6 +153,7 @@ pub(crate) async fn get_detail(
     let comments = fields["comment"]["comments"]
         .as_array()
         .map_or(&[][..], Vec::as_slice);
+    let pending = pending_comments(pool, &row.key, &url).await?;
     Ok(Some(IssueDetail {
         summary: row.summary,
         status: row.status,
@@ -169,18 +170,81 @@ pub(crate) async fn get_detail(
         description_md: adf::to_markdown(fields.get("description"), &url),
         comment_total: fields["comment"]["total"]
             .as_u64()
-            .map_or(comments.len(), |total| total as usize),
+            .map_or(comments.len(), |total| total as usize)
+            + pending.len(),
         comments: comments
             .iter()
             .map(|comment| Comment {
                 author_name: name(&comment["author"]["displayName"]).unwrap_or_default(),
                 created: name(&comment["created"]).unwrap_or_default(),
                 body_md: adf::to_markdown(comment.get("body"), &url),
+                pending: false,
             })
+            .chain(pending)
             .collect(),
         key: row.key,
         url,
     }))
+}
+
+/// The comments of the issue that wait in the outbox, oldest first.
+async fn pending_comments(
+    pool: &SqlitePool,
+    key: &IssueKey,
+    issue_url: &str,
+) -> sqlx::Result<Vec<Comment>> {
+    let payloads: Vec<String> = sqlx::query_scalar(
+        "SELECT payload FROM sync_queue
+         WHERE issue_key = ? AND entity_type = 'comment' AND status IN ('pending', 'in_progress')
+         ORDER BY id",
+    )
+    .bind(key)
+    .fetch_all(pool)
+    .await?;
+    Ok(payloads
+        .iter()
+        .map(|payload| {
+            let payload: Value = serde_json::from_str(payload).unwrap_or_default();
+            let text = payload["text"].as_str().unwrap_or_default();
+            Comment {
+                author_name: "You".to_owned(),
+                created: String::new(),
+                body_md: adf::to_markdown(Some(&adf::from_plain_text(text)), issue_url),
+                pending: true,
+            }
+        })
+        .collect())
+}
+
+/// Puts a comment Jira has just created at the end of the comments the cache
+/// holds for the issue. The next poll replaces the whole issue, this comment
+/// included, so it is never shown twice.
+pub(crate) async fn add_comment(
+    conn: &mut sqlx::SqliteConnection,
+    key: &IssueKey,
+    comment: &Value,
+) -> sqlx::Result<()> {
+    let raw: Option<String> = sqlx::query_scalar("SELECT raw_json FROM issues WHERE key = ?")
+        .bind(key)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(raw) = raw else { return Ok(()) };
+    let mut raw: Value = serde_json::from_str(&raw).unwrap_or_default();
+    let thread = &mut raw["fields"]["comment"];
+    let mut comments = thread["comments"].as_array().cloned().unwrap_or_default();
+    comments.push(comment.clone());
+    // The total can be more than the comments Jira sent
+    let total = thread["total"]
+        .as_u64()
+        .map_or(comments.len(), |total| total as usize + 1);
+    thread["comments"] = Value::Array(comments);
+    thread["total"] = total.into();
+    sqlx::query("UPDATE issues SET raw_json = ? WHERE key = ?")
+        .bind(raw.to_string())
+        .bind(key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Writes a status the user chose, which Jira has not confirmed yet. Returns

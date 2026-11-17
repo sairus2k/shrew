@@ -1,7 +1,7 @@
 //! Local changes going out to Jira: the processor of the `sync_queue` outbox.
 
 use crate::{
-    AppState, SyncEvent,
+    AppState, SyncEvent, adf,
     auth::Config,
     db::{
         issues,
@@ -11,6 +11,7 @@ use crate::{
     sync::jira_client::{JiraClient, JiraError},
 };
 use reqwest::StatusCode;
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const MAX_RETRIES: i64 = 3;
@@ -40,16 +41,23 @@ pub(crate) async fn process_queue(
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     // A retried entry is claimed again: it is still the oldest one
     while let Some(entry) = sync_queue::claim_next(&state.pool).await? {
-        let Err(error) = deliver(&client, &entry).await else {
-            // One transaction: an issue must not stay pending with nothing left to send
-            let mut tx = state.pool.begin().await?;
-            sync_queue::mark_synced(&mut *tx, entry.id).await?;
-            issues::confirm(&mut *tx, &entry.issue_key).await?;
-            tx.commit().await?;
-            if !delivered.contains(&entry.issue_key) {
-                delivered.push(entry.issue_key);
+        let error = match deliver(&client, &entry).await {
+            Ok(created) => {
+                // One transaction: an issue must not stay pending with nothing left to send,
+                // and a comment must not be missing from both the outbox and the cache
+                let mut tx = state.pool.begin().await?;
+                sync_queue::mark_synced(&mut *tx, entry.id).await?;
+                if let Some(comment) = &created {
+                    issues::add_comment(&mut tx, &entry.issue_key, comment).await?;
+                }
+                issues::confirm(&mut *tx, &entry.issue_key).await?;
+                tx.commit().await?;
+                if !delivered.contains(&entry.issue_key) {
+                    delivered.push(entry.issue_key);
+                }
+                continue;
             }
-            continue;
+            Err(error) => error,
         };
         let message = format!("{error:#}");
         match failure(&error) {
@@ -74,13 +82,25 @@ pub(crate) async fn process_queue(
 // The request is built here, not when the entry is queued: the entry holds
 // what the user did, and how that reaches Jira can depend on the settings at
 // the time of delivery.
-async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<()> {
-    let payload = serde_json::from_str(&entry.payload)?;
+//
+// The comment Jira created is returned: the cache holds it until the next poll
+// brings the issue, so that it does not vanish in between.
+async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Option<Value>> {
+    let payload: Value = serde_json::from_str(&entry.payload)?;
     match entry.entity_type.as_str() {
-        "transition" => client.transition_issue(&entry.issue_key, &payload).await?,
+        "transition" => {
+            client.transition_issue(&entry.issue_key, &payload).await?;
+            Ok(None)
+        }
+        "comment" => {
+            let text = payload["text"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("a comment entry without text"))?;
+            let body = json!({ "body": adf::from_plain_text(text) });
+            Ok(Some(client.add_comment(&entry.issue_key, &body).await?))
+        }
         other => anyhow::bail!("unknown outbox entry type `{other}`"),
     }
-    Ok(())
 }
 
 fn failure(error: &anyhow::Error) -> Failure {
@@ -667,5 +687,143 @@ mod tests {
             ]
         );
         assert_eq!(entry(&state, id).await, ("synced".to_owned(), 0, None));
+    }
+
+    fn comment_call(key: &str) -> wiremock::MockBuilder {
+        Mock::given(method("POST")).and(path(format!("/rest/api/3/issue/{key}/comment")))
+    }
+
+    /// WEB-1's comments: whether each waits for Jira, and its Markdown.
+    async fn comments(state: &AppState) -> Vec<(bool, String)> {
+        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail = detail.unwrap().unwrap();
+        assert_eq!(detail.comment_total, detail.comments.len());
+        detail
+            .comments
+            .into_iter()
+            .map(|comment| (comment.pending, comment.body_md))
+            .collect()
+    }
+
+    /// The comment Jira answers a post with, and later sends with the issue.
+    fn created_comment() -> Value {
+        json!({
+            "id": "10100",
+            "author": { "displayName": "Ada Lovelace" },
+            "created": "2026-03-30T10:00:00.000+0100",
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [{ "type": "paragraph", "content": [
+                    { "type": "text", "text": "Seen on staging" },
+                    { "type": "hardBreak" },
+                    { "type": "text", "text": "and in production" },
+                ] }],
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_comment_is_sent_as_adf_and_the_issue_keeps_it_once_jira_has_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        comment_call("WEB-1")
+            .and(basic_auth("ada@example.com", TOKEN))
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::add_comment(
+            &state,
+            &"WEB-1".into(),
+            "Seen on staging\nand in production",
+        )
+        .await
+        .unwrap();
+        let pending = (true, "Seen on staging\\\nand in production".to_owned());
+        assert_eq!(comments(&state).await, [pending]);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        let sent = requests(&server).await;
+        assert_eq!(
+            sent,
+            [(
+                "/rest/api/3/issue/WEB-1/comment".to_owned(),
+                json!({ "body": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{ "type": "paragraph", "content": [
+                        { "type": "text", "text": "Seen on staging" },
+                        { "type": "hardBreak" },
+                        { "type": "text", "text": "and in production" },
+                    ] }],
+                } })
+            )]
+        );
+        let confirmed = (false, "Seen on staging\\\nand in production".to_owned());
+        assert_eq!(comments(&state).await, std::slice::from_ref(&confirmed));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+
+        // The next poll brings the issue with the comment Jira has stored
+        let polled = inbound::issue_record(&json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-30T10:00:00.000+0100",
+                "comment": { "total": 1, "comments": [created_comment()] },
+            },
+        }))
+        .unwrap();
+        assert!(issues::upsert(&state.pool, &polled).await.unwrap());
+        assert_eq!(comments(&state).await, [confirmed]);
+    }
+
+    #[tokio::test]
+    async fn a_comment_written_offline_is_delivered_after_reconnect() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        api::add_comment(&state, &"WEB-1".into(), "Written on the train")
+            .await
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let offline = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&offline), &mut delivered)
+            .await
+            .unwrap_err();
+
+        let waiting = (true, "Written on the train".to_owned());
+        assert_eq!(comments(&state).await, [waiting]);
+
+        let server = MockServer::start().await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        let sent = requests(&server).await;
+        assert_eq!(
+            sent[0].1["body"]["content"][0]["content"][0]["text"],
+            "Written on the train"
+        );
+        assert_eq!(comments(&state).await.len(), 1);
+        assert!(!comments(&state).await[0].0);
     }
 }

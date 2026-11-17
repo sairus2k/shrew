@@ -80,6 +80,9 @@ pub struct Comment {
     pub created: String,
     /// Markdown.
     pub body_md: String,
+    /// Written here, and Jira has not received it yet. Such a comment has no
+    /// `created` time.
+    pub pending: bool,
 }
 
 /// One way out of a status: an entry of the status menu.

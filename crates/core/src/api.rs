@@ -262,6 +262,25 @@ pub async fn transition_issue(
     Ok(())
 }
 
+/// Queues a plain-text comment on the issue. It shows in the issue as pending
+/// at once, and Jira gets it from the outbox. The text is trimmed; a comment
+/// without any is refused.
+pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow::Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("a comment cannot be empty");
+    }
+    let payload = json!({ "text": text });
+    db::sync_queue::enqueue(&state.pool, "comment", key, &payload.to_string()).await?;
+
+    state
+        .events
+        .send(SyncEvent::IssuesUpdated(vec![key.clone()]))
+        .ok();
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
 /// The 50 best matches of `query` in the local cache, best first. Every word
 /// must match a key, a summary or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
@@ -522,6 +541,7 @@ mod tests {
             author_name: author.to_owned(),
             created: created.to_owned(),
             body_md: body.to_owned(),
+            pending: false,
         };
         assert_eq!(
             issue,
@@ -671,6 +691,50 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.to_string(), "issue WEB-2 not found");
+        assert_eq!(queued(&state).await, []);
+    }
+
+    #[tokio::test]
+    async fn a_comment_shows_as_pending_at_once_and_is_queued_for_jira() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+
+        add_comment(&state, &"WEB-1".into(), "  Seen on staging\nand *prod*\n ")
+            .await
+            .unwrap();
+
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(
+            issue.comments,
+            [Comment {
+                author_name: "You".to_owned(),
+                created: String::new(),
+                body_md: "Seen on staging\\\nand \\*prod\\*".to_owned(),
+                pending: true,
+            }]
+        );
+        assert_eq!(issue.comment_total, 1);
+        // The issue itself has no change of its own to wait for
+        assert_eq!(issue.sync_status, SyncStatus::Synced);
+        let queued = queued(&state).await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "comment");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&queued[0].1).unwrap(),
+            json!({ "text": "Seen on staging\nand *prod*" })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_comment_is_refused_and_queues_nothing() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+
+        for text in ["", " \n\t "] {
+            let error = add_comment(&state, &"WEB-1".into(), text)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "a comment cannot be empty");
+        }
+
         assert_eq!(queued(&state).await, []);
     }
 

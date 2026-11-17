@@ -1,5 +1,6 @@
 //! The pane beside the list: one issue with its description and comments.
 
+use crate::comment::CommentForm;
 use crate::issue::IssueModel;
 use crate::transition::StatusButton;
 use app_core::models::{Comment, IssueDetail, SyncStatus};
@@ -16,16 +17,19 @@ pub struct DetailClosed;
 pub struct DetailPane {
     issue: Entity<IssueModel>,
     status: Entity<StatusButton>,
+    comment_form: Entity<CommentForm>,
     _issue_changed: Subscription,
 }
 
 impl EventEmitter<DetailClosed> for DetailPane {}
 
 impl DetailPane {
-    pub fn new(issue: Entity<IssueModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(issue: Entity<IssueModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let _issue_changed = cx.observe(&issue, |_, _, cx| cx.notify());
+        let key = issue.read(cx).key.clone();
         Self {
             status: cx.new(|cx| StatusButton::new(issue.clone(), cx)),
+            comment_form: cx.new(|cx| CommentForm::new(key, window, cx)),
             issue,
             _issue_changed,
         }
@@ -119,7 +123,12 @@ fn code_block(node: &MarkdownNode, _: &mut Window, _: &mut App) -> Stateful<Div>
 }
 
 fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
-    let heading = format!("{}, {}", comment.author_name, minute(&comment.created));
+    let when = if comment.pending {
+        "pending".to_owned()
+    } else {
+        minute(&comment.created)
+    };
+    let heading = format!("{}, {when}", comment.author_name);
     div()
         .flex()
         .flex_col()
@@ -136,7 +145,12 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
         .child(markdown(("comment-body", index), &comment.body_md))
 }
 
-fn body(issue: &IssueDetail, status: Entity<StatusButton>, cx: &App) -> impl IntoElement {
+fn body(
+    issue: &IssueDetail,
+    status: Entity<StatusButton>,
+    comment_form: Entity<CommentForm>,
+    cx: &App,
+) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
     let or_none = |value: &Option<String>| value.clone().unwrap_or_else(|| "None".to_owned());
     let labels = if issue.labels.is_empty() {
@@ -240,6 +254,7 @@ fn body(issue: &IssueDetail, status: Entity<StatusButton>, cx: &App) -> impl Int
                 .enumerate()
                 .map(|(index, each)| comment(index, each, cx)),
         )
+        .child(comment_form)
 }
 
 impl Render for DetailPane {
@@ -286,13 +301,13 @@ impl Render for DetailPane {
                 issue
                     .detail
                     .as_ref()
-                    .map(|detail| body(detail, self.status.clone(), cx)),
+                    .map(|detail| body(detail, self.status.clone(), self.comment_form.clone(), cx)),
             )
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::harness::{in_window, launch, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, rows, sync_brings, synced};
     use crate::runtime::Core;
@@ -374,7 +389,7 @@ mod tests {
     }
 
     /// The text that the Markdown view `id` painted, one line per block.
-    fn painted(window: &Window, id: impl Into<ElementId>) -> String {
+    pub(crate) fn painted(window: &Window, id: impl Into<ElementId>) -> String {
         let id = id.into();
         let texts: Vec<String> = texts(window)
             .iter()

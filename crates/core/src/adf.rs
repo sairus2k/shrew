@@ -1,7 +1,28 @@
 //! Atlassian Document Format, the JSON that Jira v3 uses for descriptions and
 //! comments, converted to plain text for the FTS index and to Markdown for display.
 
-use serde_json::Value;
+use serde_json::{Value, json};
+
+/// The body of a comment: `text` as one paragraph of a document, which is the
+/// least ADF a comment needs. A line break becomes a `hardBreak`, so a blank
+/// line stays one too; an empty text node is not valid ADF, so an empty line
+/// has none.
+pub(crate) fn from_plain_text(text: &str) -> Value {
+    let mut content = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 {
+            content.push(json!({ "type": "hardBreak" }));
+        }
+        if !line.is_empty() {
+            content.push(json!({ "type": "text", "text": line }));
+        }
+    }
+    json!({
+        "type": "doc",
+        "version": 1,
+        "content": [{ "type": "paragraph", "content": content }],
+    })
+}
 
 /// The text of every text node, one block per line.
 pub(crate) fn to_plain_text(doc: Option<&Value>) -> String {
@@ -318,6 +339,40 @@ mod tests {
 
     fn markdown(content: Value) -> String {
         to_markdown(Some(&doc(content)), ISSUE_URL)
+    }
+
+    #[test]
+    fn plain_text_is_wrapped_in_one_paragraph() {
+        assert_eq!(
+            from_plain_text("Hello"),
+            doc(json!([paragraph(json!([text("Hello")]))]))
+        );
+    }
+
+    #[test]
+    fn line_breaks_of_plain_text_become_hard_breaks() {
+        let hard_break = json!({ "type": "hardBreak" });
+        let wrapped = from_plain_text("one\r\ntwo\n\n  three");
+
+        assert_eq!(
+            wrapped,
+            doc(json!([paragraph(json!([
+                text("one"),
+                hard_break,
+                text("two"),
+                hard_break,
+                hard_break,
+                text("  three"),
+            ]))]))
+        );
+        assert_eq!(to_plain_text(Some(&wrapped)), "one\ntwo\n\n  three");
+    }
+
+    #[test]
+    fn markdown_characters_of_plain_text_are_shown_as_typed() {
+        let wrapped = from_plain_text("*not bold*");
+
+        assert_eq!(to_markdown(Some(&wrapped), ISSUE_URL), "\\*not bold\\*");
     }
 
     #[test]

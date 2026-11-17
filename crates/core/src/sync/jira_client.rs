@@ -294,6 +294,17 @@ impl JiraClient {
         Ok(())
     }
 
+    /// `body` is the request body of Jira's comment call. Returns the comment
+    /// as Jira stored it.
+    pub(crate) async fn add_comment(
+        &self,
+        key: &IssueKey,
+        body: &Value,
+    ) -> Result<Value, JiraError> {
+        let url = self.url(&format!("/issue/{key}/comment"));
+        self.send(self.http.post(url).json(body)).await
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }

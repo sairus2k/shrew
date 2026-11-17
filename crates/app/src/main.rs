@@ -18,6 +18,7 @@ use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
 
 mod account;
+mod comment;
 #[cfg(test)]
 mod harness;
 mod initial_sync;
@@ -130,7 +131,7 @@ impl Root {
             }
             SetupStep::Ready => {
                 let list = cx.new(|cx| IssueList::new(window, cx));
-                cx.subscribe(&list, Self::open_issue).detach();
+                cx.subscribe_in(&list, window, Self::open_issue).detach();
                 let account = cx.new(Account::new);
                 cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
                     // The next account starts with its own sync errors
@@ -173,12 +174,18 @@ impl Root {
         }
     }
 
-    fn open_issue(&mut self, _: Entity<IssueList>, opened: &IssueOpened, cx: &mut Context<Self>) {
+    fn open_issue(
+        &mut self,
+        _: &Entity<IssueList>,
+        opened: &IssueOpened,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Screen::Home { list, detail, .. } = &mut self.screen else {
             return;
         };
         let issue = cx.new(|cx| IssueModel::new(opened.0.clone(), cx));
-        let pane = cx.new(|cx| DetailPane::new(issue, cx));
+        let pane = cx.new(|cx| DetailPane::new(issue, window, cx));
         let list = list.clone();
         cx.subscribe(&pane, move |this, _, _: &DetailClosed, cx| {
             if let Screen::Home { detail, .. } = &mut this.screen {
