@@ -118,6 +118,25 @@ pub(crate) async fn fail_unsent(
     .await
 }
 
+/// Gives up on the status changes of an issue that have not been sent. Returns
+/// how many there were.
+pub(crate) async fn fail_unsent_transitions(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+    error: &str,
+) -> sqlx::Result<u64> {
+    let failed = sqlx::query!(
+        "UPDATE sync_queue SET status = 'failed', error_msg = ?
+         WHERE issue_key = ? AND entity_type = 'transition'
+           AND status IN ('pending', 'in_progress')",
+        error,
+        key
+    )
+    .execute(executor)
+    .await?;
+    Ok(failed.rows_affected())
+}
+
 /// Puts a comment Jira refused back in the queue. Returns the key of its
 /// issue, or `None` if the entry is not a refused comment.
 pub(crate) async fn retry_comment(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<IssueKey>> {

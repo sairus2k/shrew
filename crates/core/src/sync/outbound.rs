@@ -75,6 +75,7 @@ pub(crate) async fn process_queue(
                 tokio::time::sleep(BACKOFF_BASE * 2u32.pow(entry.retry_count as u32)).await;
             }
             Failure::Transient | Failure::Rejected => {
+                let mut later = Vec::new();
                 sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
                 if entry.entity_type == "transition" {
                     // The entry is failed whether or not the rollback works: with
@@ -85,20 +86,27 @@ pub(crate) async fn process_queue(
                     );
                     // A failed rollback leaves the issue `pending` with nothing in the
                     // outbox, which `roll_back_unconfirmed` looks for in every cycle
-                    roll_back(state, &client, &entry.issue_key, refused)
+                    later = roll_back(state, &client, &entry.issue_key, refused)
                         .await
-                        .ok();
+                        .unwrap_or_default();
                 }
                 // A refused comment moves from the pending ones to the refused ones
                 let updated = SyncEvent::IssuesUpdated(vec![entry.issue_key.clone()]);
                 state.events.send(updated).ok();
                 let event = rejection(&entry.issue_key, &entry.entity_type, &message);
                 state.events.send(event).ok();
+                for event in later {
+                    state.events.send(event).ok();
+                }
             }
         }
     }
     Ok(())
 }
+
+/// Why the status changes queued behind one that failed are not sent: they were
+/// chosen from the status the failed one was to produce, which Jira does not have.
+const EARLIER_REJECTED: &str = "an earlier status change of this issue did not reach Jira";
 
 /// What the user is told about an entry that will not reach Jira.
 pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> SyncEvent {
@@ -122,20 +130,27 @@ pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> Sync
 /// may be the reason. That is the status the transition started from, unless a
 /// teammate moved the issue first, and then the menu of that status is as good
 /// as any to refetch.
+///
+/// The status changes of the issue still waiting in the outbox fail with it and
+/// are returned as rejections, for the caller to announce: the status Jira has
+/// is the only one that does not contradict them. They are failed in the
+/// transaction that stores the issue, so that one the user queues while Jira is
+/// being read is not left with a status that this overwrites.
 async fn roll_back(
     state: &AppState,
     client: &JiraClient,
     key: &IssueKey,
     refused: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<SyncEvent>> {
     let issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
     let record = inbound::issue_record(&issue)?;
     let mut tx = state.pool.begin().await?;
     // An issue the cache does not have belongs to a project that is no longer
     // watched: upserting it would bring it back, and nothing syncs it there
     if !issues::mark_stale(&mut *tx, &record.id).await? {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let later = sync_queue::fail_unsent_transitions(&mut *tx, key, EARLIER_REJECTED).await?;
     issues::upsert(&mut *tx, &record).await?;
     if refused && let Some(issue_type) = &record.issue_type {
         let position = Position {
@@ -146,7 +161,9 @@ async fn roll_back(
         transitions::forget(&mut *tx, &position).await?;
     }
     tx.commit().await?;
-    Ok(())
+    Ok((0..later)
+        .map(|_| rejection(key, "transition", EARLIER_REJECTED))
+        .collect())
 }
 
 /// Rolls back the transitions whose rollback could not read Jira at the time.
@@ -163,7 +180,13 @@ pub(crate) async fn roll_back_unconfirmed(
         return;
     };
     for key in keys {
-        if roll_back(state, &client, &key, true).await.is_ok() && !changed.contains(&key) {
+        let Ok(later) = roll_back(state, &client, &key, true).await else {
+            continue;
+        };
+        for event in later {
+            state.events.send(event).ok();
+        }
+        if !changed.contains(&key) {
             changed.push(key);
         }
     }
@@ -1012,6 +1035,128 @@ mod tests {
                 )
             ]
         );
+    }
+
+    async fn entry_statuses(state: &AppState) -> Vec<(String, Option<String>)> {
+        sqlx::query_as("SELECT status, error_msg FROM sync_queue ORDER BY id")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    const REFUSED: &str = "Jira returned 400 Bad Request: Resolution is required";
+    const NOT_SENT: &str = "an earlier status change of this issue did not reach Jira";
+
+    #[tokio::test]
+    async fn a_transition_queued_behind_a_rejected_one_fails_with_it_and_is_announced() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        // Only the first one reaches Jira
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        jira_has_web_1_in_to_do().mount(&server).await;
+        let key = IssueKey::from("WEB-1");
+        api::transition_issue(&state, &key, &start(), &json!({}))
+            .await
+            .unwrap();
+        api::transition_issue(&state, &key, &review(), &json!({}))
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Synced)
+        );
+        assert_eq!(
+            entry_statuses(&state).await,
+            [
+                ("failed".to_owned(), Some(REFUSED.to_owned())),
+                ("failed".to_owned(), Some(NOT_SENT.to_owned()))
+            ]
+        );
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected("WEB-1", "status change", REFUSED),
+                rejected("WEB-1", "status change", NOT_SENT)
+            ]
+        );
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transition_chosen_while_a_rollback_reads_jira_fails_instead_of_being_overwritten() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Slow enough for the user to choose a status before the answer arrives
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(500))
+                    .set_body_json(json!({
+                        "id": "10001",
+                        "key": "WEB-1",
+                        "fields": {
+                            "summary": "Fix login",
+                            "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                            "project": { "key": "WEB" },
+                            "issuetype": { "name": "Bug" },
+                            "updated": "2026-03-29T01:30:00.000+0100",
+                        },
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let key = IssueKey::from("WEB-1");
+        api::transition_issue(&state, &key, &start(), &json!({}))
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        let config = config(&server.uri());
+        let queue = process_queue(&state, &config, &mut delivered);
+        let user = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            api::transition_issue(&state, &key, &review(), &json!({}))
+                .await
+                .unwrap();
+        };
+        let (processed, ()) = tokio::join!(queue, user);
+        processed.unwrap();
+
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Synced)
+        );
+        assert_eq!(
+            entry_statuses(&state).await,
+            [
+                ("failed".to_owned(), Some(REFUSED.to_owned())),
+                ("failed".to_owned(), Some(NOT_SENT.to_owned()))
+            ]
+        );
+        assert!(received(&mut events).contains(&rejected("WEB-1", "status change", NOT_SENT)));
     }
 
     #[tokio::test]
