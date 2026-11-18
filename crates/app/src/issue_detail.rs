@@ -6,6 +6,7 @@ use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
 use crate::transition::StatusButton;
+use crate::worklog::WorklogForm;
 use app_core::{
     api,
     models::{Comment, IssueDetail, RejectedComment, SyncStatus, Worklog},
@@ -25,6 +26,7 @@ pub struct DetailPane {
     status: Entity<StatusButton>,
     assignee: Entity<AssigneeButton>,
     comment_form: Entity<CommentForm>,
+    worklog_form: Entity<WorklogForm>,
     _issue_changed: Subscription,
 }
 
@@ -37,7 +39,8 @@ impl DetailPane {
         Self {
             status: cx.new(|cx| StatusButton::new(issue.clone(), cx)),
             assignee: cx.new(|cx| AssigneeButton::new(issue.clone(), cx)),
-            comment_form: cx.new(|cx| CommentForm::new(key, window, cx)),
+            comment_form: cx.new(|cx| CommentForm::new(key.clone(), window, cx)),
+            worklog_form: cx.new(|cx| WorklogForm::new(key, window, cx)),
             issue,
             _issue_changed,
         }
@@ -247,6 +250,7 @@ fn body(
     status: Entity<StatusButton>,
     assignee_button: Entity<AssigneeButton>,
     comment_form: Entity<CommentForm>,
+    worklog_form: Entity<WorklogForm>,
     cx: &App,
 ) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
@@ -363,6 +367,7 @@ fn body(
                 .text_lg()
                 .child("Worklogs"),
         )
+        .child(worklog_form)
         .children(issue.worklogs.is_empty().then(|| {
             div()
                 .id("no-worklogs")
@@ -425,6 +430,7 @@ impl Render for DetailPane {
                     self.status.clone(),
                     self.assignee.clone(),
                     self.comment_form.clone(),
+                    self.worklog_form.clone(),
                     cx,
                 )
             }))

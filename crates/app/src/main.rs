@@ -36,6 +36,7 @@ mod runtime;
 mod sign_in;
 mod sync_status;
 mod transition;
+mod worklog;
 
 // Names the data directory: ~/Library/Application Support/<APP_ID>
 const APP_ID: &str = "dev.shrew.app";
