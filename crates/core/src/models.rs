@@ -109,6 +109,22 @@ pub struct Worklog {
     pub status: SyncStatus,
 }
 
+/// The timer that is running now. Only the start is stored: the elapsed time is
+/// derived from it, so a restart or a sleep does not skew it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningTimer {
+    pub issue_key: IssueKey,
+    /// Unix seconds.
+    pub started_at: i64,
+}
+
+impl RunningTimer {
+    /// The system clock can be set back while the timer runs.
+    pub fn elapsed_secs(&self, now: i64) -> u64 {
+        (now - self.started_at).max(0) as u64
+    }
+}
+
 /// One way out of a status: an entry of the status menu.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Transition {

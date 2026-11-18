@@ -2,7 +2,10 @@
 
 use crate::{
     AppState, SyncEvent, auth, db,
-    models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep, Transition, User},
+    models::{
+        Account, IssueDetail, IssueKey, IssueRow, Project, RunningTimer, SetupStep, Transition,
+        User,
+    },
     sync::{
         assignable, inbound,
         jira_client::{JiraClient, JiraError},
@@ -356,16 +359,7 @@ pub async fn log_time(
     // One transaction: the worklog shown and the entry Jira will get must not
     // part ways
     let mut tx = state.pool.begin().await?;
-    let local_id = db::worklogs::insert(&mut *tx, &worklog).await?;
-    // Which target it goes to is decided at delivery, so the entry holds only
-    // what the user entered
-    let payload = json!({
-        "local_id": local_id,
-        "time_spent_seconds": worklog.time_spent_sec,
-        "started_at": worklog.started_at,
-        "comment": worklog.comment,
-    });
-    db::sync_queue::enqueue(&mut *tx, "worklog", key, &payload.to_string()).await?;
+    db::worklogs::log(&mut tx, &worklog).await?;
     tx.commit().await?;
 
     state
@@ -373,6 +367,32 @@ pub async fn log_time(
         .send(SyncEvent::IssuesUpdated(vec![key.clone()]))
         .ok();
     state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+pub async fn running_timer(state: &AppState) -> anyhow::Result<Option<RunningTimer>> {
+    Ok(db::timer::get(&state.pool).await?)
+}
+
+/// Replaces a timer that is already running; its time is not logged. An issue
+/// the cache does not have is refused.
+pub async fn start_timer(state: &AppState, timer: &RunningTimer) -> anyhow::Result<()> {
+    if db::issues::get(&state.pool, &timer.issue_key)
+        .await?
+        .is_none()
+    {
+        bail!("issue {} not found", timer.issue_key);
+    }
+    Ok(db::timer::start(&state.pool, timer).await?)
+}
+
+/// Logs the time since the timer started as a worklog and stops the timer.
+/// `stopped_at` is Unix seconds: the moment of the click, not of this write.
+pub async fn stop_timer(state: &AppState, stopped_at: i64) -> anyhow::Result<()> {
+    if let Some(key) = db::timer::stop(&state.pool, stopped_at).await? {
+        state.events.send(SyncEvent::IssuesUpdated(vec![key])).ok();
+        state.sync_waker.send(()).ok();
+    }
     Ok(())
 }
 
@@ -754,6 +774,58 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_timer_logs_the_time_up_to_the_click() {
+        let (_data_dir, state) = core_with(json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        }))
+        .await;
+        let timer = RunningTimer {
+            issue_key: "WEB-1".into(),
+            started_at: 1_774_771_200,
+        };
+        start_timer(&state, &timer).await.unwrap();
+        assert_eq!(running_timer(&state).await.unwrap(), Some(timer));
+
+        stop_timer(&state, 1_774_771_200 + 3_725).await.unwrap();
+
+        assert_eq!(running_timer(&state).await.unwrap(), None);
+        let worklogs = get_issue(&state, &"WEB-1".into()).await.unwrap().worklogs;
+        assert_eq!(worklogs.len(), 1);
+        assert_eq!(worklogs[0].time_spent_secs, 3_725);
+        assert_eq!(worklogs[0].started_at, 1_774_771_200);
+        assert_eq!(worklogs[0].status, SyncStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_timer_cannot_be_started_on_an_issue_the_cache_does_not_have() {
+        let (_data_dir, state) = core_with(json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        }))
+        .await;
+        let timer = RunningTimer {
+            issue_key: "WEB-9".into(),
+            started_at: 1_774_771_200,
+        };
+
+        assert!(start_timer(&state, &timer).await.is_err());
+        assert_eq!(running_timer(&state).await.unwrap(), None);
     }
 
     #[tokio::test]

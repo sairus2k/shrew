@@ -19,6 +19,7 @@ use projects::{ProjectPicker, ProjectsCancelled, ProjectsChosen};
 use runtime::{Core, SyncBridge};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
+use timer::ActiveTimer;
 
 mod account;
 mod assignee;
@@ -35,6 +36,7 @@ mod projects;
 mod runtime;
 mod sign_in;
 mod sync_status;
+mod timer;
 mod transition;
 mod worklog;
 
@@ -51,6 +53,7 @@ enum Screen {
         detail: Option<Entity<DetailPane>>,
         status: Entity<SyncStatus>,
         account: Entity<Account>,
+        timer: Entity<ActiveTimer>,
         // Shown from the moment Jira rejects the API token until it accepts a new one
         new_token: Option<Entity<NewToken>>,
     },
@@ -158,6 +161,7 @@ impl Root {
                     detail: None,
                     status: cx.new(SyncStatus::new),
                     account,
+                    timer: cx.new(ActiveTimer::new),
                     new_token: None,
                 }
             }
@@ -195,11 +199,18 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Screen::Home { list, detail, .. } = &mut self.screen else {
+        let Screen::Home {
+            list,
+            detail,
+            timer,
+            ..
+        } = &mut self.screen
+        else {
             return;
         };
         let issue = cx.new(|cx| IssueModel::new(opened.0.clone(), cx));
-        let pane = cx.new(|cx| DetailPane::new(issue, window, cx));
+        let timer = timer.clone();
+        let pane = cx.new(|cx| DetailPane::new(issue, timer, window, cx));
         let list = list.clone();
         cx.subscribe(&pane, move |this, _, _: &DetailClosed, cx| {
             if let Screen::Home { detail, .. } = &mut this.screen {
@@ -226,6 +237,7 @@ impl Render for Root {
                 status,
                 account,
                 new_token,
+                ..
             } => div()
                 .id("home")
                 .test_support()

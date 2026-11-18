@@ -5,6 +5,7 @@ use crate::comment::CommentForm;
 use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
+use crate::timer::{ActiveTimer, TimerControl};
 use crate::transition::StatusButton;
 use crate::worklog::WorklogForm;
 use app_core::{
@@ -27,20 +28,27 @@ pub struct DetailPane {
     assignee: Entity<AssigneeButton>,
     comment_form: Entity<CommentForm>,
     worklog_form: Entity<WorklogForm>,
+    timer: Entity<TimerControl>,
     _issue_changed: Subscription,
 }
 
 impl EventEmitter<DetailClosed> for DetailPane {}
 
 impl DetailPane {
-    pub fn new(issue: Entity<IssueModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        issue: Entity<IssueModel>,
+        timer: Entity<ActiveTimer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let _issue_changed = cx.observe(&issue, |_, _, cx| cx.notify());
         let key = issue.read(cx).key.clone();
         Self {
             status: cx.new(|cx| StatusButton::new(issue.clone(), cx)),
             assignee: cx.new(|cx| AssigneeButton::new(issue.clone(), cx)),
             comment_form: cx.new(|cx| CommentForm::new(key.clone(), window, cx)),
-            worklog_form: cx.new(|cx| WorklogForm::new(key, window, cx)),
+            worklog_form: cx.new(|cx| WorklogForm::new(key.clone(), window, cx)),
+            timer: cx.new(|cx| TimerControl::new(key, timer, cx)),
             issue,
             _issue_changed,
         }
@@ -421,6 +429,7 @@ impl Render for DetailPane {
                             .text_color(cx.theme().muted_foreground)
                             .child(issue.key.to_string()),
                     )
+                    .child(self.timer.clone())
                     .children(open_in_jira)
                     .child(close),
             )

@@ -5,7 +5,7 @@ use crate::{
     auth::{self, Config},
     db::{
         issues::{self, IssueRecord, JiraTimestamp},
-        sync_queue,
+        sync_queue, timer,
         worklogs::{self, RemoteWorklog},
     },
     models::{IssueKey, StatusCategory},
@@ -267,6 +267,7 @@ pub(crate) async fn poll_updated_issues(
                 let moved_from = old_key.filter(|old| *old != record.key);
                 if let Some(old) = &moved_from {
                     worklogs::rename_issue(&mut tx, old, &record.key).await?;
+                    timer::rename_issue(&mut *tx, old, &record.key).await?;
                 }
                 written.push(record.key);
                 written.extend(moved_from);
@@ -462,6 +463,7 @@ pub(crate) async fn reconcile_removed_issues(
         if config.watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
             issues::delete(&mut *tx, &issue.id).await?;
             worklogs::delete_for_issue(&mut *tx, &issue.key).await?;
+            timer::delete_for_issue(&mut *tx, &issue.key).await?;
             // Nothing is left to send them to, and no view could show a refused
             // comment: the user is told about each one, the unsent comments included
             let entries = sync_queue::remove_for_issue(&mut *tx, &issue.key).await?;
@@ -1458,7 +1460,9 @@ mod tests {
             "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, sync_status)
                  VALUES ('40001', 'WEB-1', 600, '2026-03-29T08:15:00.000Z', 'synced');
                  INSERT INTO sync_queue (entity_type, issue_key, operation, payload, status)
-                 VALUES ('worklog', 'WEB-1', 'create', '{}', 'failed');",
+                 VALUES ('worklog', 'WEB-1', 'create', '{}', 'failed');
+                 INSERT INTO running_timer (id, issue_key, started_at)
+                 VALUES (1, 'WEB-1', 1774771200);",
         )
         .execute(&state.pool)
         .await
@@ -1473,6 +1477,9 @@ mod tests {
         let rows = stored_worklogs(&state).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "API-9");
+        let running = timer::get(&state.pool).await.unwrap().unwrap();
+        assert_eq!(running.issue_key, "API-9".into());
+        assert_eq!(running.started_at, 1_774_771_200);
         let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
             .fetch_all(&state.pool)
             .await
@@ -1489,7 +1496,9 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO worklogs (issue_key, time_spent_sec, started_at)
                  VALUES ('WEB-1', 600, '2026-03-29T08:15:00.000Z'),
-                        ('WEB-2', 600, '2026-03-29T08:15:00.000Z');",
+                        ('WEB-2', 600, '2026-03-29T08:15:00.000Z');
+                 INSERT INTO running_timer (id, issue_key, started_at)
+                 VALUES (1, 'WEB-2', 1774771200);",
         )
         .execute(&state.pool)
         .await
@@ -1502,6 +1511,8 @@ mod tests {
         let rows = stored_worklogs(&state).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "WEB-1");
+        // The timer ran on the issue that is gone
+        assert_eq!(timer::get(&state.pool).await.unwrap(), None);
     }
 
     #[tokio::test]

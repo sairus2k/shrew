@@ -59,6 +59,30 @@ pub(crate) async fn insert(
     .await
 }
 
+/// Stores a worklog logged here and the outbox entry that delivers it. The
+/// caller's transaction keeps the two together.
+pub(crate) async fn log(
+    conn: &mut sqlx::SqliteConnection,
+    worklog: &NewWorklog,
+) -> sqlx::Result<()> {
+    let local_id = insert(&mut *conn, worklog).await?;
+    // Which target it goes to is decided at delivery, so the entry holds only
+    // what the user entered
+    let payload = serde_json::json!({
+        "local_id": local_id,
+        "time_spent_seconds": worklog.time_spent_sec,
+        "started_at": worklog.started_at,
+        "comment": worklog.comment,
+    });
+    super::sync_queue::enqueue(
+        &mut *conn,
+        "worklog",
+        &worklog.issue_key,
+        &payload.to_string(),
+    )
+    .await
+}
+
 /// Records Jira's id for a worklog that has been delivered.
 pub(crate) async fn confirm(
     executor: impl sqlx::SqliteExecutor<'_>,
