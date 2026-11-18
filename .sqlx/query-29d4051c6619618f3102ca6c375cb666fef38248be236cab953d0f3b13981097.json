@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM sync_queue\n         WHERE issue_key = ? AND entity_type = 'transition'\n           AND status IN ('pending', 'in_progress')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "29d4051c6619618f3102ca6c375cb666fef38248be236cab953d0f3b13981097"
+}

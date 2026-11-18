@@ -26,6 +26,8 @@ const POLL_OVERLAP_MS: i64 = 60_000;
 const RECONCILE_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 const ISSUE_GONE: &str = "The issue no longer exists in Jira or is not visible to you";
+const COMMENT_DISCARDED: &str =
+    "The issue no longer exists in Jira or is not visible to you, so the comment was discarded";
 
 pub(crate) const ISSUE_FIELDS: &[&str] = &[
     "summary",
@@ -351,13 +353,16 @@ pub(crate) async fn reconcile_removed_issues(
     for issue in issues::cached(&mut *tx).await? {
         if config.watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
             issues::delete(&mut *tx, &issue.id).await?;
-            // Nothing is left to send them to
-            let unsent = sync_queue::fail_unsent(&mut *tx, &issue.key, ISSUE_GONE).await?;
-            rejected.extend(
-                unsent
-                    .iter()
-                    .map(|entity_type| outbound::rejection(&issue.key, entity_type, ISSUE_GONE)),
-            );
+            // Nothing is left to send them to, and no view could show a refused
+            // comment: the user is told about each one, the unsent comments included
+            let entries = sync_queue::remove_for_issue(&mut *tx, &issue.key).await?;
+            rejected.extend(entries.iter().map(|entity_type| {
+                let reason = match entity_type.as_str() {
+                    "comment" => COMMENT_DISCARDED,
+                    _ => ISSUE_GONE,
+                };
+                outbound::rejection(&issue.key, entity_type, reason)
+            }));
             removed.push(issue.key);
         }
     }
@@ -1283,7 +1288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_unsent_changes_of_a_removed_issue_fail_and_the_user_is_told() {
+    async fn the_entries_of_a_removed_issue_are_removed_and_the_user_is_told() {
         let server = MockServer::start().await;
         let data_dir = tempfile::tempdir().unwrap();
         let stored = [issue(1, "WEB"), issue(2, "WEB")];
@@ -1292,13 +1297,27 @@ mod tests {
         let (gone, kept) = (IssueKey::from("WEB-2"), IssueKey::from("WEB-1"));
         let payload = json!({ "transition": { "id": "11" }, "fields": {} }).to_string();
         let comment = json!({ "text": "Seen on staging" }).to_string();
+        let refused = json!({ "text": "Refused before" }).to_string();
         crate::db::sync_queue::enqueue(&state.pool, "transition", &gone, &payload)
             .await
             .unwrap();
         crate::db::sync_queue::enqueue(&state.pool, "comment", &gone, &comment)
             .await
             .unwrap();
-        crate::db::sync_queue::enqueue(&state.pool, "comment", &kept, &comment)
+        // Jira refused this one while the issue still existed: it was shown with
+        // Retry and Discard, which the removal takes away
+        crate::db::sync_queue::enqueue(&state.pool, "comment", &gone, &refused)
+            .await
+            .unwrap();
+        // The issue that still exists keeps its refused comment
+        let kept_comment = json!({ "text": "Kept" }).to_string();
+        crate::db::sync_queue::enqueue(&state.pool, "comment", &kept, &kept_comment)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET status = 'failed' WHERE payload = ? OR payload = ?")
+            .bind(&refused)
+            .bind(&kept_comment)
+            .execute(&state.pool)
             .await
             .unwrap();
         let config = state.config.read().await.clone().unwrap();
@@ -1307,6 +1326,7 @@ mod tests {
 
         assert_eq!(removed, std::slice::from_ref(&gone));
         let reason = "The issue no longer exists in Jira or is not visible to you";
+        let discarded = format!("{reason}, so the comment was discarded");
         assert_eq!(
             received(&mut events),
             [
@@ -1314,24 +1334,19 @@ mod tests {
                     "ChangeRejected {{ key: IssueKey(\"WEB-2\"), action: \"status change\", reason: {reason:?} }}"
                 ),
                 format!(
-                    "ChangeRejected {{ key: IssueKey(\"WEB-2\"), action: \"comment\", reason: {reason:?} }}"
+                    "ChangeRejected {{ key: IssueKey(\"WEB-2\"), action: \"comment\", reason: {discarded:?} }}"
+                ),
+                format!(
+                    "ChangeRejected {{ key: IssueKey(\"WEB-2\"), action: \"comment\", reason: {discarded:?} }}"
                 ),
             ]
         );
-        let entries: Vec<(String, String, Option<String>)> =
-            sqlx::query_as("SELECT issue_key, status, error_msg FROM sync_queue ORDER BY id")
+        let entries: Vec<(String, String)> =
+            sqlx::query_as("SELECT issue_key, status FROM sync_queue ORDER BY id")
                 .fetch_all(&state.pool)
                 .await
                 .unwrap();
-        let failed = |key: &str| (key.to_owned(), "failed".to_owned(), Some(reason.to_owned()));
-        assert_eq!(
-            entries,
-            [
-                failed("WEB-2"),
-                failed("WEB-2"),
-                ("WEB-1".to_owned(), "pending".to_owned(), None)
-            ]
-        );
+        assert_eq!(entries, [("WEB-1".to_owned(), "failed".to_owned())]);
     }
 
     #[tokio::test]

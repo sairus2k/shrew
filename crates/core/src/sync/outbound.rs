@@ -76,19 +76,22 @@ pub(crate) async fn process_queue(
             }
             Failure::Transient | Failure::Rejected => {
                 let mut later = Vec::new();
-                sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
                 if entry.entity_type == "transition" {
-                    // The entry is failed whether or not the rollback works: with
+                    sync_queue::remove(&state.pool, entry.id).await?;
+                    // The entry is gone whether or not the rollback works: with
                     // Jira out of reach the status stays as the user left it
                     let refused = matches!(
                         error.downcast_ref(),
                         Some(JiraError::Status(status, _)) if status.is_client_error()
                     );
                     // A failed rollback leaves the issue `pending` with nothing in the
-                    // outbox, which `roll_back_unconfirmed` looks for in every cycle
+                    // outbox, which `roll_back_unconfirmed` looks for in every cycle:
+                    // the issue row is the marker, not the entry
                     later = roll_back(state, &client, &entry.issue_key, refused)
                         .await
                         .unwrap_or_default();
+                } else {
+                    sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
                 }
                 // A refused comment moves from the pending ones to the refused ones
                 let updated = SyncEvent::IssuesUpdated(vec![entry.issue_key.clone()]);
@@ -131,9 +134,9 @@ pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> Sync
 /// teammate moved the issue first, and then the menu of that status is as good
 /// as any to refetch.
 ///
-/// The status changes of the issue still waiting in the outbox fail with it and
-/// are returned as rejections, for the caller to announce: the status Jira has
-/// is the only one that does not contradict them. They are failed in the
+/// The status changes of the issue still waiting in the outbox are dropped with
+/// it and returned as rejections, for the caller to announce: the status Jira
+/// has is the only one that does not contradict them. They are dropped in the
 /// transaction that stores the issue, so that one the user queues while Jira is
 /// being read is not left with a status that this overwrites.
 async fn roll_back(
@@ -150,7 +153,7 @@ async fn roll_back(
     if !issues::mark_stale(&mut *tx, &record.id).await? {
         return Ok(Vec::new());
     }
-    let later = sync_queue::fail_unsent_transitions(&mut *tx, key, EARLIER_REJECTED).await?;
+    let later = sync_queue::drop_unsent_transitions(&mut *tx, key).await?;
     issues::upsert(&mut *tx, &record).await?;
     if refused && let Some(issue_type) = &record.issue_type {
         let position = Position {
@@ -281,6 +284,14 @@ mod tests {
     /// The status, the retry count and the error of an entry.
     async fn entry(state: &AppState, id: i64) -> (String, i64, Option<String>) {
         sqlx::query_as("SELECT status, retry_count, error_msg FROM sync_queue WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn entry_count(state: &AppState, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue WHERE id = ?")
             .bind(id)
             .fetch_one(&state.pool)
             .await
@@ -430,10 +441,7 @@ mod tests {
             .unwrap();
 
         let error = "Jira returned 503 Service Unavailable: down for maintenance";
-        assert_eq!(
-            entry(&state, failing).await,
-            ("failed".to_owned(), 3, Some(error.to_owned()))
-        );
+        assert_eq!(entry_count(&state, failing).await, 0);
         assert_eq!(
             received(&mut events),
             [
@@ -469,10 +477,7 @@ mod tests {
             .unwrap();
 
         let error = "Jira returned 400 Bad Request: no such transition";
-        assert_eq!(
-            entry(&state, id).await,
-            ("failed".to_owned(), 0, Some(error.to_owned()))
-        );
+        assert_eq!(entry_count(&state, id).await, 0);
         assert_eq!(
             received(&mut events),
             [
@@ -1078,13 +1083,7 @@ mod tests {
             issue(&state).await,
             ("To Do".to_owned(), SyncStatus::Synced)
         );
-        assert_eq!(
-            entry_statuses(&state).await,
-            [
-                ("failed".to_owned(), Some(REFUSED.to_owned())),
-                ("failed".to_owned(), Some(NOT_SENT.to_owned()))
-            ]
-        );
+        assert_eq!(entry_statuses(&state).await, []);
         assert_eq!(
             received(&mut events),
             [
@@ -1149,13 +1148,7 @@ mod tests {
             issue(&state).await,
             ("To Do".to_owned(), SyncStatus::Synced)
         );
-        assert_eq!(
-            entry_statuses(&state).await,
-            [
-                ("failed".to_owned(), Some(REFUSED.to_owned())),
-                ("failed".to_owned(), Some(NOT_SENT.to_owned()))
-            ]
-        );
+        assert_eq!(entry_statuses(&state).await, []);
         assert!(received(&mut events).contains(&rejected("WEB-1", "status change", NOT_SENT)));
     }
 
@@ -1416,6 +1409,94 @@ mod tests {
         assert_eq!(comments(&state).await.len(), 2);
     }
 
+    #[tokio::test]
+    async fn a_refused_comment_outlives_the_rollback_of_a_transition_of_its_issue() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .mount(&server)
+            .await;
+        jira_has_web_1_in_to_do().mount(&server).await;
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        api::transition_issue(&state, &"WEB-1".into(), &review(), &json!({}))
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entry_statuses(&state).await,
+            [(
+                "failed".to_owned(),
+                Some("Jira returned 403 Forbidden: ".to_owned())
+            )]
+        );
+        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let comment = &detail.unwrap().unwrap().comments[0];
+        let refused = comment.rejected.clone().unwrap();
+        assert_eq!(comment.body_md, "Seen on staging");
+        api::discard_comment(&state, refused.entry_id)
+            .await
+            .unwrap();
+        assert_eq!(entry_statuses(&state).await, []);
+    }
+
+    #[tokio::test]
+    async fn the_migration_removes_failed_transitions_and_keeps_failed_comments() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        for (entity_type, status) in [
+            ("transition", "failed"),
+            ("transition", "pending"),
+            ("comment", "failed"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sync_queue (entity_type, issue_key, operation, payload, status)
+                 VALUES (?, 'WEB-1', 'create', '{}', ?)",
+            )
+            .bind(entity_type)
+            .bind(status)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0006_drop_failed_transitions.sql"
+        ))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let left: Vec<(String, String)> =
+            sqlx::query_as("SELECT entity_type, status FROM sync_queue ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            left,
+            [
+                ("transition".to_owned(), "pending".to_owned()),
+                ("comment".to_owned(), "failed".to_owned())
+            ]
+        );
+    }
+
     /// Stops watching WEB, which deletes its cached issues.
     async fn unwatch_web(state: &AppState, server: &MockServer) {
         *state.config.write().await = Some(config(&server.uri()));
@@ -1517,7 +1598,7 @@ mod tests {
             .fetch_all(&state.pool)
             .await
             .unwrap();
-        assert_eq!(statuses, ["failed", "failed", "synced"]);
+        assert_eq!(statuses, ["failed", "synced"]);
         assert!(
             issues::get(&state.pool, &"WEB-1".into())
                 .await

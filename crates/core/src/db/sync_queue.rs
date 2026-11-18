@@ -100,41 +100,46 @@ pub(crate) async fn mark_failed(pool: &SqlitePool, id: i64, error: &str) -> sqlx
     Ok(())
 }
 
-/// Gives up on the changes of an issue that have not reached Jira. Returns
-/// the entity type of each.
-pub(crate) async fn fail_unsent(
+/// Removes a status change that will not reach Jira. The user is told by the
+/// caller, and a rollback that could not run is found again by the issue row
+/// (`issues::unconfirmed`), so nothing needs the entry afterwards.
+pub(crate) async fn remove(pool: &SqlitePool, id: i64) -> sqlx::Result<()> {
+    sqlx::query!("DELETE FROM sync_queue WHERE id = ?", id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Removes every entry of an issue that no longer exists, whatever its state:
+/// there is no view left to show a refused comment in, or to retry it from.
+/// Returns the entity type of each.
+pub(crate) async fn remove_for_issue(
     executor: impl sqlx::SqliteExecutor<'_>,
     key: &IssueKey,
-    error: &str,
 ) -> sqlx::Result<Vec<String>> {
     sqlx::query_scalar!(
-        "UPDATE sync_queue SET status = 'failed', error_msg = ?
-         WHERE issue_key = ? AND status IN ('pending', 'in_progress')
-         RETURNING entity_type",
-        error,
+        "DELETE FROM sync_queue WHERE issue_key = ? RETURNING entity_type",
         key
     )
     .fetch_all(executor)
     .await
 }
 
-/// Gives up on the status changes of an issue that have not been sent. Returns
-/// how many there were.
-pub(crate) async fn fail_unsent_transitions(
+/// Drops the status changes of an issue that have not been sent. Returns how
+/// many there were.
+pub(crate) async fn drop_unsent_transitions(
     executor: impl sqlx::SqliteExecutor<'_>,
     key: &IssueKey,
-    error: &str,
 ) -> sqlx::Result<u64> {
-    let failed = sqlx::query!(
-        "UPDATE sync_queue SET status = 'failed', error_msg = ?
+    let dropped = sqlx::query!(
+        "DELETE FROM sync_queue
          WHERE issue_key = ? AND entity_type = 'transition'
            AND status IN ('pending', 'in_progress')",
-        error,
         key
     )
     .execute(executor)
     .await?;
-    Ok(failed.rows_affected())
+    Ok(dropped.rows_affected())
 }
 
 /// Puts a comment Jira refused back in the queue. Returns the key of its

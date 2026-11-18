@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM sync_queue WHERE issue_key = ? RETURNING entity_type",
+  "describe": {
+    "columns": [
+      {
+        "name": "entity_type",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9138ec3f1f122c4be80db7f8ce13488451969a25afdab1895bd6c5016d810449"
+}
