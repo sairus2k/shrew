@@ -265,11 +265,16 @@ pub async fn transition_issue(
 
 /// Queues a plain-text comment on the issue. It shows in the issue as pending
 /// at once, and Jira gets it from the outbox. The text is trimmed; a comment
-/// without any is refused.
+/// without any is refused, and so is a comment on an issue the cache does not have.
 pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow::Result<()> {
     let text = text.trim();
     if text.is_empty() {
         bail!("a comment cannot be empty");
+    }
+    // The pending comment is listed with its issue, so without the issue it
+    // would be sent and shown nowhere
+    if db::issues::get(&state.pool, key).await?.is_none() {
+        bail!("issue {key} not found");
     }
     let payload = json!({ "text": text });
     db::sync_queue::enqueue(&state.pool, "comment", key, &payload.to_string()).await?;
@@ -745,6 +750,18 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&queued[0].1).unwrap(),
             json!({ "text": "Seen on staging\nand *prod*" })
         );
+    }
+
+    #[tokio::test]
+    async fn a_comment_on_an_issue_the_cache_does_not_have_queues_nothing() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+
+        let error = add_comment(&state, &"WEB-2".into(), "Seen on staging")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "issue WEB-2 not found");
+        assert_eq!(queued(&state).await, []);
     }
 
     #[tokio::test]

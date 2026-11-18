@@ -51,8 +51,10 @@ impl CommentForm {
                     Ok(()) => this
                         .input
                         .update(cx, |input, cx| input.set_value("", window, cx)),
-                    Err(_) => window
-                        .push_notification(Notification::error("Could not save the comment"), cx),
+                    Err(error) => window.push_notification(
+                        Notification::error(format!("Could not save the comment: {error}")),
+                        cx,
+                    ),
                 }
                 cx.notify();
             })
@@ -94,7 +96,7 @@ mod tests {
     use crate::issue_detail::tests::painted;
     use crate::issue_list::tests::{issue, synced_on};
     use crate::runtime::Core;
-    use app_core::AppState;
+    use app_core::{AppState, api};
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext, Window};
@@ -379,6 +381,45 @@ mod tests {
             headings(window) == ["Ada Lovelace, 2026-03-30 10:00"]
         });
         assert_eq!(posts(&tokio, &server).len(), 2);
+    }
+
+    #[gpui_kit::test]
+    fn a_comment_on_an_issue_that_left_the_cache_keeps_its_text_and_reports_the_error(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([issue(1, "Fix login")])));
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+        in_window(cx, window, |window, cx| {
+            write(window, cx, &["Seen on staging"])
+        });
+
+        // The project of the issue is unwatched while its detail is open. A
+        // second core on the same data does it, so that the open detail is not
+        // told and still offers the form
+        let (other, _events) = tokio
+            .block_on(app_core::start_without_keychain(data_dir.path()))
+            .unwrap();
+        tokio
+            .block_on(api::watch_projects(&other, &["API".to_owned()]))
+            .unwrap();
+        in_window(cx, window, |window, cx| {
+            assert_eq!(window.notifications(cx).len(), 0);
+            window.click("submit-comment", cx);
+        });
+
+        wait_until(cx, window, |window| {
+            window.try_find("notification").is_some()
+        });
+        in_window(cx, window, |window, cx| {
+            assert_eq!(window.notifications(cx).len(), 1);
+            assert!(can_submit(window));
+        });
+        let state = core(cx);
+        let queued = tokio.block_on(async { api::unsent_changes(&state).await.unwrap() });
+        assert_eq!(queued, 0);
     }
 
     #[gpui_kit::test]
