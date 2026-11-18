@@ -2,7 +2,10 @@
 
 use crate::{
     AppState,
-    db::transitions::{self as cache, Position},
+    db::{
+        issues,
+        transitions::{self as cache, Position},
+    },
     models::{IssueKey, RequiredField, Transition},
     sync::{
         inbound,
@@ -27,7 +30,13 @@ pub(crate) async fn get(
     let Some(position) = cache::position(&state.pool, key).await? else {
         // A cache filled by an older version holds issues without their type,
         // so there is nothing to file the transitions under
-        return Ok((fetch(&client, key).await?, None));
+        let local = issues::get(&state.pool, key)
+            .await?
+            .with_context(|| format!("{key} is not in the cache"))?
+            .status;
+        let (jira_status, transitions) = fetch_confirmed(&client, key).await?;
+        ensure_same_status(key, &jira_status, &local)?;
+        return Ok((transitions, None));
     };
     match cache::get(&state.pool, &position).await? {
         Some(cached) => {
@@ -43,14 +52,32 @@ pub(crate) async fn get(
         None => {
             let (jira_status, transitions) =
                 fetch_and_store(&state.pool, &client, key, &position).await?;
-            anyhow::ensure!(
-                jira_status == position.status,
-                "{key} is in {jira_status} in Jira but {} here: its transitions are not known yet",
-                position.status
-            );
+            ensure_same_status(key, &jira_status, &position.status)?;
             Ok((transitions, None))
         }
     }
+}
+
+fn ensure_same_status(key: &IssueKey, jira_status: &str, local: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        jira_status == local,
+        "{key} is in {jira_status} in Jira but {local} here: its transitions are not known yet"
+    );
+    Ok(())
+}
+
+/// The transitions with the status Jira reported them for.
+async fn fetch_confirmed(
+    client: &JiraClient,
+    key: &IssueKey,
+) -> anyhow::Result<(String, Vec<Transition>)> {
+    // The transitions endpoint does not name the status it answers for, so the
+    // status is read on both sides of it: a move in between is not confirmed
+    let before = client.status(key).await?;
+    let transitions = fetch(client, key).await?;
+    let after = client.status(key).await?;
+    anyhow::ensure!(before == after, "{key} changed status while it was read");
+    Ok((before, transitions))
 }
 
 /// Files the answer under the status Jira reported, which is not always the
@@ -61,12 +88,7 @@ async fn fetch_and_store(
     key: &IssueKey,
     position: &Position,
 ) -> anyhow::Result<(String, Vec<Transition>)> {
-    // The transitions endpoint does not name the status it answers for, so the
-    // status is read on both sides of it: a move in between is not confirmed
-    let before = client.status(key).await?;
-    let transitions = fetch(client, key).await?;
-    let after = client.status(key).await?;
-    anyhow::ensure!(before == after, "{key} changed status while it was read");
+    let (before, transitions) = fetch_confirmed(client, key).await?;
     let position = Position {
         status: before.clone(),
         ..position.clone()
@@ -312,6 +334,42 @@ mod tests {
         refresh.expect("a stale entry is refreshed").await.unwrap();
 
         assert_eq!(names(&state, "WEB-1").await, ["Start"]);
+    }
+
+    async fn forget_type(state: &AppState, key: &str) {
+        sqlx::query("UPDATE issues SET issue_type = NULL WHERE key = ?")
+            .bind(key)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_issue_without_its_type_is_served_when_jira_agrees_and_nothing_is_stored() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        forget_type(&state, "WEB-1").await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+
+        assert_eq!(names(&state, "WEB-1").await, ["Start"]);
+
+        assert_eq!(cached_entries(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_issue_without_its_type_is_not_served_the_transitions_of_another_status() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        forget_type(&state, "WEB-1").await;
+        in_jira("WEB-1", "In Review").mount(&server).await;
+        offers("WEB-1", &["Approve"]).mount(&server).await;
+
+        api::get_transitions(&state, &"WEB-1".into())
+            .await
+            .unwrap_err();
+
+        assert_eq!(cached_entries(&state).await, 0);
     }
 
     async fn move_locally(state: &AppState, key: &str, to_status: &str) {

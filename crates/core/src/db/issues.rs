@@ -104,10 +104,6 @@ pub(crate) async fn key_of(
         .await
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "only the tests read one issue as a list row")
-)]
 pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Option<IssueRow>> {
     sqlx::query_as!(
         IssueRow,
