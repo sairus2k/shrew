@@ -2,9 +2,9 @@
 
 use crate::{
     AppState, SyncEvent, auth, db,
-    models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep, Transition},
+    models::{Account, IssueDetail, IssueKey, IssueRow, Project, SetupStep, Transition, User},
     sync::{
-        inbound,
+        assignable, inbound,
         jira_client::{JiraClient, JiraError},
         transitions,
     },
@@ -253,6 +253,43 @@ pub async fn transition_issue(
         bail!("issue {key} not found");
     }
     db::sync_queue::enqueue(&mut *tx, "transition", key, &payload.to_string()).await?;
+    tx.commit().await?;
+
+    state
+        .events
+        .send(SyncEvent::IssuesUpdated(vec![key.clone()]))
+        .ok();
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+/// The people the issue can be assigned to, in the order Jira lists them. They
+/// come from the local cache; Jira is asked only for an issue never opened before.
+pub async fn assignable_users(state: &AppState, key: &IssueKey) -> anyhow::Result<Vec<User>> {
+    // The answer is filed under the key, so an issue the cache does not have
+    // would leave an entry nothing ever uses or removes
+    if db::issues::get(&state.pool, key).await?.is_none() {
+        bail!("issue {key} not found");
+    }
+    let (users, _refresh) = assignable::get(state, key).await?;
+    Ok(users)
+}
+
+/// Assigns the issue to `assignee`, or to nobody, locally and at once: Jira
+/// gets the change from the outbox.
+pub async fn assign_issue(
+    state: &AppState,
+    key: &IssueKey,
+    assignee: Option<&User>,
+) -> anyhow::Result<()> {
+    let payload = json!({ "accountId": assignee.map(|user| &user.account_id) });
+    // One transaction, as for a transition: the assignee shown and the entry
+    // Jira will get must not part ways
+    let mut tx = state.pool.begin().await?;
+    if !db::issues::set_pending_assignee(&mut *tx, key, assignee).await? {
+        bail!("issue {key} not found");
+    }
+    db::sync_queue::enqueue(&mut *tx, "assignee", key, &payload.to_string()).await?;
     tx.commit().await?;
 
     state
@@ -714,6 +751,96 @@ mod tests {
         let (_data_dir, state) = core_with(todo_issue()).await;
 
         let error = transition_issue(&state, &"WEB-2".into(), &start(), &json!({}))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "issue WEB-2 not found");
+        assert_eq!(queued(&state).await, []);
+    }
+
+    fn grace() -> User {
+        User {
+            account_id: "7c20b".to_owned(),
+            display_name: "Grace Hopper".to_owned(),
+        }
+    }
+
+    fn assigned_issue() -> serde_json::Value {
+        let mut issue = todo_issue();
+        issue["fields"]["assignee"] =
+            json!({ "accountId": "5b10a", "displayName": "Ada Lovelace" });
+        issue
+    }
+
+    #[tokio::test]
+    async fn an_assignee_shows_at_once_and_is_queued_for_jira() {
+        let (_data_dir, state) = core_with(assigned_issue()).await;
+
+        assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.assignee_name.as_deref(), Some("Grace Hopper"));
+        assert_eq!(issue.sync_status, SyncStatus::Pending);
+        let row = db::issues::get(&state.pool, &"WEB-1".into()).await.unwrap();
+        assert_eq!(row.unwrap().assignee_name.as_deref(), Some("Grace Hopper"));
+        let queued = queued(&state).await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "assignee");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&queued[0].1).unwrap(),
+            json!({ "accountId": "7c20b" })
+        );
+    }
+
+    #[tokio::test]
+    async fn unassigning_clears_the_assignee_at_once_and_queues_a_null() {
+        let (_data_dir, state) = core_with(assigned_issue()).await;
+
+        assign_issue(&state, &"WEB-1".into(), None).await.unwrap();
+
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.assignee_name, None);
+        assert_eq!(issue.sync_status, SyncStatus::Pending);
+        let queued = queued(&state).await;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "assignee");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&queued[0].1).unwrap(),
+            json!({ "accountId": null })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assignee_that_cannot_be_queued_leaves_the_issue_as_it_was() {
+        let (_data_dir, state) = core_with(assigned_issue()).await;
+        sqlx::query(
+            "CREATE TRIGGER outbox_is_broken BEFORE INSERT ON sync_queue
+             BEGIN SELECT RAISE(ABORT, 'the outbox is broken'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let error = assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("the outbox is broken"),
+            "{error}"
+        );
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.assignee_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(issue.sync_status, SyncStatus::Synced);
+    }
+
+    #[tokio::test]
+    async fn an_assignee_of_an_issue_the_cache_does_not_have_queues_nothing() {
+        let (_data_dir, state) = core_with(todo_issue()).await;
+
+        let error = assign_issue(&state, &"WEB-2".into(), Some(&grace()))
             .await
             .unwrap_err();
 

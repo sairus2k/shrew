@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM assignable_users WHERE issue_key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "7c346c5d9a250464aef3380ec0a94dbe8030ba13254edefa45428376cc9f8330"
+}

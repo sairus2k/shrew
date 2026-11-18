@@ -55,6 +55,13 @@ pub(crate) struct Myself {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JiraUser {
+    pub account_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct Project {
     pub id: String,
     pub key: String,
@@ -312,6 +319,29 @@ impl JiraClient {
     ) -> Result<Value, JiraError> {
         let url = self.url(&format!("/issue/{key}/comment"));
         self.send(self.http.post(url).json(body)).await
+    }
+
+    /// The people Jira lets the issue be assigned to. Jira looks at the first
+    /// thousand users only and filters those, so one request with the largest
+    /// page is all there is to ask for.
+    pub(crate) async fn assignable_users(
+        &self,
+        key: &IssueKey,
+    ) -> Result<Vec<JiraUser>, JiraError> {
+        let request = self.http.get(self.url("/user/assignable/search")).query(&[
+            ("issueKey", key.to_string()),
+            ("maxResults", "1000".to_owned()),
+        ]);
+        self.send(request).await
+    }
+
+    /// `body` is the request body of Jira's assignee call: the `accountId` of
+    /// the new assignee, or `null` to leave the issue unassigned.
+    pub(crate) async fn assign_issue(&self, key: &IssueKey, body: &Value) -> Result<(), JiraError> {
+        let url = self.url(&format!("/issue/{key}/assignee"));
+        // Jira answers 204 with no body
+        self.execute(self.http.put(url).json(body)).await?;
+        Ok(())
     }
 
     fn url(&self, path: &str) -> String {
@@ -583,6 +613,81 @@ mod tests {
         assert!(matches!(unauthorized, JiraError::Unauthorized));
         assert!(
             matches!(&forbidden, JiraError::Status(StatusCode::FORBIDDEN, body) if body == "forbidden")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_assignable_users_of_an_issue_are_asked_for_by_its_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/user/assignable/search"))
+            .and(basic_auth(EMAIL, TOKEN))
+            .and(query_param("issueKey", "WEB-1"))
+            .and(query_param("maxResults", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "accountId": "5b10a", "displayName": "Ada", "active": true, "self": "x" },
+                { "accountId": "7c20b", "displayName": "Grace", "active": true },
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let users = client(&server)
+            .assignable_users(&"WEB-1".into())
+            .await
+            .unwrap();
+
+        let users: Vec<_> = users
+            .iter()
+            .map(|user| (user.account_id.as_str(), user.display_name.as_str()))
+            .collect();
+        assert_eq!(users, [("5b10a", "Ada"), ("7c20b", "Grace")]);
+    }
+
+    #[tokio::test]
+    async fn an_assignee_is_set_by_account_id_and_unset_by_null() {
+        let server = MockServer::start().await;
+        for body in [
+            json!({ "accountId": "5b10a" }),
+            json!({ "accountId": null }),
+        ] {
+            Mock::given(method("PUT"))
+                .and(path("/rest/api/3/issue/WEB-1/assignee"))
+                .and(basic_auth(EMAIL, TOKEN))
+                .and(body_json(body))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = client(&server);
+
+        client
+            .assign_issue(&"WEB-1".into(), &json!({ "accountId": "5b10a" }))
+            .await
+            .unwrap();
+        client
+            .assign_issue(&"WEB-1".into(), &json!({ "accountId": null }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_assignee_is_a_status_error_with_jiras_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/WEB-1/assignee"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("user not found"))
+            .mount(&server)
+            .await;
+
+        let error = client(&server)
+            .assign_issue(&"WEB-1".into(), &json!({ "accountId": "nobody" }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, JiraError::Status(StatusCode::BAD_REQUEST, body) if body == "user not found")
         );
     }
 }

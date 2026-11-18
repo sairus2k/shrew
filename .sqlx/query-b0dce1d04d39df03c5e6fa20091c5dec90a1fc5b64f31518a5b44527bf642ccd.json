@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO assignable_users (issue_key, users) VALUES (?, ?)\n         ON CONFLICT(issue_key) DO UPDATE SET\n             users      = excluded.users,\n             fetched_at = datetime('now')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b0dce1d04d39df03c5e6fa20091c5dec90a1fc5b64f31518a5b44527bf642ccd"
+}

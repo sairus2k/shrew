@@ -1,7 +1,7 @@
 use crate::{
     adf,
     models::{
-        Comment, IssueDetail, IssueKey, IssueRow, RejectedComment, StatusCategory, SyncStatus,
+        Comment, IssueDetail, IssueKey, IssueRow, RejectedComment, StatusCategory, SyncStatus, User,
     },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -64,14 +64,37 @@ pub(crate) async fn upsert(
             project_key        = excluded.project_key,
             summary            = excluded.summary,
             description_text   = excluded.description_text,
-            status             = excluded.status,
-            status_category    = excluded.status_category,
-            assignee_id        = excluded.assignee_id,
-            assignee_name      = excluded.assignee_name,
+            -- A change the outbox still has to send is what the user sees, and
+            -- Jira's answer to it replaces it once the entry has been sent
+            status             = CASE WHEN EXISTS (
+                                     SELECT 1 FROM sync_queue
+                                     WHERE issue_key = issues.key AND entity_type = 'transition'
+                                       AND status IN ('pending', 'in_progress'))
+                                 THEN issues.status ELSE excluded.status END,
+            status_category    = CASE WHEN EXISTS (
+                                     SELECT 1 FROM sync_queue
+                                     WHERE issue_key = issues.key AND entity_type = 'transition'
+                                       AND status IN ('pending', 'in_progress'))
+                                 THEN issues.status_category ELSE excluded.status_category END,
+            assignee_id        = CASE WHEN EXISTS (
+                                     SELECT 1 FROM sync_queue
+                                     WHERE issue_key = issues.key AND entity_type = 'assignee'
+                                       AND status IN ('pending', 'in_progress'))
+                                 THEN issues.assignee_id ELSE excluded.assignee_id END,
+            assignee_name      = CASE WHEN EXISTS (
+                                     SELECT 1 FROM sync_queue
+                                     WHERE issue_key = issues.key AND entity_type = 'assignee'
+                                       AND status IN ('pending', 'in_progress'))
+                                 THEN issues.assignee_name ELSE excluded.assignee_name END,
             issue_type         = excluded.issue_type,
             raw_json           = excluded.raw_json,
             remote_updated_at  = excluded.remote_updated_at,
-            sync_status        = 'synced',
+            sync_status        = CASE WHEN EXISTS (
+                                     SELECT 1 FROM sync_queue
+                                     WHERE issue_key = issues.key
+                                       AND entity_type IN ('transition', 'assignee')
+                                       AND status IN ('pending', 'in_progress'))
+                                 THEN 'pending' ELSE 'synced' END,
             synced_at          = datetime('now')
         WHERE excluded.remote_updated_at > issues.remote_updated_at
         "#,
@@ -265,6 +288,27 @@ pub(crate) async fn set_pending_status(
         "UPDATE issues SET status = ?, status_category = ?, sync_status = 'pending' WHERE key = ?",
         status,
         status_category,
+        key,
+    )
+    .execute(executor)
+    .await?;
+    Ok(written.rows_affected() > 0)
+}
+
+/// Writes an assignee the user chose (`None` for nobody), which Jira has not
+/// confirmed yet. Returns whether the cache has the issue.
+pub(crate) async fn set_pending_assignee(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+    assignee: Option<&User>,
+) -> sqlx::Result<bool> {
+    let id = assignee.map(|user| &user.account_id);
+    let name = assignee.map(|user| &user.display_name);
+    let written = sqlx::query!(
+        "UPDATE issues SET assignee_id = ?, assignee_name = ?, sync_status = 'pending'
+         WHERE key = ?",
+        id,
+        name,
         key,
     )
     .execute(executor)
@@ -762,6 +806,12 @@ mod tests {
         assert_eq!(found(&pool, "bravo", None).await, ["PROJ-2"]);
         assert_eq!(found(&pool, "charlie", None).await, ["PROJ-3"]);
         check_fts_integrity(&pool).await;
+
+        // The upsert looks at the outbox, which a database of this age did not have
+        sqlx::raw_sql(include_str!("../../migrations/0004_sync_queue.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // The upsert still finds the row by its Jira id
         upsert(&pool, &issue("12", "PROJ-3", T2, "Delta"))

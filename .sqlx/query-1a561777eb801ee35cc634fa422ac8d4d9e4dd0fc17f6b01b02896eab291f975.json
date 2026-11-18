@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE issues SET assignee_id = ?, assignee_name = ?, sync_status = 'pending'\n         WHERE key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "1a561777eb801ee35cc634fa422ac8d4d9e4dd0fc17f6b01b02896eab291f975"
+}

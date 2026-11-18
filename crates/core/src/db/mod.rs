@@ -4,6 +4,7 @@ use sqlx::{
 };
 use std::path::Path;
 
+pub(crate) mod assignable;
 pub(crate) mod issues;
 pub(crate) mod sync_queue;
 pub(crate) mod transitions;
@@ -32,6 +33,7 @@ pub(crate) async fn clear(pool: &SqlitePool) -> sqlx::Result<()> {
          DELETE FROM projects;
          DELETE FROM sync_queue;
          DELETE FROM transition_cache;
+         DELETE FROM assignable_users;
          COMMIT;",
     )
     .execute(pool)

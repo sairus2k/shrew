@@ -4,7 +4,7 @@ use crate::{
     AppState, SyncEvent, adf,
     auth::Config,
     db::{
-        issues,
+        assignable, issues,
         sync_queue::{self, QueueEntry},
         transitions::{self, Position},
     },
@@ -76,10 +76,10 @@ pub(crate) async fn process_queue(
             }
             Failure::Transient | Failure::Rejected => {
                 let mut later = Vec::new();
-                if entry.entity_type == "transition" {
+                if matches!(entry.entity_type.as_str(), "transition" | "assignee") {
                     sync_queue::remove(&state.pool, entry.id).await?;
                     // The entry is gone whether or not the rollback works: with
-                    // Jira out of reach the status stays as the user left it
+                    // Jira out of reach the change stays as the user left it
                     let refused = matches!(
                         error.downcast_ref(),
                         Some(JiraError::Status(status, _)) if status.is_client_error()
@@ -87,9 +87,15 @@ pub(crate) async fn process_queue(
                     // A failed rollback leaves the issue `pending` with nothing in the
                     // outbox, which `roll_back_unconfirmed` looks for in every cycle:
                     // the issue row is the marker, not the entry
-                    later = roll_back(state, &client, &entry.issue_key, refused)
-                        .await
-                        .unwrap_or_default();
+                    later = roll_back(
+                        state,
+                        &client,
+                        &entry.issue_key,
+                        &entry.entity_type,
+                        refused,
+                    )
+                    .await
+                    .unwrap_or_default();
                 } else {
                     sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
                 }
@@ -115,6 +121,7 @@ const EARLIER_REJECTED: &str = "an earlier status change of this issue did not r
 pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> SyncEvent {
     let action = match entity_type {
         "transition" => "status change",
+        "assignee" => "assignee change",
         other => other,
     };
     SyncEvent::ChangeRejected {
@@ -124,25 +131,31 @@ pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> Sync
     }
 }
 
-/// Reads the issue again and stores it as Jira has it, so that a status the
-/// user chose and Jira refused does not stay on screen. Jira has not changed
-/// the issue, so its `updated` is no newer than the stored row's.
+/// Reads the issue again and stores it as Jira has it, so that a change the
+/// user made and Jira refused does not stay on screen. Jira has not changed
+/// the issue, so its `updated` is no newer than the stored row's. `entity_type`
+/// is the type of the entry that failed: what the user changed by the other
+/// kind of entry, while it waits in the outbox, stays as it is (see `upsert`).
 ///
-/// With `refused` (Jira answered with a 4xx) the cached menu of the status the
-/// issue is in is dropped, because a field or a validator it did not know about
-/// may be the reason. That is the status the transition started from, unless a
-/// teammate moved the issue first, and then the menu of that status is as good
-/// as any to refetch.
+/// With `refused` (Jira answered with a 4xx) what was cached to offer the
+/// change is dropped, because something the cache did not know about may be the
+/// reason. For a transition that is the menu of the status the issue is in:
+/// the status the transition started from, unless a teammate moved the issue
+/// first, and then the menu of that status is as good as any to refetch. For an
+/// assignee it is the list of people the issue can be assigned to.
 ///
 /// The status changes of the issue still waiting in the outbox are dropped with
-/// it and returned as rejections, for the caller to announce: the status Jira
-/// has is the only one that does not contradict them. They are dropped in the
-/// transaction that stores the issue, so that one the user queues while Jira is
-/// being read is not left with a status that this overwrites.
+/// a failed transition and returned as rejections, for the caller to announce:
+/// the status Jira has is the only one that does not contradict them. They are
+/// dropped in the transaction that stores the issue, so that one the user
+/// queues while Jira is being read is not left with a status that this
+/// overwrites. A failed assignee change drops nothing: the other assignee
+/// changes were chosen from a list that does not depend on it.
 async fn roll_back(
     state: &AppState,
     client: &JiraClient,
     key: &IssueKey,
+    entity_type: &str,
     refused: bool,
 ) -> anyhow::Result<Vec<SyncEvent>> {
     let issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
@@ -153,9 +166,20 @@ async fn roll_back(
     if !issues::mark_stale(&mut *tx, &record.id).await? {
         return Ok(Vec::new());
     }
-    let later = sync_queue::drop_unsent_transitions(&mut *tx, key).await?;
+    let status_change = entity_type == "transition";
+    let later = if status_change {
+        sync_queue::drop_unsent_transitions(&mut *tx, key).await?
+    } else {
+        0
+    };
     issues::upsert(&mut *tx, &record).await?;
-    if refused && let Some(issue_type) = &record.issue_type {
+    if refused && !status_change {
+        assignable::forget(&mut *tx, key).await?;
+    }
+    if refused
+        && status_change
+        && let Some(issue_type) = &record.issue_type
+    {
         let position = Position {
             project_key: record.project_key.clone(),
             issue_type: issue_type.clone(),
@@ -183,7 +207,7 @@ pub(crate) async fn roll_back_unconfirmed(
         return;
     };
     for key in keys {
-        let Ok(later) = roll_back(state, &client, &key, true).await else {
+        let Ok(later) = roll_back(state, &client, &key, "transition", true).await else {
             continue;
         };
         for event in later {
@@ -206,6 +230,10 @@ async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Opti
     match entry.entity_type.as_str() {
         "transition" => {
             client.transition_issue(&entry.issue_key, &payload).await?;
+            Ok(None)
+        }
+        "assignee" => {
+            client.assign_issue(&entry.issue_key, &payload).await?;
             Ok(None)
         }
         "comment" => {
@@ -240,7 +268,7 @@ mod tests {
     use super::*;
     use crate::{
         api,
-        models::{StatusCategory, SyncStatus, Transition},
+        models::{StatusCategory, SyncStatus, Transition, User},
         start_syncing_without_keychain, start_without_keychain,
         sync::inbound,
     };
@@ -1630,5 +1658,534 @@ mod tests {
         let comment = &detail.unwrap().unwrap().comments[0];
         assert_eq!(comment.body_md, "Seen on staging");
         assert!(comment.rejected.is_some());
+    }
+
+    fn grace() -> User {
+        User {
+            account_id: "7c20b".to_owned(),
+            display_name: "Grace Hopper".to_owned(),
+        }
+    }
+
+    /// Jira's assignee call for `key`.
+    fn assignee_call(key: &str) -> wiremock::MockBuilder {
+        Mock::given(method("PUT")).and(path(format!("/rest/api/3/issue/{key}/assignee")))
+    }
+
+    /// WEB-1 as Jira has it: in To Do, assigned to Ada.
+    fn web_1_of_ada() -> Value {
+        json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "assignee": { "accountId": "5b10a", "displayName": "Ada Lovelace" },
+                "project": { "key": "WEB" },
+                "issuetype": { "name": "Bug" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        })
+    }
+
+    fn jira_has_web_1_assigned_to_ada() -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(web_1_of_ada()))
+    }
+
+    /// Puts WEB-1 into the cache as Jira has it, assigned to Ada.
+    async fn store_issue_of_ada(state: &AppState) {
+        let record = inbound::issue_record(&web_1_of_ada()).unwrap();
+        issues::upsert(&state.pool, &record).await.unwrap();
+    }
+
+    /// The assignee of WEB-1 and whether it waits for Jira.
+    async fn assignee(state: &AppState) -> (Option<String>, SyncStatus) {
+        let issue = issues::get(&state.pool, &"WEB-1".into()).await;
+        let issue = issue.unwrap().unwrap();
+        (issue.assignee_name, issue.sync_status)
+    }
+
+    fn ada_name() -> Option<String> {
+        Some("Ada Lovelace".to_owned())
+    }
+
+    fn grace_name() -> Option<String> {
+        Some("Grace Hopper".to_owned())
+    }
+
+    async fn cache_people_of(state: &AppState, keys: &[&str]) {
+        for key in keys {
+            crate::db::assignable::put(&state.pool, &(*key).into(), &[grace()])
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn cached_people(state: &AppState) -> Vec<String> {
+        sqlx::query_scalar("SELECT issue_key FROM assignable_users ORDER BY issue_key")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_assignee_is_sent_by_account_id_and_the_issue_keeps_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        assignee_call("WEB-1")
+            .and(basic_auth("ada@example.com", TOKEN))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&server).await,
+            [(
+                "/rest/api/3/issue/WEB-1/assignee".to_owned(),
+                json!({ "accountId": "7c20b" })
+            )]
+        );
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Synced));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert!(received(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_issue_is_unassigned_by_sending_null() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::assign_issue(&state, &"WEB-1".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(assignee(&state).await, (None, SyncStatus::Pending));
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&server).await,
+            [(
+                "/rest/api/3/issue/WEB-1/assignee".to_owned(),
+                json!({ "accountId": null })
+            )]
+        );
+        assert_eq!(assignee(&state).await, (None, SyncStatus::Synced));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_assignee_shows_the_assignee_jira_has_and_drops_the_cached_people() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        cache_transitions_of(&state, &["To Do", "In Progress"]).await;
+        cache_people_of(&state, &["WEB-1", "WEB-2"]).await;
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("user not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Pending));
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        // Jira's `updated` did not change, and the row still goes back
+        assert_eq!(assignee(&state).await, (ada_name(), SyncStatus::Synced));
+        assert_eq!(entry_statuses(&state).await, []);
+        // The refused person is not offered again from the cache; the menus are not touched
+        assert_eq!(cached_people(&state).await, ["WEB-2"]);
+        assert_eq!(cached_statuses(&state).await, ["In Progress", "To Do"]);
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "assignee change",
+                    "Jira returned 400 Bad Request: user not found"
+                )
+            ]
+        );
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_assignee_given_up_on_after_server_errors_is_rolled_back_but_keeps_its_people() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        cache_people_of(&state, &["WEB-1"]).await;
+        // The first attempt and three retries
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+            .expect(4)
+            .mount(&server)
+            .await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(assignee(&state).await, (ada_name(), SyncStatus::Synced));
+        assert_eq!(cached_people(&state).await, ["WEB-1"]);
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "assignee change",
+                    "Jira returned 503 Service Unavailable: down"
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_assignee_chosen_offline_is_delivered_after_reconnect() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        // A port that was free a moment ago: nothing listens on it
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let offline = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut delivered = Vec::new();
+        let error = process_queue(&state, &config(&offline), &mut delivered)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error.downcast_ref(), Some(JiraError::Http(_))));
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Pending));
+        assert_eq!(entry_statuses(&state).await[0].0, "pending");
+
+        let server = MockServer::start().await;
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Synced));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+    }
+
+    #[tokio::test]
+    async fn an_assignee_rollback_that_could_not_read_jira_is_done_when_jira_answers_again() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("user not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        received(&mut events);
+        let config = config(&server.uri());
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config, &mut delivered)
+            .await
+            .unwrap();
+
+        // The assignee Jira refused stays until Jira can be read, and the issue
+        // is found by its row: nothing is left in the outbox
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Pending));
+        assert_eq!(entry_statuses(&state).await, []);
+
+        let mut changed = Vec::new();
+        roll_back_unconfirmed(&state, &config, &mut changed).await;
+
+        assert_eq!(assignee(&state).await, (ada_name(), SyncStatus::Synced));
+        assert_eq!(changed, keys(&["WEB-1"]));
+    }
+
+    /// WEB-1 changed by the user in two ways at once: in In Progress, assigned
+    /// to Grace, and nothing sent yet. Jira has it in To Do, assigned to Ada.
+    async fn both_changes_waiting(state: &AppState) {
+        store_issue_of_ada(state).await;
+        let key = IssueKey::from("WEB-1");
+        api::transition_issue(state, &key, &start(), &json!({}))
+            .await
+            .unwrap();
+        api::assign_issue(state, &key, Some(&grace()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_status_rollback_leaves_the_assignee_that_still_waits_in_the_outbox() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        both_changes_waiting(&state).await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        // The transition is the one that failed: its entry is gone
+        sqlx::query("DELETE FROM sync_queue WHERE entity_type = 'transition'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let client = JiraClient::new(&server.uri(), "ada@example.com", TOKEN);
+
+        roll_back(&state, &client, &"WEB-1".into(), "transition", true)
+            .await
+            .unwrap();
+
+        // The status is Jira's, the assignee is still the user's, and the issue still waits
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Pending)
+        );
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Pending));
+        assert_eq!(entry_statuses(&state).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_assignee_rollback_leaves_the_status_that_still_waits_in_the_outbox() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        both_changes_waiting(&state).await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        sqlx::query("DELETE FROM sync_queue WHERE entity_type = 'assignee'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        cache_transitions_of(&state, &["To Do"]).await;
+        let client = JiraClient::new(&server.uri(), "ada@example.com", TOKEN);
+
+        let later = roll_back(&state, &client, &"WEB-1".into(), "assignee", true)
+            .await
+            .unwrap();
+
+        // The assignee is Jira's, the status is still the user's, and the issue still waits
+        assert_eq!(
+            issue(&state).await,
+            ("In Progress".to_owned(), SyncStatus::Pending)
+        );
+        assert_eq!(assignee(&state).await, (ada_name(), SyncStatus::Pending));
+        // The transition is not dropped, and the menu it was chosen from stays
+        assert!(later.is_empty());
+        assert_eq!(entry_statuses(&state).await.len(), 1);
+        assert_eq!(cached_statuses(&state).await, ["To Do"]);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_transition_does_not_take_the_queued_assignee_with_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        both_changes_waiting(&state).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        // Jira has the status it had and the assignee the user chose
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Synced)
+        );
+        assert_eq!(assignee(&state).await, (grace_name(), SyncStatus::Synced));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected("WEB-1", "status change", REFUSED),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_assignee_does_not_take_the_queued_transition_with_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        let key = IssueKey::from("WEB-1");
+        api::assign_issue(&state, &key, Some(&grace()))
+            .await
+            .unwrap();
+        api::transition_issue(&state, &key, &start(), &json!({}))
+            .await
+            .unwrap();
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("user not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        jira_has_web_1_assigned_to_ada().mount(&server).await;
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        // The status the user chose reached Jira, and the assignee is Jira's
+        assert_eq!(
+            issue(&state).await,
+            ("In Progress".to_owned(), SyncStatus::Synced)
+        );
+        assert_eq!(assignee(&state).await, (ada_name(), SyncStatus::Synced));
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "assignee change",
+                    "Jira returned 400 Bad Request: user not found"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_does_not_overwrite_an_assignee_that_waits_in_the_outbox() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        // A teammate changed the issue after the user did, so Jira's version is newer
+        let mut newer = web_1_of_ada();
+        newer["fields"]["summary"] = json!("Fix login on Safari");
+        newer["fields"]["updated"] = json!("2026-03-30T01:30:00.000+0100");
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [newer] })))
+            .mount(&server)
+            .await;
+
+        let config = config(&server.uri());
+        *state.config.write().await = Some(config.clone());
+        let mut changed = Vec::new();
+        inbound::poll_updated_issues(&state, &config, 1, &mut changed)
+            .await
+            .unwrap();
+
+        let row = issues::get(&state.pool, &"WEB-1".into()).await;
+        let row = row.unwrap().unwrap();
+        assert_eq!(row.summary, "Fix login on Safari");
+        assert_eq!(row.assignee_name, grace_name());
+        assert_eq!(row.sync_status, SyncStatus::Pending);
+        assert_eq!(changed, keys(&["WEB-1"]));
+    }
+
+    #[tokio::test]
+    async fn a_poll_after_the_assignee_was_delivered_brings_what_jira_has() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        // Jira has the assignee under the name of its profile
+        let mut newer = web_1_of_ada();
+        newer["fields"]["assignee"] =
+            json!({ "accountId": "7c20b", "displayName": "Grace B. Hopper" });
+        newer["fields"]["updated"] = json!("2026-03-30T01:30:00.000+0100");
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [newer] })))
+            .mount(&server)
+            .await;
+
+        let config = config(&server.uri());
+        *state.config.write().await = Some(config.clone());
+        let mut changed = Vec::new();
+        inbound::poll_updated_issues(&state, &config, 1, &mut changed)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            assignee(&state).await,
+            (Some("Grace B. Hopper".to_owned()), SyncStatus::Synced)
+        );
     }
 }

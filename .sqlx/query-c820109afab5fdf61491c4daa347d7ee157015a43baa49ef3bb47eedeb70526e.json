@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT users, fetched_at < datetime('now', '-1 hour') AS \"stale!: bool\"\n        FROM assignable_users\n        WHERE issue_key = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "users",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "stale!: bool",
+        "ordinal": 1,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "c820109afab5fdf61491c4daa347d7ee157015a43baa49ef3bb47eedeb70526e"
+}

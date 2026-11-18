@@ -106,6 +106,13 @@ pub struct Transition {
     pub required_fields: Vec<RequiredField>,
 }
 
+/// A Jira user an issue can be assigned to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub account_id: String,
+    pub display_name: String,
+}
+
 /// A field the user has to fill in before a transition can be sent.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequiredField {
