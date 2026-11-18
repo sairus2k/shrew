@@ -6,6 +6,7 @@ use crate::{
     db::{
         issues::{self, IssueRecord, JiraTimestamp},
         sync_queue,
+        worklogs::{self, RemoteWorklog},
     },
     models::{IssueKey, StatusCategory},
     sync::{jira_client::JiraClient, outbound},
@@ -264,6 +265,9 @@ pub(crate) async fn poll_updated_issues(
             let old_key = issues::key_of(&mut *tx, &record.id).await?;
             if issues::upsert(&mut *tx, &record).await? {
                 let moved_from = old_key.filter(|old| *old != record.key);
+                if let Some(old) = &moved_from {
+                    worklogs::rename_issue(&mut tx, old, &record.key).await?;
+                }
                 written.push(record.key);
                 written.extend(moved_from);
             }
@@ -285,6 +289,99 @@ pub(crate) async fn poll_updated_issues(
         .filter(|current| current.last_sync_at == Some(last_sync_at))
     {
         current.last_sync_at = Some(started_at);
+        auth::save_config(&state.data_dir, current).await?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraWorklog {
+    id: String,
+    issue_id: String,
+    time_spent_seconds: i64,
+    started: String,
+    comment: Option<Value>,
+}
+
+fn remote_worklog(worklog: &Value) -> anyhow::Result<RemoteWorklog> {
+    let JiraWorklog {
+        id,
+        issue_id,
+        time_spent_seconds,
+        started,
+        comment,
+    } = JiraWorklog::deserialize(worklog)
+        .with_context(|| format!("unexpected worklog from Jira: {}", worklog["id"]))?;
+    let comment = adf::to_plain_text(comment.as_ref());
+    Ok(RemoteWorklog {
+        started_at: worklogs::started_at_from_jira(&started).map_err(|error| {
+            anyhow::anyhow!("worklog {id} has an unreadable `started`: {error}")
+        })?,
+        remote_id: id,
+        issue_id,
+        time_spent_sec: time_spent_seconds,
+        comment: (!comment.is_empty()).then_some(comment),
+    })
+}
+
+/// Stores the worklogs Jira changed since the last poll, those of issues the
+/// cache has, and moves the saved time forward. The keys of the issues whose
+/// worklogs were written are added to `changed`.
+pub(crate) async fn poll_updated_worklogs(
+    state: &AppState,
+    config: &Config,
+    changed: &mut Vec<IssueKey>,
+) -> anyhow::Result<()> {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let mut since = config.last_worklog_sync_at;
+    loop {
+        let page = client.updated_worklogs(since).await?;
+        let ids: Vec<i64> = page
+            .values
+            .iter()
+            .map(|worklog| worklog.worklog_id)
+            .collect();
+        let listed = if ids.is_empty() {
+            Vec::new()
+        } else {
+            client.worklogs(&ids).await?
+        };
+        let mut tx = state.pool.begin().await?;
+        for worklog in &listed {
+            // An unreadable worklog is announced and left out, as an unreadable issue is
+            let record = match remote_worklog(worklog) {
+                Ok(record) => record,
+                Err(error) => {
+                    let skipped = SyncEvent::IssueSkipped {
+                        key: format!("worklog {}", worklog["id"].as_str().unwrap_or("unknown")),
+                        reason: format!("{error:#}"),
+                    };
+                    state.events.send(skipped).ok();
+                    continue;
+                }
+            };
+            if let Some(key) = worklogs::upsert_remote(&mut *tx, &record).await?
+                && !changed.contains(&key)
+            {
+                changed.push(key);
+            }
+        }
+        tx.commit().await?;
+        // Jira's time, not the local clock: the next poll asks from where this one ended
+        since = page.until.max(since);
+        if page.last_page {
+            break;
+        }
+    }
+
+    let mut saved = state.config.write().await;
+    // A sign-in during the poll starts a new setup: its sync time is not ours to set
+    if let Some(current) = saved
+        .as_mut()
+        .filter(|current| current.last_worklog_sync_at == config.last_worklog_sync_at)
+    {
+        current.last_worklog_sync_at = since;
         auth::save_config(&state.data_dir, current).await?;
     }
     Ok(())
@@ -353,6 +450,7 @@ pub(crate) async fn reconcile_removed_issues(
     for issue in issues::cached(&mut *tx).await? {
         if config.watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
             issues::delete(&mut *tx, &issue.id).await?;
+            worklogs::delete_for_issue(&mut *tx, &issue.key).await?;
             // Nothing is left to send them to, and no view could show a refused
             // comment: the user is told about each one, the unsent comments included
             let entries = sync_queue::remove_for_issue(&mut *tx, &issue.key).await?;
@@ -393,7 +491,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, method, path},
+        matchers::{body_json, method, path, query_param},
     };
 
     fn issue(id: u32, project: &str) -> Value {
@@ -840,6 +938,7 @@ mod tests {
         api::initial_sync(&state).await.unwrap();
         received(&mut events);
         listing(ids(1..10)).mount(server).await;
+        crate::sync::no_worklog_changes().mount(server).await;
         (state, events)
     }
 
@@ -1117,6 +1216,263 @@ mod tests {
         assert_eq!(row.unwrap().project_key, "API");
     }
 
+    /// Jira's answer to `GET /worklog/updated?since={since}`.
+    fn worklogs_updated(since: i64, ids: &[i64], until: i64, last_page: bool) -> Mock {
+        let values: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "worklogId": id, "updatedTime": until }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/worklog/updated"))
+            .and(query_param("since", since.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "values": values, "until": until, "lastPage": last_page }),
+                ),
+            )
+            .with_priority(1)
+    }
+
+    /// A worklog as `POST /worklog/list` sends it: 10:15 in a UTC+2 profile.
+    fn jira_worklog(id: &str, issue_id: &str, seconds: i64) -> Value {
+        json!({
+            "id": id,
+            "issueId": issue_id,
+            "timeSpentSeconds": seconds,
+            "started": "2026-03-29T10:15:00.000+0200",
+            "comment": { "type": "doc", "version": 1, "content": [
+                { "type": "paragraph", "content": [{ "type": "text", "text": "Pairing" }] },
+            ] },
+        })
+    }
+
+    fn worklog_list(ids: &[i64], worklogs: &[Value]) -> Mock {
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/worklog/list"))
+            .and(body_json(json!({ "ids": ids })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(worklogs))
+            .expect(1)
+    }
+
+    /// Every cached worklog: the issue, the remote id, the seconds, the start and the comment.
+    async fn stored_worklogs(
+        state: &AppState,
+    ) -> Vec<(String, Option<String>, i64, String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT issue_key, remote_id, time_spent_sec, started_at, comment FROM worklogs
+             ORDER BY issue_key, remote_id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn saved_worklog_time(state: &AppState) -> i64 {
+        let config = state.config.read().await;
+        config.as_ref().unwrap().last_worklog_sync_at
+    }
+
+    #[tokio::test]
+    async fn a_poll_stores_the_worklogs_jira_changed_and_continues_from_where_it_ended() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        // Two pages; worklog 3 is on an issue the cache does not have
+        worklogs_updated(0, &[1, 2], 5_000, false)
+            .mount(&server)
+            .await;
+        worklog_list(
+            &[1, 2],
+            &[jira_worklog("1", "1", 3600), jira_worklog("2", "1", 900)],
+        )
+        .mount(&server)
+        .await;
+        worklogs_updated(5_000, &[3], 9_000, true)
+            .mount(&server)
+            .await;
+        worklog_list(&[3], &[jira_worklog("3", "77", 60)])
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        // 10:15 at UTC+2 is 08:15 UTC
+        let started = "2026-03-29T08:15:00.000Z";
+        let pairing = Some("Pairing".to_owned());
+        assert_eq!(
+            stored_worklogs(&state).await,
+            [
+                (
+                    "WEB-1".to_owned(),
+                    Some("1".to_owned()),
+                    3600,
+                    started.to_owned(),
+                    pairing.clone()
+                ),
+                (
+                    "WEB-1".to_owned(),
+                    Some("2".to_owned()),
+                    900,
+                    started.to_owned(),
+                    pairing
+                ),
+            ]
+        );
+        assert_eq!(saved_worklog_time(&state).await, 9_000);
+        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
+        let saved: Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved["last_worklog_sync_at"], json!(9_000));
+
+        // The next cycle asks from the end of the last page, and a worklog Jira
+        // changed meanwhile replaces the stored one
+        let changed_worklog = jira_worklog("1", "1", 7200);
+        worklogs_updated(9_000, &[1], 9_500, true)
+            .mount(&server)
+            .await;
+        worklog_list(&[1], &[changed_worklog]).mount(&server).await;
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        let rows = stored_worklogs(&state).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].2, 7200);
+        assert_eq!(saved_worklog_time(&state).await, 9_500);
+    }
+
+    #[tokio::test]
+    async fn a_worklog_created_here_is_not_stored_twice_when_the_poll_returns_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/WEB-1/worklog"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "30001" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The worklog posted in this cycle comes back in the same cycle's poll
+        let mut returned = jira_worklog("30001", "1", 5400);
+        returned["comment"] = json!(null);
+        worklogs_updated(0, &[30001], 9_000, true)
+            .mount(&server)
+            .await;
+        worklog_list(&[30001], &[returned]).mount(&server).await;
+        // 2026-03-29 08:15:00 UTC
+        api::log_time(&state, &"WEB-1".into(), 5400, 1_774_772_100, None)
+            .await
+            .unwrap();
+
+        // The first event is `log_time`'s own
+        let events = cycle(&mut events).await;
+        assert_eq!(events.len(), 4, "{events:?}");
+
+        let rows = stored_worklogs(&state).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1.as_deref(), Some("30001"));
+        let status: String = sqlx::query_scalar("SELECT sync_status FROM worklogs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "synced");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_worklog_is_announced_and_the_others_are_stored() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        let mut unreadable = jira_worklog("1", "1", 60);
+        unreadable["started"] = json!("yesterday");
+        worklogs_updated(0, &[1, 2], 9_000, true)
+            .mount(&server)
+            .await;
+        worklog_list(&[1, 2], &[unreadable, jira_worklog("2", "1", 900)])
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        let cycle = cycle(&mut events).await;
+        assert_eq!(cycle.len(), 4, "{cycle:?}");
+        assert!(cycle[1].starts_with("IssueSkipped") && cycle[1].contains("worklog 1"));
+        assert_eq!(stored_worklogs(&state).await.len(), 1);
+        assert_eq!(saved_worklog_time(&state).await, 9_000);
+    }
+
+    #[tokio::test]
+    async fn the_worklogs_of_a_moved_issue_follow_its_new_key() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        // A delivered worklog, and one that Jira refused and the outbox still holds
+        sqlx::raw_sql(
+            "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, sync_status)
+                 VALUES ('40001', 'WEB-1', 600, '2026-03-29T08:15:00.000Z', 'synced');
+                 INSERT INTO sync_queue (entity_type, issue_key, operation, payload, status)
+                 VALUES ('worklog', 'WEB-1', 'create', '{}', 'failed');",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let mut moved = changed(issue(1, "API"), LATER, "Moved");
+        moved["key"] = json!("API-9");
+        poll(JUST_SYNCED, page(&[moved], None)).mount(&server).await;
+
+        state.sync_waker.send(()).unwrap();
+        cycle(&mut events).await;
+
+        let rows = stored_worklogs(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "API-9");
+        let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, ["API-9"]);
+    }
+
+    #[tokio::test]
+    async fn the_worklogs_of_an_issue_removed_by_reconciliation_are_removed_too() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB")];
+        let (state, _events) = synced(&server, data_dir.path(), &stored).await;
+        sqlx::raw_sql(
+            "INSERT INTO worklogs (issue_key, time_spent_sec, started_at)
+                 VALUES ('WEB-1', 600, '2026-03-29T08:15:00.000Z'),
+                        ('WEB-2', 600, '2026-03-29T08:15:00.000Z');",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        listing(ids(1..2)).with_priority(1).mount(&server).await;
+        let config = state.config.read().await.clone().unwrap();
+
+        reconcile_removed_issues(&state, &config).await.unwrap();
+
+        let rows = stored_worklogs(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "WEB-1");
+    }
+
     #[tokio::test]
     async fn a_failed_poll_reports_the_error_and_the_next_one_still_runs() {
         let server = MockServer::start().await;
@@ -1172,6 +1528,7 @@ mod tests {
         let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
         poll(182, page(&[renamed], None)).mount(&server).await;
         listing(ids(1..2)).mount(&server).await;
+        crate::sync::no_worklog_changes().mount(&server).await;
         let (state, mut events) = start_syncing_without_keychain(data_dir.path())
             .await
             .unwrap();

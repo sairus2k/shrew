@@ -375,7 +375,7 @@ impl Render for TransitionFieldsForm {
 
 #[cfg(test)]
 mod tests {
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
+    use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, rows, synced_on};
     use crate::runtime::Core;
     use app_core::AppState;
@@ -442,6 +442,7 @@ mod tests {
         at_most: u64,
     ) -> MockServer {
         let server = MockServer::builder().listener(listener).start().await;
+        no_worklog_changes().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),
@@ -931,6 +932,7 @@ mod tests {
         let [(_, to_do), _] = offers();
         let mut web_1 = two_issues()[0].clone();
         web_1["fields"]["status"] = to("To Do", "new");
+        no_worklog_changes().mount(server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),

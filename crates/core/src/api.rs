@@ -59,6 +59,7 @@ pub async fn sign_in(
         last_sync_at: None,
         pending_projects: Vec::new(),
         last_reconcile_at: 0,
+        last_worklog_sync_at: 0,
     };
     // What a sign-out that failed halfway, or a config deleted by hand, left behind
     db::clear(&state.pool).await?;
@@ -324,6 +325,57 @@ pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow
     Ok(())
 }
 
+/// Logs time on the issue, locally and at once: Jira gets the worklog from
+/// the outbox, with the `started_at` given here however late it is delivered.
+/// `started_at` is Unix seconds. The comment is trimmed and left out when
+/// empty. Zero time, and an issue the cache does not have, are refused.
+pub async fn log_time(
+    state: &AppState,
+    key: &IssueKey,
+    time_spent_secs: u64,
+    started_at: i64,
+    comment: Option<&str>,
+) -> anyhow::Result<()> {
+    if time_spent_secs == 0 {
+        bail!("the time spent cannot be zero");
+    }
+    let started_at =
+        db::worklogs::started_at_from_unix(started_at).context("the start time is out of range")?;
+    let worklog = db::worklogs::NewWorklog {
+        issue_key: key.clone(),
+        time_spent_sec: i64::try_from(time_spent_secs).context("the time spent is too long")?,
+        started_at,
+        comment: comment
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty())
+            .map(str::to_owned),
+    };
+    if db::issues::get(&state.pool, key).await?.is_none() {
+        bail!("issue {key} not found");
+    }
+    // One transaction: the worklog shown and the entry Jira will get must not
+    // part ways
+    let mut tx = state.pool.begin().await?;
+    let local_id = db::worklogs::insert(&mut *tx, &worklog).await?;
+    // Which target it goes to is decided at delivery, so the entry holds only
+    // what the user entered
+    let payload = json!({
+        "local_id": local_id,
+        "time_spent_seconds": worklog.time_spent_sec,
+        "started_at": worklog.started_at,
+        "comment": worklog.comment,
+    });
+    db::sync_queue::enqueue(&mut *tx, "worklog", key, &payload.to_string()).await?;
+    tx.commit().await?;
+
+    state
+        .events
+        .send(SyncEvent::IssuesUpdated(vec![key.clone()]))
+        .ok();
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
 /// Queues a comment Jira refused again, as it was written. `entry_id` comes
 /// from `Comment::rejected`.
 pub async fn retry_comment(state: &AppState, entry_id: i64) -> anyhow::Result<()> {
@@ -433,6 +485,7 @@ mod tests {
                 "last_sync_at": null,
                 "pending_projects": [],
                 "last_reconcile_at": 0,
+                "last_worklog_sync_at": 0,
             })
         );
         assert_eq!(

@@ -95,6 +95,22 @@ struct IssueId {
     id: String,
 }
 
+/// One page of `GET /worklog/updated`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorklogPage {
+    pub values: Vec<UpdatedWorklog>,
+    /// The time to ask from for the next page, or to continue from after the last.
+    pub until: i64,
+    pub last_page: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdatedWorklog {
+    pub worklog_id: i64,
+}
+
 #[derive(Deserialize)]
 struct ApproximateCount {
     count: u64,
@@ -319,6 +335,37 @@ impl JiraClient {
     ) -> Result<Value, JiraError> {
         let url = self.url(&format!("/issue/{key}/comment"));
         self.send(self.http.post(url).json(body)).await
+    }
+
+    /// `body` is the request body of Jira's worklog call. Returns the worklog
+    /// as Jira stored it.
+    pub(crate) async fn add_worklog(
+        &self,
+        key: &IssueKey,
+        body: &Value,
+    ) -> Result<Value, JiraError> {
+        let url = self.url(&format!("/issue/{key}/worklog"));
+        self.send(self.http.post(url).json(body)).await
+    }
+
+    /// The worklogs of every issue that changed since `since` (Unix
+    /// milliseconds), by id, one page at a time.
+    pub(crate) async fn updated_worklogs(&self, since: i64) -> Result<WorklogPage, JiraError> {
+        let request = self
+            .http
+            .get(self.url("/worklog/updated"))
+            .query(&[("since", since.to_string())]);
+        self.send(request).await
+    }
+
+    /// The worklogs with these ids, as Jira sent them. Jira takes at most a
+    /// thousand ids, which is also the size of a page of `updated_worklogs`.
+    pub(crate) async fn worklogs(&self, ids: &[i64]) -> Result<Vec<Value>, JiraError> {
+        let request = self
+            .http
+            .post(self.url("/worklog/list"))
+            .json(&json!({ "ids": ids }));
+        self.send(request).await
     }
 
     /// The people Jira lets the issue be assigned to. Jira looks at the first

@@ -25,6 +25,10 @@ pub(crate) struct Config {
     // milliseconds. 0 until the first one
     #[serde(default)]
     pub last_reconcile_at: i64,
+    // Where the next poll of changed worklogs starts, in Unix milliseconds: the
+    // `until` Jira gave with the last page. 0 asks for every worklog, once.
+    #[serde(default)]
+    pub last_worklog_sync_at: i64,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,

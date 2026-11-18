@@ -140,7 +140,7 @@ impl Render for AssigneeButton {
 
 #[cfg(test)]
 mod tests {
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
+    use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, rows, synced_on};
     use crate::runtime::Core;
     use app_core::AppState;
@@ -158,6 +158,7 @@ mod tests {
     /// (`5b10a`, Ada) and Grace can be assigned to it.
     async fn jira() -> MockServer {
         let server = MockServer::start().await;
+        no_worklog_changes().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
                 ResponseTemplate::new(200)

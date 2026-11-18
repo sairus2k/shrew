@@ -92,7 +92,7 @@ impl Render for CommentForm {
 
 #[cfg(test)]
 mod tests {
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
+    use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
     use crate::issue_detail::tests::painted;
     use crate::issue_list::tests::{issue, synced_on};
     use crate::runtime::Core;
@@ -136,6 +136,7 @@ mod tests {
     /// accepts comments on WEB-1.
     async fn jira(listener: TcpListener, issues: Value) -> MockServer {
         let server = MockServer::builder().listener(listener).start().await;
+        no_worklog_changes().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": issues })))
             .mount(&server)
@@ -270,6 +271,7 @@ mod tests {
         // The next poll finds the issue with the comment Jira stored
         tokio.block_on(server.reset());
         tokio.block_on(async {
+            no_worklog_changes().mount(&server).await;
             Mock::given(path("/rest/api/3/search/jql"))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_json(json!({ "issues": [commented()] })),

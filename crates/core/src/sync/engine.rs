@@ -70,6 +70,7 @@ async fn cycle(
         outbound::process_queue(state, &config, &mut changed).await?;
         outbound::roll_back_unconfirmed(state, &config, &mut changed).await;
         inbound::poll_updated_issues(state, &config, last_sync_at, &mut changed).await?;
+        inbound::poll_updated_worklogs(state, &config, &mut changed).await?;
         // Deleted and moved issues never match `updated >=`: the poll cannot see them
         if inbound::reconcile_due(&config, *reconciled, inbound::now_ms()?) {
             changed.extend(inbound::reconcile_removed_issues(state, &config).await?);

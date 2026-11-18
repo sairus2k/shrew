@@ -8,6 +8,7 @@ pub(crate) mod assignable;
 pub(crate) mod issues;
 pub(crate) mod sync_queue;
 pub(crate) mod transitions;
+pub(crate) mod worklogs;
 
 const DB_FILE: &str = "shrew.db";
 
@@ -34,6 +35,7 @@ pub(crate) async fn clear(pool: &SqlitePool) -> sqlx::Result<()> {
          DELETE FROM sync_queue;
          DELETE FROM transition_cache;
          DELETE FROM assignable_users;
+         DELETE FROM worklogs;
          COMMIT;",
     )
     .execute(pool)

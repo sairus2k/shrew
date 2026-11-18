@@ -7,6 +7,7 @@ use crate::{
         assignable, issues,
         sync_queue::{self, QueueEntry},
         transitions::{self, Position},
+        worklogs,
     },
     models::IssueKey,
     sync::{
@@ -47,13 +48,20 @@ pub(crate) async fn process_queue(
     // A retried entry is claimed again: it is still the oldest one
     while let Some(entry) = sync_queue::claim_next(&state.pool).await? {
         let error = match deliver(&client, &entry).await {
-            Ok(created) => {
+            Ok(delivered_as) => {
                 // One transaction: an issue must not stay pending with nothing left to send,
                 // and a comment must not be missing from both the outbox and the cache
                 let mut tx = state.pool.begin().await?;
                 sync_queue::mark_synced(&mut *tx, entry.id).await?;
-                if let Some(comment) = &created {
-                    issues::add_comment(&mut tx, &entry.issue_key, comment).await?;
+                match &delivered_as {
+                    Delivered::Comment(comment) => {
+                        issues::add_comment(&mut tx, &entry.issue_key, comment).await?;
+                    }
+                    Delivered::Worklog {
+                        local_id,
+                        remote_id,
+                    } => worklogs::confirm(&mut *tx, local_id, remote_id).await?,
+                    Delivered::Nothing => {}
                 }
                 issues::confirm(&mut *tx, &entry.issue_key).await?;
                 tx.commit().await?;
@@ -98,6 +106,11 @@ pub(crate) async fn process_queue(
                     .unwrap_or_default();
                 } else {
                     sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
+                    if entry.entity_type == "worklog" {
+                        let payload: Value = serde_json::from_str(&entry.payload)?;
+                        let local_id = payload["local_id"].as_str().unwrap_or_default();
+                        worklogs::mark_failed(&state.pool, local_id).await?;
+                    }
                 }
                 // A refused comment moves from the pending ones to the refused ones
                 let updated = SyncEvent::IssuesUpdated(vec![entry.issue_key.clone()]);
@@ -223,28 +236,61 @@ pub(crate) async fn roll_back_unconfirmed(
 // what the user did, and how that reaches Jira can depend on the settings at
 // the time of delivery.
 //
-// The comment Jira created is returned: the cache holds it until the next poll
-// brings the issue, so that it does not vanish in between.
-async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Option<Value>> {
+// What Jira created is returned: the cache holds a comment until the next poll
+// brings the issue, so that it does not vanish in between, and a worklog keeps
+// the id Jira gave it.
+async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Delivered> {
     let payload: Value = serde_json::from_str(&entry.payload)?;
     match entry.entity_type.as_str() {
         "transition" => {
             client.transition_issue(&entry.issue_key, &payload).await?;
-            Ok(None)
+            Ok(Delivered::Nothing)
         }
         "assignee" => {
             client.assign_issue(&entry.issue_key, &payload).await?;
-            Ok(None)
+            Ok(Delivered::Nothing)
         }
         "comment" => {
             let text = payload["text"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("a comment entry without text"))?;
             let body = json!({ "body": adf::from_plain_text(text) });
-            Ok(Some(client.add_comment(&entry.issue_key, &body).await?))
+            Ok(Delivered::Comment(
+                client.add_comment(&entry.issue_key, &body).await?,
+            ))
+        }
+        "worklog" => {
+            let local_id = payload["local_id"].as_str().unwrap_or_default().to_owned();
+            let started =
+                worklogs::started_at_for_jira(payload["started_at"].as_str().unwrap_or_default())
+                    .map_err(|error| {
+                    anyhow::anyhow!("a worklog entry with an unreadable start: {error}")
+                })?;
+            let mut body = json!({
+                "timeSpentSeconds": payload["time_spent_seconds"],
+                "started": started,
+            });
+            if let Some(comment) = payload["comment"].as_str() {
+                body["comment"] = adf::from_plain_text(comment);
+            }
+            let created = client.add_worklog(&entry.issue_key, &body).await?;
+            let remote_id = created["id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Jira answered a worklog without an id"))?
+                .to_owned();
+            Ok(Delivered::Worklog {
+                local_id,
+                remote_id,
+            })
         }
         other => anyhow::bail!("unknown outbox entry type `{other}`"),
     }
+}
+
+enum Delivered {
+    Nothing,
+    Comment(Value),
+    Worklog { local_id: String, remote_id: String },
 }
 
 fn failure(error: &anyhow::Error) -> Failure {
@@ -291,6 +337,7 @@ mod tests {
             last_sync_at: Some(inbound::now_ms().unwrap()),
             pending_projects: Vec::new(),
             last_reconcile_at: 0,
+            last_worklog_sync_at: 0,
             api_token: TOKEN.to_owned(),
         }
     }
@@ -594,6 +641,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [] })))
             .mount(server)
             .await;
+        crate::sync::no_worklog_changes().mount(server).await;
         start_syncing_without_keychain(data_dir).await.unwrap()
     }
 
@@ -1022,6 +1070,258 @@ mod tests {
         );
         assert_eq!(comments(&state).await.len(), 1);
         assert!(!comments(&state).await[0].0);
+    }
+
+    fn worklog_call(key: &str) -> wiremock::MockBuilder {
+        Mock::given(method("POST")).and(path(format!("/rest/api/3/issue/{key}/worklog")))
+    }
+
+    /// 2026-03-29 08:15:00 UTC
+    const STARTED: i64 = 1_774_772_100;
+
+    /// Every worklog of WEB-1: the remote id, the sync status, the seconds and the start.
+    async fn worklog_rows(state: &AppState) -> Vec<(Option<String>, String, i64, String)> {
+        sqlx::query_as(
+            "SELECT remote_id, sync_status, time_spent_sec, started_at FROM worklogs
+             WHERE issue_key = 'WEB-1' ORDER BY created_at, rowid",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn log_time_stores_the_worklog_and_a_target_neutral_entry_together() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+
+        api::log_time(&state, &"WEB-1".into(), 5400, STARTED, Some("  Pairing  "))
+            .await
+            .unwrap();
+
+        let started = "2026-03-29T08:15:00.000Z".to_owned();
+        assert_eq!(
+            worklog_rows(&state).await,
+            [(None, "pending".to_owned(), 5400, started.clone())]
+        );
+        let (local_id, comment): (String, Option<String>) =
+            sqlx::query_as("SELECT local_id, comment FROM worklogs")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(comment.as_deref(), Some("Pairing"));
+        let queued: Vec<(String, String, String, String)> =
+            sqlx::query_as("SELECT entity_type, issue_key, status, payload FROM sync_queue")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "worklog");
+        assert_eq!(queued[0].1, "WEB-1");
+        assert_eq!(queued[0].2, "pending");
+        // Nothing in the entry is Jira's request: the target builds it when it sends
+        let payload: Value = serde_json::from_str(&queued[0].3).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "local_id": local_id,
+                "time_spent_seconds": 5400,
+                "started_at": started,
+                "comment": "Pairing",
+            })
+        );
+        assert_eq!(
+            received(&mut events),
+            ["IssuesUpdated([IssueKey(\"WEB-1\")])"]
+        );
+    }
+
+    #[tokio::test]
+    async fn log_time_refuses_what_cannot_be_delivered_and_stores_nothing() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+
+        let unknown = api::log_time(&state, &"WEB-9".into(), 60, STARTED, None).await;
+        let zero = api::log_time(&state, &"WEB-1".into(), 0, STARTED, None).await;
+
+        assert_eq!(unknown.unwrap_err().to_string(), "issue WEB-9 not found");
+        assert!(zero.is_err());
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM worklogs) + (SELECT COUNT(*) FROM sync_queue)",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn log_time_leaves_no_worklog_when_its_entry_cannot_be_stored() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        sqlx::query("DROP TABLE sync_queue")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap_err();
+
+        assert!(worklog_rows(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_worklog_is_sent_with_its_time_start_and_comment_and_keeps_the_remote_id() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        worklog_call("WEB-1")
+            .and(basic_auth("ada@example.com", TOKEN))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "30001" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 5400, STARTED, Some("Pairing"))
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&server).await,
+            [(
+                "/rest/api/3/issue/WEB-1/worklog".to_owned(),
+                json!({
+                    "timeSpentSeconds": 5400,
+                    "started": "2026-03-29T08:15:00.000+0000",
+                    "comment": { "type": "doc", "version": 1, "content": [
+                        { "type": "paragraph", "content": [{ "type": "text", "text": "Pairing" }] },
+                    ] },
+                })
+            )]
+        );
+        assert_eq!(
+            worklog_rows(&state).await,
+            [(
+                Some("30001".to_owned()),
+                "synced".to_owned(),
+                5400,
+                "2026-03-29T08:15:00.000Z".to_owned()
+            )]
+        );
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        let waiting: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue WHERE status != 'synced'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(waiting, 0);
+    }
+
+    #[tokio::test]
+    async fn a_worklog_without_a_comment_is_sent_without_one() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "30001" })))
+            .mount(&server)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, Some("   "))
+            .await
+            .unwrap();
+
+        process_queue(&state, &config(&server.uri()), &mut Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&server).await[0].1,
+            json!({ "timeSpentSeconds": 600, "started": "2026-03-29T08:15:00.000+0000" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worklog_created_offline_is_delivered_after_reconnect_with_its_original_start() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        api::log_time(&state, &"WEB-1".into(), 1800, STARTED, None)
+            .await
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let offline = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&offline), &mut delivered)
+            .await
+            .unwrap_err();
+
+        assert_eq!(worklog_rows(&state).await[0].0, None);
+        assert_eq!(worklog_rows(&state).await[0].1, "pending");
+
+        // Long after the work was done
+        let server = MockServer::start().await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "30002" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&server).await[0].1["started"],
+            "2026-03-29T08:15:00.000+0000"
+        );
+        assert_eq!(worklog_rows(&state).await[0].0.as_deref(), Some("30002"));
+        assert_eq!(worklog_rows(&state).await[0].1, "synced");
+        assert_eq!(delivered, keys(&["WEB-1"]));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_worklog_is_marked_failed_and_announced() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("no permission"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(worklog_rows(&state).await[0].0, None);
+        assert_eq!(worklog_rows(&state).await[0].1, "failed");
+        let status: String = sqlx::query_scalar("SELECT status FROM sync_queue")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(delivered.is_empty());
+        let events = received(&mut events);
+        assert_eq!(events[0], "IssuesUpdated([IssueKey(\"WEB-1\")])");
+        assert!(events[1].starts_with("ChangeRejected") && events[1].contains("worklog"));
     }
 
     #[tokio::test]
