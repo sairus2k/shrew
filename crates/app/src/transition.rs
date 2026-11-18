@@ -22,6 +22,8 @@ pub struct StatusButton {
     transitions: Vec<Transition>,
     // The status `transitions` were asked for
     loaded_for: Option<String>,
+    // A transition is being written to the core
+    saving: bool,
     // Open while the user fills in the fields of a transition
     form: Option<Entity<TransitionFieldsForm>>,
     _form_events: Option<Subscription>,
@@ -39,6 +41,7 @@ impl StatusButton {
             issue,
             transitions: Vec::new(),
             loaded_for: None,
+            saving: false,
             form: None,
             _form_events: None,
             _load: Task::ready(()),
@@ -56,12 +59,17 @@ impl StatusButton {
         if status.is_none() || status == self.loaded_for {
             return;
         }
-        self.loaded_for = status;
         let key = issue.key.clone();
         // Until the new status answers, the button is disabled instead of
         // offering transitions of the status the issue just left
         self.transitions.clear();
         cx.notify();
+        // The core asks its database for the status, which the write of the
+        // transition has not reached yet: it would answer for the old one
+        if self.saving {
+            return;
+        }
+        self.loaded_for = status;
         let load = spawn(cx, move |state| async move {
             api::get_transitions(&state, &key).await
         });
@@ -105,6 +113,7 @@ impl StatusButton {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.saving = true;
         // Optimistic: every view observing the model repaints in this frame
         self.issue
             .update(cx, |issue, cx| issue.apply_transition(&transition, cx));
@@ -115,17 +124,21 @@ impl StatusButton {
         });
         cx.spawn_in(window, async move |this, cx| {
             // On success the core announces the issue and the model reloads it
-            if write.await.is_err() {
-                // Nothing was committed, so the cache still holds the previous status
-                this.update_in(cx, |this, window, cx| {
+            let saved = write.await.is_ok();
+            this.update_in(cx, |this, window, cx| {
+                this.saving = false;
+                this.loaded_for = None;
+                this.load_transitions(cx);
+                if !saved {
+                    // Nothing was committed, so the cache still holds the previous status
                     this.issue.update(cx, |issue, cx| issue.reload(cx));
                     window.push_notification(
                         Notification::error("Could not save the transition"),
                         cx,
                     );
-                })
-                .ok();
-            }
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -703,7 +716,9 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let tokio = tokio_runtime();
-        let server = tokio.block_on(jira_offering(local_port(), screens()));
+        // Jira keeps saying To Do after the transition, so the menu of Done is
+        // asked for again at every change of the issue
+        let server = tokio.block_on(jira_asked_about_menus(local_port(), screens(), u64::MAX));
         tokio.block_on(accept_one_transition(&server));
         let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
         let window = launch(cx, &tokio, data_dir.path());
