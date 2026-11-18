@@ -21,6 +21,7 @@ use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
 
 mod account;
+mod assignee;
 mod comment;
 #[cfg(test)]
 mod harness;

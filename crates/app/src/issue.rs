@@ -5,7 +5,7 @@
 use crate::runtime::{Core, spawn};
 use app_core::{
     SyncEvent, api,
-    models::{IssueDetail, IssueKey, SyncStatus, Transition},
+    models::{IssueDetail, IssueKey, SyncStatus, Transition, User},
 };
 use gpui_kit::*;
 
@@ -62,6 +62,18 @@ impl IssueModel {
         if let Some(detail) = &mut self.detail {
             detail.status = transition.to_status.clone();
             detail.status_category = transition.to_status_category;
+            detail.sync_status = SyncStatus::Pending;
+        }
+        cx.notify();
+    }
+
+    /// Shows the issue with the assignee the user chose (`None` for nobody)
+    /// before the core has stored it.
+    pub fn apply_assignee(&mut self, assignee: Option<&User>, cx: &mut Context<Self>) {
+        // A read still in flight would put the old assignee back
+        self._load = Task::ready(());
+        if let Some(detail) = &mut self.detail {
+            detail.assignee_name = assignee.map(|user| user.display_name.clone());
             detail.sync_status = SyncStatus::Pending;
         }
         cx.notify();

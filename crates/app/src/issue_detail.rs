@@ -1,5 +1,6 @@
 //! The pane beside the list: one issue with its description and comments.
 
+use crate::assignee::AssigneeButton;
 use crate::comment::CommentForm;
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
@@ -21,6 +22,7 @@ pub struct DetailClosed;
 pub struct DetailPane {
     issue: Entity<IssueModel>,
     status: Entity<StatusButton>,
+    assignee: Entity<AssigneeButton>,
     comment_form: Entity<CommentForm>,
     _issue_changed: Subscription,
 }
@@ -33,6 +35,7 @@ impl DetailPane {
         let key = issue.read(cx).key.clone();
         Self {
             status: cx.new(|cx| StatusButton::new(issue.clone(), cx)),
+            assignee: cx.new(|cx| AssigneeButton::new(issue.clone(), cx)),
             comment_form: cx.new(|cx| CommentForm::new(key, window, cx)),
             issue,
             _issue_changed,
@@ -207,6 +210,7 @@ fn rejected_comment(index: usize, rejected: &RejectedComment, cx: &App) -> impl 
 fn body(
     issue: &IssueDetail,
     status: Entity<StatusButton>,
+    assignee_button: Entity<AssigneeButton>,
     comment_form: Entity<CommentForm>,
     cx: &App,
 ) -> impl IntoElement {
@@ -260,7 +264,9 @@ fn body(
                                 .child("Pending")
                         })),
                 )
-                .child(field("detail-assignee", "Assignee", assignee, cx))
+                .child(
+                    field_line("detail-assignee", "Assignee", assignee, cx).child(assignee_button),
+                )
                 .child(field(
                     "detail-reporter",
                     "Reporter",
@@ -356,12 +362,15 @@ impl Render for DetailPane {
                     .children(open_in_jira)
                     .child(close),
             )
-            .children(
-                issue
-                    .detail
-                    .as_ref()
-                    .map(|detail| body(detail, self.status.clone(), self.comment_form.clone(), cx)),
-            )
+            .children(issue.detail.as_ref().map(|detail| {
+                body(
+                    detail,
+                    self.status.clone(),
+                    self.assignee.clone(),
+                    self.comment_form.clone(),
+                    cx,
+                )
+            }))
     }
 }
 
