@@ -419,6 +419,15 @@ mod tests {
         listener: TcpListener,
         offers: [(&'static str, Value); 2],
     ) -> MockServer {
+        jira_asked_about_menus(listener, offers, 1).await
+    }
+
+    /// Like `jira_offering`, but a menu may be asked for up to `at_most` times.
+    async fn jira_asked_about_menus(
+        listener: TcpListener,
+        offers: [(&'static str, Value); 2],
+        at_most: u64,
+    ) -> MockServer {
         let server = MockServer::builder().listener(listener).start().await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
@@ -445,7 +454,7 @@ mod tests {
                     ResponseTemplate::new(200).set_body_json(json!({ "transitions": transitions })),
                 )
                 // One question per status: every later menu comes from the cache
-                .expect(..=1)
+                .expect(..=at_most)
                 .mount(&server)
                 .await;
         }
@@ -867,9 +876,20 @@ mod tests {
         in_window(cx, window, |window, _| assert!(pending(window)));
 
         // Jira is back at the same address
-        let server = tokio.block_on(jira(TcpListener::bind(address).unwrap()));
+        // Jira still says To Do, so each change of the issue asks for its menu
+        // again, and how many changes arrive depends on timing
+        let server = tokio.block_on(jira_asked_about_menus(
+            TcpListener::bind(address).unwrap(),
+            offers(),
+            u64::MAX,
+        ));
         tokio.block_on(accept_one_transition(&server));
-        tokio.block_on(state.sync_once()).unwrap();
+        // A pooled connection to the old server can still be in use, and the
+        // request on it fails with "connection closed before message
+        // completed". The next sync cycle opens a new one.
+        if tokio.block_on(state.sync_once()).is_err() {
+            tokio.block_on(state.sync_once()).unwrap();
+        }
 
         wait_until(cx, window, |window| !pending(window));
         in_window(cx, window, |window, _| {
@@ -878,7 +898,10 @@ mod tests {
         let sent = tokio.block_on(server.received_requests()).unwrap();
         let transition = sent
             .iter()
-            .find(|request| request.url.path() == "/rest/api/3/issue/WEB-1/transitions")
+            .find(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/rest/api/3/issue/WEB-1/transitions"
+            })
             .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&transition.body).unwrap(),
@@ -907,9 +930,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/rest/api/3/issue/WEB-1/transitions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "transitions": to_do })))
-            // The menu of the status the issue is moved to, which Jira has not
-            // seen, and the menu of To Do again, as the cache dropped it
-            .expect(2)
+            // Whether the menu of the status the issue is moved to is asked for,
+            // and whether To Do is asked for again or comes from the cache,
+            // depends on how the question races the rejection. That the
+            // rejection drops the cached menu is checked in the core.
             .mount(server)
             .await;
         Mock::given(method("POST"))
