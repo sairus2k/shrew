@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT key AS \"key: IssueKey\" FROM issues\n           WHERE sync_status = 'pending' AND NOT EXISTS (\n               SELECT 1 FROM sync_queue\n               WHERE issue_key = issues.key AND status IN ('pending', 'in_progress')\n           )",
+  "describe": {
+    "columns": [
+      {
+        "name": "key: IssueKey",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d861d18cf58acfe51d9d91845a4ca4a5a67fbcf60510a885db4a1823bdcadc69"
+}

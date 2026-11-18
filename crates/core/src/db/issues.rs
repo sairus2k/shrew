@@ -291,6 +291,22 @@ pub(crate) async fn confirm(
     Ok(())
 }
 
+/// The issues that show a status Jira has not confirmed although the outbox
+/// holds nothing for them: the transition was refused and could not be rolled back.
+pub(crate) async fn unconfirmed(
+    executor: impl sqlx::SqliteExecutor<'_>,
+) -> sqlx::Result<Vec<IssueKey>> {
+    sqlx::query_scalar!(
+        r#"SELECT key AS "key: IssueKey" FROM issues
+           WHERE sync_status = 'pending' AND NOT EXISTS (
+               SELECT 1 FROM sync_queue
+               WHERE issue_key = issues.key AND status IN ('pending', 'in_progress')
+           )"#
+    )
+    .fetch_all(executor)
+    .await
+}
+
 /// Lets the next upsert of the issue overwrite the row, whatever `updated` it
 /// carries: the issue is read again to undo a local change, and Jira has not
 /// touched it since the row was written. Returns whether the cache has the issue.

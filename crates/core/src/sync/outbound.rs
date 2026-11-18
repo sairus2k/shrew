@@ -83,6 +83,8 @@ pub(crate) async fn process_queue(
                         error.downcast_ref(),
                         Some(JiraError::Status(status, _)) if status.is_client_error()
                     );
+                    // A failed rollback leaves the issue `pending` with nothing in the
+                    // outbox, which `roll_back_unconfirmed` looks for in every cycle
                     roll_back(state, &client, &entry.issue_key, refused)
                         .await
                         .ok();
@@ -145,6 +147,26 @@ async fn roll_back(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Rolls back the transitions whose rollback could not read Jira at the time.
+/// Whether Jira refused them is not known any more, so the cached menu of the
+/// status the issue is in is dropped as after a refusal. An issue that Jira
+/// cannot be asked about stays as it is and is tried again in the next cycle.
+pub(crate) async fn roll_back_unconfirmed(
+    state: &AppState,
+    config: &Config,
+    changed: &mut Vec<IssueKey>,
+) {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let Ok(keys) = issues::unconfirmed(&state.pool).await else {
+        return;
+    };
+    for key in keys {
+        if roll_back(state, &client, &key, true).await.is_ok() && !changed.contains(&key) {
+            changed.push(key);
+        }
+    }
 }
 
 // The request is built here, not when the entry is queued: the entry holds
@@ -1018,6 +1040,92 @@ mod tests {
             ("To Do".to_owned(), SyncStatus::Synced)
         );
         assert_eq!(cached_statuses(&state).await, ["To Do"]);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_that_could_not_read_jira_is_done_when_jira_answers_again() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        cache_transitions_of(&state, &["To Do", "In Progress"]).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("Resolution is required"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        jira_has_web_1_in_to_do().mount(&server).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        received(&mut events);
+        let config = config(&server.uri());
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config, &mut delivered)
+            .await
+            .unwrap();
+
+        // The status Jira refused stays until Jira can be read
+        assert_eq!(
+            issue(&state).await,
+            ("In Progress".to_owned(), SyncStatus::Pending)
+        );
+        assert_eq!(
+            received(&mut events),
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned(),
+                rejected(
+                    "WEB-1",
+                    "status change",
+                    "Jira returned 400 Bad Request: Resolution is required"
+                )
+            ]
+        );
+
+        let mut changed = Vec::new();
+        roll_back_unconfirmed(&state, &config, &mut changed).await;
+
+        assert_eq!(
+            issue(&state).await,
+            ("To Do".to_owned(), SyncStatus::Synced)
+        );
+        assert_eq!(changed, keys(&["WEB-1"]));
+        assert_eq!(cached_statuses(&state).await, ["In Progress"]);
+        // The user was told once, and nothing is left to roll back
+        process_queue(&state, &config, &mut delivered)
+            .await
+            .unwrap();
+        roll_back_unconfirmed(&state, &config, &mut changed).await;
+        assert_eq!(received(&mut events), Vec::<String>::new());
+        assert_eq!(changed, keys(&["WEB-1"]));
+    }
+
+    #[tokio::test]
+    async fn a_status_waiting_in_the_outbox_is_not_rolled_back() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        jira_has_web_1_in_to_do().mount(&server).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        let mut changed = Vec::new();
+        roll_back_unconfirmed(&state, &config(&server.uri()), &mut changed).await;
+
+        assert_eq!(
+            issue(&state).await,
+            ("In Progress".to_owned(), SyncStatus::Pending)
+        );
+        assert!(changed.is_empty());
+        assert!(requests(&server).await.is_empty());
     }
 
     #[tokio::test]
