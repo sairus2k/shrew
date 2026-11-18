@@ -1,9 +1,16 @@
+use crate::models::WorklogTarget;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 
 const CONFIG_FILE: &str = "config.json";
 const KEYCHAIN_SERVICE: &str = "dev.shrew.app";
 const KEYCHAIN_ACCOUNT: &str = "jira-api-token";
+const TEMPO_KEYCHAIN_ACCOUNT: &str = "tempo-api-token";
+pub(crate) const TEMPO_URL: &str = "https://api.tempo.io/4";
+
+fn default_tempo_url() -> String {
+    TEMPO_URL.to_owned()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Config {
@@ -29,9 +36,18 @@ pub(crate) struct Config {
     // `until` Jira gave with the last page. 0 asks for every worklog, once.
     #[serde(default)]
     pub last_worklog_sync_at: i64,
+    #[serde(default)]
+    pub worklog_target: WorklogTarget,
+    // Part of the config so that tests can point Tempo at a mock server, as
+    // `site_url` does for Jira
+    #[serde(default = "default_tempo_url")]
+    pub tempo_url: String,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,
+    // Same; empty when the user has not saved a Tempo token
+    #[serde(skip)]
+    pub tempo_api_token: String,
 }
 
 /// Where the API token is kept. The calls block: run them off the async threads.
@@ -42,16 +58,20 @@ pub(crate) trait TokenStore: Send + Sync {
     fn delete(&self) -> anyhow::Result<()>;
 }
 
-/// The macOS Keychain, under the given service name.
-pub(crate) struct Keychain(pub &'static str);
+/// One item of the macOS Keychain: the service name and the account name.
+pub(crate) struct Keychain(pub &'static str, pub &'static str);
 
 impl Keychain {
     pub(crate) fn of_the_app() -> Self {
-        Self(KEYCHAIN_SERVICE)
+        Self(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    }
+
+    pub(crate) fn tempo_of_the_app() -> Self {
+        Self(KEYCHAIN_SERVICE, TEMPO_KEYCHAIN_ACCOUNT)
     }
 
     fn entry(&self) -> keyring::Result<keyring::Entry> {
-        keyring::Entry::new(self.0, KEYCHAIN_ACCOUNT)
+        keyring::Entry::new(self.0, self.1)
     }
 }
 
@@ -105,7 +125,11 @@ impl TokenStore for TokenFile {
 /// The saved credentials, or `None` when the user has to sign in.
 // An unreadable config or a Keychain that refuses access is not fatal: signing
 // in again writes both anew.
-pub(crate) async fn load(data_dir: &Path, tokens: Arc<dyn TokenStore>) -> Option<Config> {
+pub(crate) async fn load(
+    data_dir: &Path,
+    tokens: Arc<dyn TokenStore>,
+    tempo_tokens: Arc<dyn TokenStore>,
+) -> Option<Config> {
     // The config is read first, so a fresh install never queries the Keychain
     let json = tokio::fs::read(data_dir.join(CONFIG_FILE)).await.ok()?;
     let config: Config = serde_json::from_slice(&json).ok()?;
@@ -113,8 +137,17 @@ pub(crate) async fn load(data_dir: &Path, tokens: Arc<dyn TokenStore>) -> Option
         .await
         .ok()?
         .ok()??;
+    // A Tempo token that cannot be read is the same as none: Tempo then
+    // cannot be the target, and the user saves the token again
+    let tempo_api_token = tokio::task::spawn_blocking(move || tempo_tokens.load())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .unwrap_or_default();
     Some(Config {
         api_token,
+        tempo_api_token,
         ..config
     })
 }
@@ -129,9 +162,14 @@ pub(crate) async fn save(
     save_config(data_dir, config).await
 }
 
-/// Deletes the token and the config file. Succeeds when they are already gone.
-pub(crate) async fn remove(data_dir: &Path, tokens: Arc<dyn TokenStore>) -> anyhow::Result<()> {
+/// Deletes the tokens and the config file. Succeeds when they are already gone.
+pub(crate) async fn remove(
+    data_dir: &Path,
+    tokens: Arc<dyn TokenStore>,
+    tempo_tokens: Arc<dyn TokenStore>,
+) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || tokens.delete()).await??;
+    tokio::task::spawn_blocking(move || tempo_tokens.delete()).await??;
     match tokio::fs::remove_file(data_dir.join(CONFIG_FILE)).await {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
@@ -155,7 +193,7 @@ mod tests {
     #[test]
     fn keychain_keeps_the_token_until_it_is_deleted() {
         // A service of its own, so the token of the real app is never touched
-        let keychain = Keychain("dev.shrew.app.test");
+        let keychain = Keychain("dev.shrew.app.test", KEYCHAIN_ACCOUNT);
         keychain.entry().unwrap().delete_credential().ok();
         assert_eq!(keychain.load().unwrap(), None);
 

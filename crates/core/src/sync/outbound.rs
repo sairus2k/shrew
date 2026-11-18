@@ -9,10 +9,11 @@ use crate::{
         transitions::{self, Position},
         worklogs,
     },
-    models::IssueKey,
+    models::{IssueKey, WorklogTarget},
     sync::{
         inbound,
         jira_client::{JiraClient, JiraError},
+        tempo_client::{TempoClient, TempoError},
     },
 };
 use reqwest::StatusCode;
@@ -47,7 +48,7 @@ pub(crate) async fn process_queue(
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     // A retried entry is claimed again: it is still the oldest one
     while let Some(entry) = sync_queue::claim_next(&state.pool).await? {
-        let error = match deliver(&client, &entry).await {
+        let error = match deliver(&client, state, config, &entry).await {
             Ok(delivered_as) => {
                 // One transaction: an issue must not stay pending with nothing left to send,
                 // and a comment must not be missing from both the outbox and the cache
@@ -73,6 +74,13 @@ pub(crate) async fn process_queue(
             Err(error) => error,
         };
         let message = format!("{error:#}");
+        if matches!(error.downcast_ref(), Some(TempoError::Unauthorized)) {
+            // Only the worklogs are blocked by the Tempo token, so the cycle
+            // goes on to read what Jira has
+            sync_queue::release(&state.pool, entry.id).await?;
+            state.events.send(SyncEvent::TempoTokenRejected).ok();
+            return Ok(());
+        }
         match failure(&error) {
             Failure::NotAsked => {
                 sync_queue::release(&state.pool, entry.id).await?;
@@ -234,12 +242,18 @@ pub(crate) async fn roll_back_unconfirmed(
 
 // The request is built here, not when the entry is queued: the entry holds
 // what the user did, and how that reaches Jira can depend on the settings at
-// the time of delivery.
+// the time of delivery: a worklog queued before the user switched the target
+// goes to the target set now.
 //
 // What Jira created is returned: the cache holds a comment until the next poll
 // brings the issue, so that it does not vanish in between, and a worklog keeps
 // the id Jira gave it.
-async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Delivered> {
+async fn deliver(
+    client: &JiraClient,
+    state: &AppState,
+    config: &Config,
+    entry: &QueueEntry,
+) -> anyhow::Result<Delivered> {
     let payload: Value = serde_json::from_str(&entry.payload)?;
     match entry.entity_type.as_str() {
         "transition" => {
@@ -261,6 +275,13 @@ async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Deli
         }
         "worklog" => {
             let local_id = payload["local_id"].as_str().unwrap_or_default().to_owned();
+            if config.worklog_target == WorklogTarget::Tempo {
+                let remote_id = post_to_tempo(state, config, entry, &payload).await?;
+                return Ok(Delivered::Worklog {
+                    local_id,
+                    remote_id,
+                });
+            }
             let started =
                 worklogs::started_at_for_jira(payload["started_at"].as_str().unwrap_or_default())
                     .map_err(|error| {
@@ -287,6 +308,38 @@ async fn deliver(client: &JiraClient, entry: &QueueEntry) -> anyhow::Result<Deli
     }
 }
 
+/// Returns the id of the Jira worklog Tempo mirrored the worklog into.
+async fn post_to_tempo(
+    state: &AppState,
+    config: &Config,
+    entry: &QueueEntry,
+    payload: &Value,
+) -> anyhow::Result<String> {
+    // Tempo takes the numeric id of the issue, not its key
+    let issue_id: i64 = issues::id_of(&state.pool, &entry.issue_key)
+        .await?
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("{} is not in the cache", entry.issue_key))?;
+    let started =
+        chrono::DateTime::parse_from_rfc3339(payload["started_at"].as_str().unwrap_or_default())
+            .map_err(|error| {
+                anyhow::anyhow!("a worklog entry with an unreadable start: {error}")
+            })?;
+    let mut body = json!({
+        "issueId": issue_id,
+        "authorAccountId": config.account_id,
+        "timeSpentSeconds": payload["time_spent_seconds"],
+        "startDate": started.format("%Y-%m-%d").to_string(),
+        "startTime": started.format("%H:%M:%S").to_string(),
+    });
+    if let Some(comment) = payload["comment"].as_str() {
+        body["description"] = comment.into();
+    }
+    Ok(TempoClient::new(&config.tempo_url, &config.tempo_api_token)
+        .create_worklog(&body)
+        .await?)
+}
+
 enum Delivered {
     Nothing,
     Comment(Value),
@@ -296,17 +349,21 @@ enum Delivered {
 fn failure(error: &anyhow::Error) -> Failure {
     match error.downcast_ref() {
         Some(JiraError::Unauthorized | JiraError::Http(_)) => Failure::NotAsked,
-        Some(JiraError::Status(status, _))
-            if status.is_server_error()
-                || matches!(
-                    *status,
-                    StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
-                ) =>
-        {
-            Failure::Transient
-        }
-        _ => Failure::Rejected,
+        Some(JiraError::Status(status, _)) if transient(*status) => Failure::Transient,
+        _ => match error.downcast_ref() {
+            Some(TempoError::Http(_)) => Failure::NotAsked,
+            Some(TempoError::Status(status, _)) if transient(*status) => Failure::Transient,
+            _ => Failure::Rejected,
+        },
     }
+}
+
+fn transient(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+        )
 }
 
 #[cfg(test)]
@@ -338,7 +395,10 @@ mod tests {
             pending_projects: Vec::new(),
             last_reconcile_at: 0,
             last_worklog_sync_at: 0,
+            worklog_target: Default::default(),
+            tempo_url: crate::auth::TEMPO_URL.to_owned(),
             api_token: TOKEN.to_owned(),
+            tempo_api_token: String::new(),
         }
     }
 
@@ -2487,5 +2547,200 @@ mod tests {
             assignee(&state).await,
             (Some("Grace B. Hopper".to_owned()), SyncStatus::Synced)
         );
+    }
+
+    fn tempo_config(jira: &MockServer, tempo: &MockServer) -> Config {
+        Config {
+            worklog_target: WorklogTarget::Tempo,
+            tempo_url: tempo.uri(),
+            tempo_api_token: "tempo-secret".to_owned(),
+            ..config(&jira.uri())
+        }
+    }
+
+    fn tempo_worklog_call() -> wiremock::MockBuilder {
+        Mock::given(method("POST")).and(path("/worklogs"))
+    }
+
+    async fn worklog_requests(server: &MockServer) -> usize {
+        let requests = requests(server).await;
+        requests
+            .iter()
+            .filter(|(path, _)| path.contains("worklog"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn with_tempo_as_the_target_a_worklog_goes_to_tempo_and_not_to_jira() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        tempo_worklog_call()
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer tempo-secret",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "tempoWorklogId": 7, "jiraWorklogId": 30001 })),
+            )
+            .expect(1)
+            .mount(&tempo)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 5400, STARTED, Some("Pairing"))
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests(&tempo).await,
+            [(
+                "/worklogs".to_owned(),
+                json!({
+                    "issueId": 10001,
+                    "authorAccountId": "5b10a",
+                    "timeSpentSeconds": 5400,
+                    "startDate": "2026-03-29",
+                    "startTime": "08:15:00",
+                    "description": "Pairing",
+                })
+            )]
+        );
+        assert_eq!(worklog_requests(&jira).await, 0);
+        assert_eq!(
+            worklog_rows(&state).await[0].0.as_deref(),
+            Some("30001"),
+            "the id of the mirrored Jira worklog is the remote id"
+        );
+        assert_eq!(worklog_rows(&state).await[0].1, "synced");
+        assert_eq!(delivered, keys(&["WEB-1"]));
+    }
+
+    #[tokio::test]
+    async fn a_worklog_goes_to_the_target_set_when_the_queue_is_flushed() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "30001" })))
+            .mount(&jira)
+            .await;
+        tempo_worklog_call()
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "jiraWorklogId": "30002" })),
+            )
+            .mount(&tempo)
+            .await;
+        // Queued while the target was Jira
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+
+        // The target is Tempo when the queue is flushed
+        let mut delivered = Vec::new();
+        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(worklog_requests(&jira).await, 0);
+        assert_eq!(requests(&tempo).await.len(), 1);
+
+        api::log_time(&state, &"WEB-1".into(), 60, STARTED + 7200, None)
+            .await
+            .unwrap();
+        process_queue(&state, &config(&jira.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(worklog_requests(&jira).await, 1);
+        assert_eq!(requests(&tempo).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_tempo_token_is_reported_and_the_worklog_stays_queued() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        tempo_worklog_call()
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&tempo)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(received(&mut events), ["TempoTokenRejected"]);
+        let status: String = sqlx::query_scalar("SELECT status FROM sync_queue")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(worklog_rows(&state).await[0].1, "pending");
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_worklog_posted_to_tempo_is_not_stored_twice_when_the_poll_returns_it() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        let mut config = tempo_config(&jira, &tempo);
+        // The pass for deleted issues would find WEB-1 missing from this Jira
+        config.last_reconcile_at = inbound::now_ms().unwrap();
+        *state.config.write().await = Some(config);
+        tempo_worklog_call()
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "jiraWorklogId": 30001 })),
+            )
+            .mount(&tempo)
+            .await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [] })))
+            .mount(&jira)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/worklog/updated"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "values": [{ "worklogId": 30001, "updatedTime": 9000 }],
+                        "until": 9000, "lastPage": true }),
+            ))
+            .mount(&jira)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/worklog/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id": "30001",
+                "issueId": "10001",
+                "author": { "accountId": "5b10a", "displayName": "Ada" },
+                "timeSpentSeconds": 5400,
+                "started": "2026-03-29T08:15:00.000+0000",
+            }])))
+            .mount(&jira)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 5400, STARTED, None)
+            .await
+            .unwrap();
+
+        crate::sync::engine::sync_cycle(&state, &mut true, &mut None)
+            .await
+            .unwrap();
+
+        let rows = worklog_rows(&state).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0.as_deref(), Some("30001"));
+        assert_eq!(rows[0].1, "synced");
     }
 }

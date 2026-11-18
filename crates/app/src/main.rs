@@ -17,6 +17,7 @@ use issue_list::{IssueList, IssueOpened};
 use new_token::{NewToken, TokenRenewed};
 use projects::{ProjectPicker, ProjectsCancelled, ProjectsChosen};
 use runtime::{Core, SyncBridge};
+use settings::{Settings, SettingsClosed};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
 use timer::ActiveTimer;
@@ -34,6 +35,7 @@ mod issue_list;
 mod new_token;
 mod projects;
 mod runtime;
+mod settings;
 mod sign_in;
 mod sync_status;
 mod timer;
@@ -47,6 +49,7 @@ enum Screen {
     SignIn(Entity<SignIn>),
     ChooseProjects(Entity<ProjectPicker>),
     InitialSync(Entity<InitialSync>),
+    Settings(Entity<Settings>),
     Home {
         list: Entity<IssueList>,
         // The issue the user opened from the list
@@ -64,6 +67,9 @@ struct Root {
     // The sync error the user was last told about. While Jira is down every
     // cycle fails the same way, and one notification is enough.
     notified_error: Option<String>,
+    // Tempo keeps answering 401 in every cycle until the token is replaced,
+    // and the user needs to be told once
+    tempo_rejection_shown: bool,
 }
 
 impl Root {
@@ -73,6 +79,7 @@ impl Root {
         Self {
             screen: Self::screen(step, window, cx),
             notified_error: None,
+            tempo_rejection_shown: false,
         }
     }
 
@@ -98,6 +105,10 @@ impl Root {
                 window.push_notification(Notification::error(message), cx);
             }
             SyncEvent::TokenRejected => self.ask_for_token(window, cx),
+            SyncEvent::TempoTokenRejected if !self.tempo_rejection_shown => {
+                self.tempo_rejection_shown = true;
+                window.push_notification(Notification::error(TEMPO_REJECTED), cx);
+            }
             _ => {}
         }
     }
@@ -185,6 +196,24 @@ impl Root {
         picker
     }
 
+    fn edit_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.screen, Screen::Home { .. }) {
+            return;
+        }
+        let settings = cx.new(|cx| Settings::new(window, cx));
+        cx.subscribe_in(
+            &settings,
+            window,
+            |this, _, _: &SettingsClosed, window, cx| {
+                this.tempo_rejection_shown = false;
+                this.show(SetupStep::Ready, window, cx)
+            },
+        )
+        .detach();
+        self.screen = Screen::Settings(settings);
+        cx.notify();
+    }
+
     fn edit_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.screen, Screen::Home { .. }) {
             self.screen = Screen::ChooseProjects(Self::picker(true, window, cx));
@@ -231,6 +260,7 @@ impl Render for Root {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
             Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
             Screen::InitialSync(sync) => sync.clone().into_any_element(),
+            Screen::Settings(settings) => settings.clone().into_any_element(),
             Screen::Home {
                 list,
                 detail,
@@ -283,6 +313,15 @@ impl Render for Root {
                         .border_color(cx.theme().border)
                         .child(div().flex_1().min_w_0().child(status.clone()))
                         .child(
+                            Button::new("edit-settings")
+                                .ghost()
+                                .xsmall()
+                                .label("Time tracking")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.edit_settings(window, cx)
+                                })),
+                        )
+                        .child(
                             Button::new("edit-projects")
                                 .ghost()
                                 .xsmall()
@@ -297,6 +336,9 @@ impl Render for Root {
         }
     }
 }
+
+const TEMPO_REJECTED: &str = "Tempo rejected the API token, so logged time waits in the queue. \
+     Save a new token under Time tracking, or switch the target to Jira";
 
 fn rejection_message(key: &IssueKey, action: &str, reason: &str) -> String {
     format!("{key}: {action} rejected: {reason}")

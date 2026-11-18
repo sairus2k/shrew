@@ -21,6 +21,9 @@ pub enum SyncEvent {
     },
     // Jira answered 401: the sync is paused until `api::renew_token` succeeds
     TokenRejected,
+    // Tempo answered 401 to a worklog: the worklogs stay queued until
+    // `api::save_tempo_token` saves another token or the target is Jira again
+    TempoTokenRejected,
     // A change made here will never reach Jira: Jira refused it, or the issue it
     // belongs to is gone. `action` names it for the user, such as "status change".
     ChangeRejected {

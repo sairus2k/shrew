@@ -17,7 +17,12 @@ pub use state::AppState; // an opaque handle: its fields are pub(crate)
 pub async fn start(
     data_dir: &Path,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
-    start_with(data_dir, Arc::new(auth::Keychain::of_the_app())).await
+    start_with(
+        data_dir,
+        Arc::new(auth::Keychain::of_the_app()),
+        Arc::new(auth::Keychain::tempo_of_the_app()),
+    )
+    .await
 }
 
 /// `start` with the API token kept in a file under `data_dir`, so that tests
@@ -29,7 +34,9 @@ pub async fn start_without_keychain(
     data_dir: &Path,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
     let tokens = auth::TokenFile(data_dir.join("api-token"));
-    let (state, events_rx, _wake_rx) = open(data_dir, Arc::new(tokens)).await?;
+    let tempo_tokens = auth::TokenFile(data_dir.join("tempo-token"));
+    let (state, events_rx, _wake_rx) =
+        open(data_dir, Arc::new(tokens), Arc::new(tempo_tokens)).await?;
     Ok((state, events_rx))
 }
 
@@ -39,14 +46,16 @@ pub(crate) async fn start_syncing_without_keychain(
     data_dir: &Path,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
     let tokens = auth::TokenFile(data_dir.join("api-token"));
-    start_with(data_dir, Arc::new(tokens)).await
+    let tempo_tokens = auth::TokenFile(data_dir.join("tempo-token"));
+    start_with(data_dir, Arc::new(tokens), Arc::new(tempo_tokens)).await
 }
 
 async fn start_with(
     data_dir: &Path,
     tokens: Arc<dyn auth::TokenStore>,
+    tempo_tokens: Arc<dyn auth::TokenStore>,
 ) -> anyhow::Result<(Arc<AppState>, mpsc::UnboundedReceiver<SyncEvent>)> {
-    let (state, events_rx, wake_rx) = open(data_dir, tokens).await?;
+    let (state, events_rx, wake_rx) = open(data_dir, tokens, tempo_tokens).await?;
     tokio::spawn(sync::engine::run(state.clone(), wake_rx));
     Ok((state, events_rx))
 }
@@ -54,6 +63,7 @@ async fn start_with(
 async fn open(
     data_dir: &Path,
     tokens: Arc<dyn auth::TokenStore>,
+    tempo_tokens: Arc<dyn auth::TokenStore>,
 ) -> anyhow::Result<(
     Arc<AppState>,
     mpsc::UnboundedReceiver<SyncEvent>,
@@ -61,7 +71,7 @@ async fn open(
 )> {
     tokio::fs::create_dir_all(data_dir).await?;
     let pool = db::init(data_dir).await?;
-    let config = auth::load(data_dir, tokens.clone()).await;
+    let config = auth::load(data_dir, tokens.clone(), tempo_tokens.clone()).await;
     let (events, events_rx) = mpsc::unbounded_channel();
     let (sync_waker, wake_rx) = watch::channel(());
     let state = AppState {
@@ -71,6 +81,7 @@ async fn open(
         data_dir: data_dir.to_owned(),
         sync_waker,
         tokens,
+        tempo_tokens,
         sync_running: Mutex::new(()),
         signed_out: watch::channel(()).0,
     };

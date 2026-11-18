@@ -171,6 +171,22 @@ pub struct Project {
     pub name: String,
 }
 
+/// Where logged time is sent. Never both: Tempo mirrors its worklogs into Jira,
+/// so posting to both would log the time twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorklogTarget {
+    #[default]
+    Jira,
+    Tempo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorklogSettings {
+    pub target: WorklogTarget,
+    pub tempo_token_saved: bool,
+}
+
 /// What the app still needs before it can show issues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupStep {

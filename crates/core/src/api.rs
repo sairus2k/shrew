@@ -4,7 +4,7 @@ use crate::{
     AppState, SyncEvent, auth, db,
     models::{
         Account, IssueDetail, IssueKey, IssueRow, Project, RunningTimer, SetupStep, Transition,
-        User,
+        User, WorklogSettings, WorklogTarget,
     },
     sync::{
         assignable, inbound,
@@ -63,6 +63,9 @@ pub async fn sign_in(
         pending_projects: Vec::new(),
         last_reconcile_at: 0,
         last_worklog_sync_at: 0,
+        worklog_target: Default::default(),
+        tempo_url: auth::TEMPO_URL.to_owned(),
+        tempo_api_token: String::new(),
     };
     // What a sign-out that failed halfway, or a config deleted by hand, left behind
     db::clear(&state.pool).await?;
@@ -82,7 +85,12 @@ pub async fn sign_out(state: &AppState) -> anyhow::Result<()> {
     state.signed_out.send_replace(());
     let _no_sync = state.sync_running.lock().await;
     let mut config = state.config.write().await;
-    auth::remove(&state.data_dir, state.tokens.clone()).await?;
+    auth::remove(
+        &state.data_dir,
+        state.tokens.clone(),
+        state.tempo_tokens.clone(),
+    )
+    .await?;
     *config = None;
     db::clear(&state.pool).await?;
     Ok(())
@@ -113,6 +121,50 @@ pub async fn renew_token(state: &AppState, api_token: &str) -> anyhow::Result<()
     let current = saved.as_mut().context("Sign in first")?;
     current.api_token = api_token.to_owned();
     auth::save(&state.data_dir, state.tokens.clone(), current).await?;
+    drop(saved);
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+/// Where logged time goes, and whether a Tempo token is saved.
+pub async fn worklog_settings(state: &AppState) -> anyhow::Result<WorklogSettings> {
+    let config = state.config.read().await;
+    let config = config.as_ref().context("Sign in first")?;
+    Ok(WorklogSettings {
+        target: config.worklog_target,
+        tempo_token_saved: !config.tempo_api_token.is_empty(),
+    })
+}
+
+/// Chooses where the queued and the future worklogs are sent. Tempo needs its
+/// token first.
+pub async fn set_worklog_target(state: &AppState, target: WorklogTarget) -> anyhow::Result<()> {
+    let mut saved = state.config.write().await;
+    let current = saved.as_mut().context("Sign in first")?;
+    if target == WorklogTarget::Tempo && current.tempo_api_token.is_empty() {
+        bail!("Save the Tempo API token first");
+    }
+    current.worklog_target = target;
+    auth::save_config(&state.data_dir, current).await?;
+    drop(saved);
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+/// Saves the Tempo API token in the token store. It is not checked: Tempo has
+/// no call for that that the app needs, and a wrong one is reported as
+/// `SyncEvent::TempoTokenRejected` when a worklog is sent.
+pub async fn save_tempo_token(state: &AppState, api_token: &str) -> anyhow::Result<()> {
+    let api_token = api_token.trim();
+    if api_token.is_empty() {
+        bail!("Enter the Tempo API token");
+    }
+    let mut saved = state.config.write().await;
+    let current = saved.as_mut().context("Sign in first")?;
+    let tempo_tokens = state.tempo_tokens.clone();
+    let token = api_token.to_owned();
+    tokio::task::spawn_blocking(move || tempo_tokens.save(&token)).await??;
+    current.tempo_api_token = api_token.to_owned();
     drop(saved);
     state.sync_waker.send(()).ok();
     Ok(())
@@ -506,6 +558,8 @@ mod tests {
                 "pending_projects": [],
                 "last_reconcile_at": 0,
                 "last_worklog_sync_at": 0,
+                "worklog_target": "jira",
+                "tempo_url": "https://api.tempo.io/4",
             })
         );
         assert_eq!(
@@ -529,6 +583,68 @@ mod tests {
         assert_eq!(account(&state).await, Some(signed_in));
         let config = state.config.read().await;
         assert_eq!(config.as_ref().unwrap().api_token, "secret-token");
+    }
+
+    #[tokio::test]
+    async fn tempo_cannot_be_the_target_without_a_token() {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+
+        let refused = set_worklog_target(&state, WorklogTarget::Tempo).await;
+
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "Save the Tempo API token first"
+        );
+        assert_eq!(
+            worklog_settings(&state).await.unwrap(),
+            WorklogSettings {
+                target: WorklogTarget::Jira,
+                tempo_token_saved: false
+            }
+        );
+        assert!(save_tempo_token(&state, "  ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_tempo_token_and_the_target_survive_a_restart_and_the_token_stays_out_of_the_config()
+     {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+
+        save_tempo_token(&state, " tempo-secret ").await.unwrap();
+        set_worklog_target(&state, WorklogTarget::Tempo)
+            .await
+            .unwrap();
+
+        // The token store stands in for the Keychain
+        assert_eq!(
+            state.tempo_tokens.load().unwrap().as_deref(),
+            Some("tempo-secret")
+        );
+        let config = std::fs::read_to_string(data_dir.path().join("config.json")).unwrap();
+        assert!(!config.contains("tempo-secret"));
+        state.pool.close().await;
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(
+            worklog_settings(&state).await.unwrap(),
+            WorklogSettings {
+                target: WorklogTarget::Tempo,
+                tempo_token_saved: true
+            }
+        );
+
+        sign_out(&state).await.unwrap();
+        assert_eq!(state.tempo_tokens.load().unwrap(), None);
     }
 
     fn project_list() -> ResponseTemplate {

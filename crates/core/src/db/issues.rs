@@ -128,6 +128,17 @@ pub(crate) async fn key_of(
         .await
 }
 
+/// The id Jira gave the issue, if the cache has it.
+pub(crate) async fn id_of(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT id FROM issues WHERE key = ?")
+        .bind(key)
+        .fetch_optional(executor)
+        .await
+}
+
 pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Option<IssueRow>> {
     sqlx::query_as!(
         IssueRow,

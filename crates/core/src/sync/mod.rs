@@ -3,6 +3,7 @@ pub(crate) mod engine;
 pub(crate) mod inbound;
 pub(crate) mod jira_client;
 pub(crate) mod outbound;
+pub(crate) mod tempo_client;
 pub(crate) mod transitions;
 
 /// A Jira where no worklog changed: every sync cycle asks for them, so a test

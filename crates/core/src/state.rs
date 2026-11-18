@@ -16,6 +16,7 @@ pub struct AppState {
     // Sending wakes the sync engine before its poll interval is over
     pub(crate) sync_waker: watch::Sender<()>,
     pub(crate) tokens: Arc<dyn TokenStore>,
+    pub(crate) tempo_tokens: Arc<dyn TokenStore>,
     // Held by a sync cycle while it runs. A sign-out takes it before it wipes
     // the cache, so a cycle of the old account cannot write into it afterwards.
     pub(crate) sync_running: Mutex<()>,
