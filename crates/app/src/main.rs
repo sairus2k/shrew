@@ -23,6 +23,7 @@ use sync_status::SyncStatus;
 mod account;
 mod assignee;
 mod comment;
+mod duration;
 #[cfg(test)]
 mod harness;
 mod initial_sync;

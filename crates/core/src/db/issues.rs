@@ -1,5 +1,6 @@
 use crate::{
     adf,
+    db::worklogs,
     models::{
         Comment, IssueDetail, IssueKey, IssueRow, RejectedComment, StatusCategory, SyncStatus, User,
     },
@@ -175,6 +176,7 @@ pub(crate) async fn get_detail(
         .as_array()
         .map_or(&[][..], Vec::as_slice);
     let pending = pending_comments(pool, &row.key, &url).await?;
+    let worklogs = worklogs::for_issue(pool, &row.key).await?;
     Ok(Some(IssueDetail {
         summary: row.summary,
         status: row.status,
@@ -204,6 +206,7 @@ pub(crate) async fn get_detail(
             })
             .chain(pending)
             .collect(),
+        worklogs,
         key: row.key,
         url,
     }))

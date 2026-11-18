@@ -410,7 +410,7 @@ pub async fn search_issues(
 mod tests {
     use super::*;
     use crate::{
-        models::{Comment, StatusCategory, SyncStatus},
+        models::{Comment, StatusCategory, SyncStatus, Worklog},
         start_without_keychain,
     };
     use serde_json::json;
@@ -683,8 +683,76 @@ mod tests {
                     comment("Ada Lovelace", "2026-03-29T01:30:00.000+0100", "Fixed"),
                 ],
                 comment_total: 3,
+                worklogs: vec![],
                 url: format!("{site_url}/browse/WEB-1"),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_worklogs_of_an_issue_are_listed_newest_first_with_their_authors_and_state() {
+        let (_data_dir, state) = core_with(json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        }))
+        .await;
+        let grace = db::worklogs::RemoteWorklog {
+            remote_id: "1".to_owned(),
+            issue_id: "10001".to_owned(),
+            author_name: "Grace Hopper".to_owned(),
+            time_spent_sec: 5580,
+            started_at: "2026-03-27T09:00:00.000Z".to_owned(),
+            comment: Some("Pairing".to_owned()),
+        };
+        db::worklogs::upsert_remote(&state.pool, &grace)
+            .await
+            .unwrap();
+        log_time(&state, &"WEB-1".into(), 900, 1_774_771_200, Some("Review"))
+            .await
+            .unwrap();
+        log_time(&state, &"WEB-1".into(), 1800, 1_774_857_600, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE worklogs SET sync_status = 'failed' WHERE time_spent_sec = 1800")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let worklogs = get_issue(&state, &"WEB-1".into()).await.unwrap().worklogs;
+
+        let worklog =
+            |author: &str, started_at, time_spent_secs, comment: Option<&str>, status| Worklog {
+                author_name: author.to_owned(),
+                started_at,
+                time_spent_secs,
+                comment: comment.map(str::to_owned),
+                status,
+            };
+        assert_eq!(
+            worklogs,
+            [
+                worklog("You", 1_774_857_600, 1800, None, SyncStatus::Failed),
+                worklog(
+                    "You",
+                    1_774_771_200,
+                    900,
+                    Some("Review"),
+                    SyncStatus::Pending
+                ),
+                worklog(
+                    "Grace Hopper",
+                    1_774_602_000,
+                    5580,
+                    Some("Pairing"),
+                    SyncStatus::Synced
+                ),
+            ]
         );
     }
 

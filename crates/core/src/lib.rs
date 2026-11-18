@@ -115,7 +115,7 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(applied, 8);
+        assert_eq!(applied, 9);
         state.pool.close().await;
     }
 }

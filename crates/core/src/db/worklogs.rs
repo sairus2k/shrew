@@ -1,6 +1,6 @@
 //! The worklogs of the cached issues: the ones logged here and the ones Jira has.
 
-use crate::models::IssueKey;
+use crate::models::{IssueKey, SyncStatus, Worklog};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 /// A worklog logged here. `started_at` is UTC with a fixed width.
@@ -15,6 +15,7 @@ pub(crate) struct NewWorklog {
 pub(crate) struct RemoteWorklog {
     pub remote_id: String,
     pub issue_id: String,
+    pub author_name: String,
     pub time_spent_sec: i64,
     pub started_at: String,
     pub comment: Option<String>,
@@ -92,10 +93,12 @@ pub(crate) async fn upsert_remote(
     worklog: &RemoteWorklog,
 ) -> sqlx::Result<Option<IssueKey>> {
     sqlx::query_scalar(
-        "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, comment, sync_status)
-         SELECT ?, key, ?, ?, ?, 'synced' FROM issues WHERE id = ?
+        "INSERT INTO worklogs
+             (remote_id, issue_key, author_name, time_spent_sec, started_at, comment, sync_status)
+         SELECT ?, key, ?, ?, ?, ?, 'synced' FROM issues WHERE id = ?
          ON CONFLICT(remote_id) DO UPDATE SET
              issue_key      = excluded.issue_key,
+             author_name    = excluded.author_name,
              time_spent_sec = excluded.time_spent_sec,
              started_at     = excluded.started_at,
              comment        = excluded.comment,
@@ -103,12 +106,39 @@ pub(crate) async fn upsert_remote(
          RETURNING issue_key",
     )
     .bind(&worklog.remote_id)
+    .bind(&worklog.author_name)
     .bind(worklog.time_spent_sec)
     .bind(&worklog.started_at)
     .bind(&worklog.comment)
     .bind(&worklog.issue_id)
     .fetch_optional(executor)
     .await
+}
+
+/// The worklogs of the issue, the one started last first. A worklog logged
+/// here has no author name until Jira sends it back.
+pub(crate) async fn for_issue(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+) -> sqlx::Result<Vec<Worklog>> {
+    type Row = (Option<String>, String, i64, Option<String>, SyncStatus);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT author_name, started_at, time_spent_sec, comment, sync_status
+         FROM worklogs WHERE issue_key = ? ORDER BY started_at DESC, created_at DESC",
+    )
+    .bind(key)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(author, started_at, seconds, comment, status)| Worklog {
+            author_name: author.unwrap_or_else(|| "You".to_owned()),
+            started_at: DateTime::parse_from_rfc3339(&started_at).map_or(0, |at| at.timestamp()),
+            time_spent_secs: seconds.try_into().unwrap_or_default(),
+            comment,
+            status,
+        })
+        .collect())
 }
 
 /// Follows an issue that was moved to another project: its worklogs, and the

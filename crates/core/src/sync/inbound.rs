@@ -299,15 +299,23 @@ pub(crate) async fn poll_updated_issues(
 struct JiraWorklog {
     id: String,
     issue_id: String,
+    author: Option<JiraAuthor>,
     time_spent_seconds: i64,
     started: String,
     comment: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JiraAuthor {
+    display_name: Option<String>,
 }
 
 fn remote_worklog(worklog: &Value) -> anyhow::Result<RemoteWorklog> {
     let JiraWorklog {
         id,
         issue_id,
+        author,
         time_spent_seconds,
         started,
         comment,
@@ -320,6 +328,9 @@ fn remote_worklog(worklog: &Value) -> anyhow::Result<RemoteWorklog> {
         })?,
         remote_id: id,
         issue_id,
+        author_name: author
+            .and_then(|author| author.display_name)
+            .unwrap_or_else(|| "Unknown".to_owned()),
         time_spent_sec: time_spent_seconds,
         comment: (!comment.is_empty()).then_some(comment),
     })
@@ -1238,12 +1249,23 @@ mod tests {
         json!({
             "id": id,
             "issueId": issue_id,
+            "author": { "accountId": "7c20b", "displayName": "Grace Hopper" },
             "timeSpentSeconds": seconds,
             "started": "2026-03-29T10:15:00.000+0200",
             "comment": { "type": "doc", "version": 1, "content": [
                 { "type": "paragraph", "content": [{ "type": "text", "text": "Pairing" }] },
             ] },
         })
+    }
+
+    #[test]
+    fn a_worklog_whose_author_has_no_name_is_attributed_to_unknown() {
+        let mut worklog = jira_worklog("1", "1", 60);
+        worklog["author"] = json!({ "accountId": "7c20b" });
+        assert_eq!(remote_worklog(&worklog).unwrap().author_name, "Unknown");
+
+        worklog.as_object_mut().unwrap().remove("author");
+        assert_eq!(remote_worklog(&worklog).unwrap().author_name, "Unknown");
     }
 
     fn worklog_list(ids: &[i64], worklogs: &[Value]) -> Mock {
@@ -1326,6 +1348,15 @@ mod tests {
                     pairing
                 ),
             ]
+        );
+        let authors: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT author_name FROM worklogs ORDER BY remote_id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            authors,
+            ["Grace Hopper"; 2].map(|name| Some(name.to_owned()))
         );
         assert_eq!(saved_worklog_time(&state).await, 9_000);
         let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();

@@ -69,6 +69,8 @@ pub struct IssueDetail {
     /// How many comments the issue has in Jira. Jira sends only part of a long
     /// thread with a search page, so this can be more than `comments.len()`.
     pub comment_total: usize,
+    /// The one started last first.
+    pub worklogs: Vec<Worklog>,
     /// The page of the issue in Jira.
     pub url: String,
 }
@@ -93,6 +95,18 @@ pub struct RejectedComment {
     pub entry_id: i64,
     /// Why Jira refused it.
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worklog {
+    /// "You" for a worklog logged here that Jira has not sent back yet.
+    pub author_name: String,
+    /// Unix seconds.
+    pub started_at: i64,
+    pub time_spent_secs: u64,
+    pub comment: Option<String>,
+    /// `Pending` until Jira has received it; `Failed` if Jira refused it.
+    pub status: SyncStatus,
 }
 
 /// One way out of a status: an entry of the status menu.

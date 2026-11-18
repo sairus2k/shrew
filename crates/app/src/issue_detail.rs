@@ -2,12 +2,13 @@
 
 use crate::assignee::AssigneeButton;
 use crate::comment::CommentForm;
+use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
 use crate::transition::StatusButton;
 use app_core::{
     api,
-    models::{Comment, IssueDetail, RejectedComment, SyncStatus},
+    models::{Comment, IssueDetail, RejectedComment, SyncStatus, Worklog},
 };
 use gpui_kit::component::{
     ActiveTheme, Sizable,
@@ -157,6 +158,40 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
                 .rejected
                 .as_ref()
                 .map(|rejected| rejected_comment(index, rejected, cx)),
+        )
+}
+
+fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
+    let mut heading = format!(
+        "{}, {}, {}",
+        worklog.author_name,
+        local_minute(worklog.started_at),
+        format_duration(worklog.time_spent_secs)
+    );
+    match worklog.status {
+        SyncStatus::Synced => {}
+        SyncStatus::Pending => heading.push_str(", pending"),
+        // Jira refused it; there is nothing to retry from here yet
+        SyncStatus::Failed => heading.push_str(", not sent"),
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .id(SharedString::from(format!("worklog-{index}")))
+                .test_support()
+                .aria_label(heading.clone())
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(heading),
+        )
+        .children(
+            worklog
+                .comment
+                .as_ref()
+                .map(|text| markdown(("worklog-comment", index), text)),
         )
 }
 
@@ -320,6 +355,28 @@ fn body(
                 .map(|(index, each)| comment(index, each, cx)),
         )
         .child(comment_form)
+        .child(
+            div()
+                .id("detail-worklogs")
+                .test_support()
+                .aria_label("Worklogs")
+                .text_lg()
+                .child("Worklogs"),
+        )
+        .children(issue.worklogs.is_empty().then(|| {
+            div()
+                .id("no-worklogs")
+                .test_support()
+                .text_color(muted)
+                .child("No worklogs")
+        }))
+        .children(
+            issue
+                .worklogs
+                .iter()
+                .enumerate()
+                .map(|(index, each)| worklog(index, each, cx)),
+        )
 }
 
 impl Render for DetailPane {
@@ -376,10 +433,11 @@ impl Render for DetailPane {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
-    use crate::issue_list::tests::{issue, rows, sync_brings, synced};
+    use crate::duration::local_minute;
+    use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
+    use crate::issue_list::tests::{issue, rows, sync_brings, synced, synced_on};
     use crate::runtime::Core;
-    use app_core::SyncEvent;
+    use app_core::{SyncEvent, api};
     use gpui_kit::base::test_support::texts;
     use gpui_kit::test::{TestEventExt, TestWindowExt};
     use gpui_kit::{
@@ -387,6 +445,10 @@ pub(crate) mod tests {
         ScrollDelta, ScrollEvent, TestAppContext, Window, point, px, size,
     };
     use serde_json::{Value, json};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     fn doc(content: Value) -> Value {
         json!({ "type": "doc", "version": 1, "content": content })
@@ -811,6 +873,130 @@ pub(crate) mod tests {
             assert_eq!(rows(window).len(), 2);
             assert_eq!(beside_an_issue, px(320.));
             assert_eq!(window.find("issue-WEB-1").bounds().size.width, px(800.));
+        });
+    }
+
+    /// A mock Jira that finds WEB-1 and has no worklog changes.
+    async fn jira_with_web_1() -> MockServer {
+        let server = MockServer::start().await;
+        no_worklog_changes().mount(&server).await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "issues": [issue(1, "Fix login")] })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The lines of the worklog list on screen.
+    fn worklog_lines(window: &Window) -> Vec<String> {
+        (0..5)
+            .map_while(|index| window.try_find(format!("worklog-{index}")))
+            .map(|worklog| worklog.label().unwrap().to_owned())
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn the_worklogs_of_an_issue_appear_when_a_sync_brings_them(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira_with_web_1());
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "detail-worklogs"), "Worklogs");
+            assert!(window.try_find("no-worklogs").is_some());
+        });
+
+        // 10:15 at UTC+2, 93 minutes
+        tokio.block_on(async {
+            server.reset().await;
+            Mock::given(path("/rest/api/3/search/jql"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "issues": [issue(1, "Fix login")] })),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/rest/api/3/worklog/updated"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "values": [{ "worklogId": 7, "updatedTime": 5 }],
+                    "until": 5,
+                    "lastPage": true,
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/rest/api/3/worklog/list"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                    "id": "7",
+                    "issueId": "1",
+                    "author": { "accountId": "7c20b", "displayName": "Grace Hopper" },
+                    "timeSpentSeconds": 5580,
+                    "started": "2026-03-29T10:15:00.000+0200",
+                    "comment": doc(json!([paragraph("Pairing")])),
+                }])))
+                .mount(&server)
+                .await;
+        });
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        tokio.block_on(state.sync_once()).unwrap();
+
+        let started = local_minute(1_774_772_100);
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("Grace Hopper, {started}, 1h 33m")]
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(painted(window, ("worklog-comment", 0usize)), "Pairing");
+            assert!(window.try_find("no-worklogs").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_worklog_is_pending_until_delivered_and_not_sent_when_jira_refuses_it(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira_with_web_1());
+        tokio.block_on(
+            Mock::given(method("POST"))
+                .and(path("/rest/api/3/issue/WEB-1/worklog"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_json(json!({ "errorMessages": ["No permission"] })),
+                )
+                .mount(&server),
+        );
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+
+        tokio
+            .block_on(api::log_time(
+                &state,
+                &"WEB-1".into(),
+                900,
+                1_774_771_200,
+                Some("Review"),
+            ))
+            .unwrap();
+
+        let earlier = local_minute(1_774_771_200);
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("You, {earlier}, 15m, pending")]
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(painted(window, ("worklog-comment", 0usize)), "Review");
+        });
+
+        tokio.block_on(state.sync_once()).unwrap();
+
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("You, {earlier}, 15m, not sent")]
         });
     }
 }
