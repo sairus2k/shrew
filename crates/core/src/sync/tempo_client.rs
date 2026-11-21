@@ -38,6 +38,25 @@ impl From<reqwest::Error> for TempoError {
     }
 }
 
+/// Tempo explains a refusal as `{"errors": [{"message": ..}]}`. The user is
+/// shown the messages; any other body stays as it is.
+fn readable_error(body: String) -> String {
+    let Ok(answer) = serde_json::from_str::<Value>(&body) else {
+        return body;
+    };
+    let messages: Vec<&str> = answer["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|error| error["message"].as_str())
+        .collect();
+    if messages.is_empty() {
+        body
+    } else {
+        messages.join(" ")
+    }
+}
+
 pub(crate) struct TempoClient {
     http: reqwest::Client,
     base_url: String,
@@ -73,7 +92,7 @@ impl TempoClient {
                 if status == StatusCode::FORBIDDEN && body.contains("following scopes") {
                     return Err(TempoError::Unauthorized);
                 }
-                Err(TempoError::Status(status, body))
+                Err(TempoError::Status(status, readable_error(body)))
             }
             _ => {
                 let created: Value = response.json().await?;
@@ -85,5 +104,30 @@ impl TempoClient {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable_error;
+
+    #[test]
+    fn tempos_error_answer_is_reduced_to_its_messages() {
+        assert_eq!(
+            readable_error(r#"{"errors":[{"message":"User is invalid"}]}"#.to_owned()),
+            "User is invalid"
+        );
+        assert_eq!(
+            readable_error(
+                r#"{"errors":[{"message":"Issue not found"},{"message":"User is invalid"}]}"#
+                    .to_owned()
+            ),
+            "Issue not found User is invalid"
+        );
+        assert_eq!(
+            readable_error(r#"{"errors":[]}"#.to_owned()),
+            r#"{"errors":[]}"#
+        );
+        assert_eq!(readable_error("No permission".to_owned()), "No permission");
     }
 }
