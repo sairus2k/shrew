@@ -83,7 +83,7 @@ impl IssueList {
         cx.notify();
     }
 
-    fn open(&mut self, key: IssueKey, cx: &mut Context<Self>) {
+    pub fn open(&mut self, key: IssueKey, cx: &mut Context<Self>) {
         self.opened = Some(key.clone());
         cx.emit(IssueOpened(key));
         cx.notify();

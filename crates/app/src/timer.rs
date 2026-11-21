@@ -6,7 +6,10 @@ use app_core::{
     api,
     models::{IssueKey, RunningTimer},
 };
-use gpui_kit::component::{ActiveTheme, Sizable, button::Button};
+use gpui_kit::component::{
+    ActiveTheme, Sizable,
+    button::{Button, ButtonVariants},
+};
 use gpui_kit::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -172,6 +175,69 @@ impl Render for TimerControl {
                 )
             }))
             .child(button)
+    }
+}
+
+/// The user asked for the issue of the running timer.
+pub struct TimerIssueClicked(pub IssueKey);
+
+/// The running timer in the status bar, so that it is seen with any issue
+/// open or none: its issue, the time elapsed and a stop.
+pub struct TimerStatus {
+    timer: Entity<ActiveTimer>,
+    _timer_changed: Subscription,
+}
+
+impl EventEmitter<TimerIssueClicked> for TimerStatus {}
+
+impl TimerStatus {
+    pub fn new(timer: Entity<ActiveTimer>, cx: &mut Context<Self>) -> Self {
+        let _timer_changed = cx.observe(&timer, |_, _, cx| cx.notify());
+        Self {
+            timer,
+            _timer_changed,
+        }
+    }
+}
+
+impl Render for TimerStatus {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(running) = self.timer.read(cx).running.clone() else {
+            return div();
+        };
+        let key = SharedString::from(running.issue_key.to_string());
+        let elapsed = SharedString::from(clock(running.elapsed_secs(unix_now())));
+        let timer = self.timer.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("running-timer-issue")
+                    .test_support()
+                    .aria_label(key.clone())
+                    .cursor_pointer()
+                    .text_color(cx.theme().foreground)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(TimerIssueClicked(running.issue_key.clone()))
+                    }))
+                    .child(key),
+            )
+            .child(
+                div()
+                    .id("running-timer-elapsed")
+                    .test_support()
+                    .aria_label(elapsed.clone())
+                    .child(elapsed),
+            )
+            .child(
+                Button::new("stop-running-timer")
+                    .ghost()
+                    .xsmall()
+                    .label("Stop")
+                    .on_click(move |_, _, cx| timer.update(cx, |timer, cx| timer.stop(cx))),
+            )
     }
 }
 
@@ -437,6 +503,76 @@ mod tests {
         assert_eq!(running(&tokio, &state), Some(started));
         in_window(cx, window, |window, _| {
             assert!(window.try_find("stop-timer").is_some());
+        });
+    }
+
+    fn status_bar_timer(window: &Window) -> Option<(String, String)> {
+        let issue = window.try_find("running-timer-issue")?;
+        let elapsed = window.find("running-timer-elapsed");
+        Some((
+            issue.label().unwrap().to_owned(),
+            elapsed.label().unwrap().to_owned(),
+        ))
+    }
+
+    #[gpui_kit::test]
+    fn the_status_bar_shows_the_running_timer_whichever_issue_is_open_and_stops_it(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let data_dir = synced_on(
+            &tokio,
+            &server.uri(),
+            &[issue(1, "Fix login"), issue(2, "Broken checkout")],
+        );
+        running_since(&tokio, data_dir.path(), unix_now() - 6_000);
+        let window = launch(cx, &tokio, data_dir.path());
+
+        // No issue is open
+        wait_until(cx, window, |window| {
+            status_bar_timer(window)
+                .is_some_and(|(issue, elapsed)| issue == "WEB-1" && elapsed.starts_with("1:40:"))
+        });
+        open(cx, window, "WEB-2");
+        in_window(cx, window, |window, _| {
+            assert_eq!(status_bar_timer(window).unwrap().0, "WEB-1");
+        });
+
+        click(cx, window, "stop-running-timer");
+
+        wait_until(cx, window, |window| status_bar_timer(window).is_none());
+        let state = state(cx);
+        let key: IssueKey = "WEB-1".into();
+        wait_until(cx, window, |_| {
+            running(&tokio, &state).is_none()
+                && tokio
+                    .block_on(api::get_issue(&state, &key))
+                    .unwrap()
+                    .worklogs
+                    .len()
+                    == 1
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_issue_of_the_running_timer_opens_from_the_status_bar(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let data_dir = synced_on(
+            &tokio,
+            &server.uri(),
+            &[issue(1, "Fix login"), issue(2, "Broken checkout")],
+        );
+        running_since(&tokio, data_dir.path(), unix_now() - 6_000);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-2");
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+
+        click(cx, window, "running-timer-issue");
+
+        wait_until(cx, window, |window| {
+            window.find("issue-detail").label() == Some("WEB-1")
         });
     }
 

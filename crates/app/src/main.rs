@@ -20,7 +20,7 @@ use runtime::{Core, SyncBridge};
 use settings::{Settings, SettingsClosed};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
-use timer::ActiveTimer;
+use timer::{ActiveTimer, TimerIssueClicked, TimerStatus};
 
 mod account;
 mod assignee;
@@ -57,6 +57,7 @@ enum Screen {
         status: Entity<SyncStatus>,
         account: Entity<Account>,
         timer: Entity<ActiveTimer>,
+        timer_status: Entity<TimerStatus>,
         // Shown from the moment Jira rejects the API token until it accepts a new one
         new_token: Option<Entity<NewToken>>,
     },
@@ -167,12 +168,23 @@ impl Root {
                     this.show(SetupStep::SignIn, window, cx)
                 })
                 .detach();
+                let timer = cx.new(ActiveTimer::new);
+                let timer_status = cx.new(|cx| TimerStatus::new(timer.clone(), cx));
+                let opening = list.clone();
+                cx.subscribe(
+                    &timer_status,
+                    move |_, _, clicked: &TimerIssueClicked, cx| {
+                        opening.update(cx, |list, cx| list.open(clicked.0.clone(), cx));
+                    },
+                )
+                .detach();
                 Screen::Home {
                     list,
                     detail: None,
                     status: cx.new(SyncStatus::new),
                     account,
-                    timer: cx.new(ActiveTimer::new),
+                    timer,
+                    timer_status,
                     new_token: None,
                 }
             }
@@ -266,6 +278,7 @@ impl Render for Root {
                 detail,
                 status,
                 account,
+                timer_status,
                 new_token,
                 ..
             } => div()
@@ -312,6 +325,7 @@ impl Render for Root {
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .child(div().flex_1().min_w_0().child(status.clone()))
+                        .child(div().mr_2().child(timer_status.clone()))
                         .child(
                             Button::new("edit-settings")
                                 .ghost()
