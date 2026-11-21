@@ -1054,9 +1054,7 @@ pub(crate) mod tests {
         in_window(cx, window, |window, _| {
             assert_eq!(
                 window.find("worklog-reason-0").label(),
-                Some(
-                    r#"Not sent: Jira returned 400 Bad Request: {"errorMessages":["No permission"]}"#
-                )
+                Some("Not sent: Jira returned 400 Bad Request: No permission")
             );
         });
 

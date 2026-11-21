@@ -172,6 +172,25 @@ pub(crate) struct TransitionField {
     pub allowed_values: Option<Vec<Value>>,
 }
 
+/// Jira explains a refusal as `{"errorMessages": [..], "errors": {field: message}}`.
+/// The user is shown the messages; any other body stays as it is.
+fn readable_error(body: String) -> String {
+    let Ok(answer) = serde_json::from_str::<Value>(&body) else {
+        return body;
+    };
+    let general = answer["errorMessages"].as_array().into_iter().flatten();
+    let by_field = answer["errors"]
+        .as_object()
+        .into_iter()
+        .flat_map(|errors| errors.values());
+    let messages: Vec<&str> = general.chain(by_field).filter_map(Value::as_str).collect();
+    if messages.is_empty() {
+        body
+    } else {
+        messages.join(" ")
+    }
+}
+
 pub(crate) struct JiraClient {
     http: reqwest::Client,
     base_url: String,
@@ -422,7 +441,7 @@ impl JiraClient {
                 }
                 status if !status.is_success() => {
                     let body = response.text().await.unwrap_or_default();
-                    return Err(JiraError::Status(status, body));
+                    return Err(JiraError::Status(status, readable_error(body)));
                 }
                 _ => return Ok(response),
             }
@@ -694,6 +713,20 @@ mod tests {
             .map(|user| (user.account_id.as_str(), user.display_name.as_str()))
             .collect();
         assert_eq!(users, [("5b10a", "Ada"), ("7c20b", "Grace")]);
+    }
+
+    #[test]
+    fn jiras_error_answer_is_reduced_to_its_messages() {
+        let refused = r#"{"errorMessages":["Worklog must not be null."],"errors":{"timeLogged":"You must indicate the time spent working."}}"#;
+        assert_eq!(
+            readable_error(refused.to_owned()),
+            "Worklog must not be null. You must indicate the time spent working."
+        );
+        assert_eq!(
+            readable_error(r#"{"errorMessages":[],"errors":{}}"#.to_owned()),
+            r#"{"errorMessages":[],"errors":{}}"#
+        );
+        assert_eq!(readable_error("No permission".to_owned()), "No permission");
     }
 
     #[tokio::test]
