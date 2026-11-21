@@ -115,6 +115,21 @@ pub(crate) async fn remove(pool: &SqlitePool, id: i64) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Follows an issue that was moved to another project: every entry of it,
+/// also one Jira refused and the issue still shows, belongs to the new key.
+pub(crate) async fn rename_issue(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    old: &IssueKey,
+    new: &IssueKey,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE sync_queue SET issue_key = ? WHERE issue_key = ?")
+        .bind(new)
+        .bind(old)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Removes every entry of an issue that no longer exists, whatever its state:
 /// there is no view left to show a refused comment in, or to retry it from.
 /// Returns the entity type of each.

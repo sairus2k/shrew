@@ -285,7 +285,10 @@ pub(crate) async fn poll_updated_issues(
             if issues::upsert(&mut *tx, &record).await? {
                 let moved_from = old_key.filter(|old| *old != record.key);
                 if let Some(old) = &moved_from {
-                    worklogs::rename_issue(&mut tx, old, &record.key).await?;
+                    // After the upsert, which finds the unsent changes of the
+                    // issue by the key it had
+                    sync_queue::rename_issue(&mut *tx, old, &record.key).await?;
+                    worklogs::rename_issue(&mut *tx, old, &record.key).await?;
                     timer::rename_issue(&mut *tx, old, &record.key).await?;
                 }
                 written.push(record.key);

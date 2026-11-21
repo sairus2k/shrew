@@ -287,25 +287,18 @@ pub(crate) async fn discard(
     Ok(Some(key))
 }
 
-/// Follows an issue that was moved to another project: its worklogs, and the
-/// worklogs still waiting in the outbox, belong to the new key.
+/// Follows an issue that was moved to another project: its worklogs belong to
+/// the new key.
 pub(crate) async fn rename_issue(
-    conn: &mut sqlx::SqliteConnection,
+    executor: impl sqlx::SqliteExecutor<'_>,
     old: &IssueKey,
     new: &IssueKey,
 ) -> sqlx::Result<()> {
     sqlx::query("UPDATE worklogs SET issue_key = ? WHERE issue_key = ?")
         .bind(new)
         .bind(old)
-        .execute(&mut *conn)
+        .execute(executor)
         .await?;
-    sqlx::query(
-        "UPDATE sync_queue SET issue_key = ? WHERE issue_key = ? AND entity_type = 'worklog'",
-    )
-    .bind(new)
-    .bind(old)
-    .execute(&mut *conn)
-    .await?;
     Ok(())
 }
 

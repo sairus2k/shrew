@@ -3272,4 +3272,125 @@ mod tests {
             .unwrap();
         assert_eq!(comment.as_deref(), Some("Pairing"));
     }
+
+    /// The poll brings WEB-1 as API-9: Jira moved it to another watched project.
+    async fn move_web_1_to_api(state: &AppState, server: &MockServer) {
+        let mut moved = web_1_of_ada();
+        moved["key"] = json!("API-9");
+        moved["fields"]["project"]["key"] = json!("API");
+        moved["fields"]["updated"] = json!("2026-03-30T10:00:00.000+0100");
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [moved] })))
+            .mount(server)
+            .await;
+        let mut config = config(&server.uri());
+        config.watched_projects.push("API".to_owned());
+        *state.config.write().await = Some(config.clone());
+        let last_sync_at = config.last_sync_at.unwrap();
+        inbound::poll_updated_issues(state, &config, last_sync_at, &mut Vec::new())
+            .await
+            .unwrap();
+    }
+
+    /// The status and the assignee of API-9 and whether it waits for Jira.
+    async fn api_9(state: &AppState) -> (String, Option<String>, SyncStatus) {
+        let issue = issues::get(&state.pool, &"API-9".into()).await;
+        let issue = issue.unwrap().unwrap();
+        (issue.status, issue.assignee_name, issue.sync_status)
+    }
+
+    #[tokio::test]
+    async fn a_transition_queued_before_a_move_is_delivered_under_the_new_key() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        move_web_1_to_api(&state, &server).await;
+
+        // The status the user chose is still shown, on the moved issue
+        let chosen = ("In Progress".to_owned(), ada_name(), SyncStatus::Pending);
+        assert_eq!(api_9(&state).await, chosen);
+        transition("API-9")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(delivered, keys(&["API-9"]));
+        let confirmed = ("In Progress".to_owned(), ada_name(), SyncStatus::Synced);
+        assert_eq!(api_9(&state).await, confirmed);
+    }
+
+    #[tokio::test]
+    async fn an_assignee_queued_before_a_move_is_delivered_under_the_new_key() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+
+        move_web_1_to_api(&state, &server).await;
+
+        // The assignee the user chose is still shown, on the moved issue
+        let chosen = ("To Do".to_owned(), grace_name(), SyncStatus::Pending);
+        assert_eq!(api_9(&state).await, chosen);
+        assignee_call("API-9")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(delivered, keys(&["API-9"]));
+        let confirmed = ("To Do".to_owned(), grace_name(), SyncStatus::Synced);
+        assert_eq!(api_9(&state).await, confirmed);
+    }
+
+    #[tokio::test]
+    async fn a_comment_queued_before_a_move_is_delivered_under_the_new_key() {
+        async fn comments_of_api_9(state: &AppState) -> Vec<(bool, String)> {
+            let detail = issues::get_detail(&state.pool, &"API-9".into(), "http://localhost").await;
+            let comments = detail.unwrap().unwrap().comments;
+            comments
+                .into_iter()
+                .map(|comment| (comment.pending, comment.body_md))
+                .collect()
+        }
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+
+        move_web_1_to_api(&state, &server).await;
+
+        // The comment still waits in the moved issue
+        let text = "Seen on staging".to_owned();
+        assert_eq!(comments_of_api_9(&state).await, [(true, text)]);
+        comment_call("API-9")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(delivered, keys(&["API-9"]));
+        let stored = "Seen on staging\\\nand in production".to_owned();
+        assert_eq!(comments_of_api_9(&state).await, [(false, stored)]);
+    }
 }
