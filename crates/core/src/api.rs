@@ -63,6 +63,7 @@ pub async fn sign_in(
         pending_projects: Vec::new(),
         last_reconcile_at: 0,
         last_worklog_sync_at: 0,
+        last_worklog_delete_sync_at: 0,
         worklog_target: Default::default(),
         tempo_url: auth::TEMPO_URL.to_owned(),
         tempo_api_token: String::new(),
@@ -579,6 +580,7 @@ mod tests {
                 "pending_projects": [],
                 "last_reconcile_at": 0,
                 "last_worklog_sync_at": 0,
+                "last_worklog_delete_sync_at": 0,
                 "worklog_target": "jira",
                 "tempo_url": "https://api.tempo.io/4",
             })

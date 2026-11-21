@@ -408,6 +408,47 @@ pub(crate) async fn poll_updated_worklogs(
     Ok(())
 }
 
+/// Removes the worklogs Jira deleted since the last poll and moves the saved
+/// time forward. The keys of the issues that lost a worklog are added to `changed`.
+pub(crate) async fn poll_deleted_worklogs(
+    state: &AppState,
+    config: &Config,
+    changed: &mut Vec<IssueKey>,
+) -> anyhow::Result<()> {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let mut since = config.last_worklog_delete_sync_at;
+    loop {
+        let page = client.deleted_worklogs(since).await?;
+        let ids: Vec<i64> = page
+            .values
+            .iter()
+            .map(|worklog| worklog.worklog_id)
+            .collect();
+        let mut tx = state.pool.begin().await?;
+        for key in worklogs::delete_remote(&mut tx, &ids).await? {
+            if !changed.contains(&key) {
+                changed.push(key);
+            }
+        }
+        tx.commit().await?;
+        since = page.until.max(since);
+        if page.last_page {
+            break;
+        }
+    }
+
+    let mut saved = state.config.write().await;
+    // A sign-in during the poll starts a new setup: its sync time is not ours to set
+    if let Some(current) = saved
+        .as_mut()
+        .filter(|current| current.last_worklog_delete_sync_at == config.last_worklog_delete_sync_at)
+    {
+        current.last_worklog_delete_sync_at = since;
+        auth::save_config(&state.data_dir, current).await?;
+    }
+    Ok(())
+}
+
 // The span is relative ("-5m"), which Jira counts back from its own clock. A
 // JQL date string would be read in the time zone of the user's Jira profile.
 fn incremental_jql(watched_projects: &[String], last_sync_at: i64, now: i64) -> String {
@@ -1255,6 +1296,24 @@ mod tests {
             .with_priority(1)
     }
 
+    /// Jira's answer to `GET /worklog/deleted?since={since}`, which must be asked once.
+    fn worklogs_deleted(since: i64, ids: &[i64], until: i64, last_page: bool) -> Mock {
+        let values: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "worklogId": id, "updatedTime": until }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/worklog/deleted"))
+            .and(query_param("since", since.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "values": values, "until": until, "lastPage": last_page }),
+                ),
+            )
+            .with_priority(1)
+            .expect(1)
+    }
+
     /// A worklog as `POST /worklog/list` sends it: 10:15 in a UTC+2 profile.
     fn jira_worklog(id: &str, issue_id: &str, seconds: i64) -> Value {
         json!({
@@ -1395,6 +1454,72 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].2, 7200);
         assert_eq!(saved_worklog_time(&state).await, 9_500);
+    }
+
+    #[tokio::test]
+    async fn a_worklog_deleted_in_jira_is_removed_and_one_not_yet_delivered_is_kept() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        sqlx::query(
+            "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, sync_status)
+             VALUES ('1', 'WEB-1', 60, '2026-03-29T08:15:00.000Z', 'synced'),
+                    ('2', 'WEB-1', 60, '2026-03-29T08:15:00.000Z', 'synced'),
+                    ('3', 'WEB-1', 60, '2026-03-29T08:15:00.000Z', 'synced'),
+                    (NULL, 'WEB-1', 120, '2026-03-29T09:00:00.000Z', 'pending'),
+                    (NULL, 'WEB-1', 180, '2026-03-29T10:00:00.000Z', 'failed')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        // Two pages; worklog 99 was never cached
+        worklogs_deleted(0, &[1], 5_000, false).mount(&server).await;
+        worklogs_deleted(5_000, &[2, 99], 9_000, true)
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        let remaining: Vec<(Option<String>, i64)> = sqlx::query_as(
+            "SELECT remote_id, time_spent_sec FROM worklogs ORDER BY time_spent_sec",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining,
+            [(Some("3".to_owned()), 60), (None, 120), (None, 180)]
+        );
+        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
+        let saved: Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved["last_worklog_delete_sync_at"], json!(9_000));
+
+        // The next cycle asks from the end of the last page, which `expect(1)` checks
+        worklogs_deleted(9_000, &[], 9_500, true)
+            .mount(&server)
+            .await;
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .last_worklog_delete_sync_at,
+            9_500
+        );
     }
 
     #[tokio::test]

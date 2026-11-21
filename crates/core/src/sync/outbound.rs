@@ -407,6 +407,7 @@ mod tests {
             pending_projects: Vec::new(),
             last_reconcile_at: 0,
             last_worklog_sync_at: 0,
+            last_worklog_delete_sync_at: 0,
             worklog_target: Default::default(),
             tempo_url: crate::auth::TEMPO_URL.to_owned(),
             api_token: TOKEN.to_owned(),
@@ -2889,6 +2890,14 @@ mod tests {
                 json!({ "values": [{ "worklogId": 30001, "updatedTime": 9000 }],
                         "until": 9000, "lastPage": true }),
             ))
+            .mount(&jira)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/worklog/deleted"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "values": [], "until": 9000, "lastPage": true })),
+            )
             .mount(&jira)
             .await;
         Mock::given(method("POST"))

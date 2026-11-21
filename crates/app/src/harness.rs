@@ -12,12 +12,15 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{path, path_regex},
+};
 
 /// A Jira where no worklog changed: every sync cycle asks for them.
 pub(crate) fn no_worklog_changes() -> Mock {
     Mock::given(wiremock::matchers::method("GET"))
-        .and(path("/rest/api/3/worklog/updated"))
+        .and(path_regex("^/rest/api/3/worklog/(updated|deleted)$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(
             json!({ "values": [], "until": 1_700_000_000_000_i64, "lastPage": true }),
         ))

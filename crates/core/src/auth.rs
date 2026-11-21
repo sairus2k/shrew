@@ -36,6 +36,9 @@ pub(crate) struct Config {
     // `until` Jira gave with the last page. 0 asks for every worklog, once.
     #[serde(default)]
     pub last_worklog_sync_at: i64,
+    // Same for the poll of deleted worklogs, which Jira reports separately
+    #[serde(default)]
+    pub last_worklog_delete_sync_at: i64,
     #[serde(default)]
     pub worklog_target: WorklogTarget,
     // Part of the config so that tests can point Tempo at a mock server, as

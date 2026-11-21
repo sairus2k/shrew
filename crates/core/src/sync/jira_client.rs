@@ -380,6 +380,16 @@ impl JiraClient {
         self.send(request).await
     }
 
+    /// The ids of the worklogs deleted since `since` (Unix milliseconds), one
+    /// page at a time. Jira keeps this list apart from `updated_worklogs`.
+    pub(crate) async fn deleted_worklogs(&self, since: i64) -> Result<WorklogPage, JiraError> {
+        let request = self
+            .http
+            .get(self.url("/worklog/deleted"))
+            .query(&[("since", since.to_string())]);
+        self.send(request).await
+    }
+
     /// The worklogs with these ids and their properties, as Jira sent them.
     /// Jira takes at most a thousand ids, which is also the size of a page of
     /// `updated_worklogs`.

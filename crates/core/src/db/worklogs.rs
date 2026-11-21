@@ -170,6 +170,23 @@ pub(crate) async fn upsert_remote(
     .await
 }
 
+/// Removes the cached worklogs Jira deleted. A worklog logged here and not yet
+/// delivered has no `remote_id`, so it is never matched. Returns the keys of the
+/// issues that lost one.
+pub(crate) async fn delete_remote(
+    conn: &mut sqlx::SqliteConnection,
+    remote_ids: &[i64],
+) -> sqlx::Result<Vec<IssueKey>> {
+    sqlx::query_scalar(
+        "DELETE FROM worklogs
+         WHERE remote_id IN (SELECT value FROM json_each(?))
+         RETURNING issue_key",
+    )
+    .bind(serde_json::json!(remote_ids.iter().map(i64::to_string).collect::<Vec<_>>()).to_string())
+    .fetch_all(conn)
+    .await
+}
+
 /// The worklogs of the issue, the one started last first. A worklog logged
 /// here has no author name until Jira sends it back.
 pub(crate) async fn for_issue(

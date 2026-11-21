@@ -12,10 +12,10 @@ pub(crate) mod transitions;
 pub(crate) fn no_worklog_changes() -> wiremock::Mock {
     use wiremock::{
         Mock, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path_regex},
     };
     Mock::given(method("GET"))
-        .and(path("/rest/api/3/worklog/updated"))
+        .and(path_regex("^/rest/api/3/worklog/(updated|deleted)$"))
         .respond_with(ResponseTemplate::new(200).set_body_json(
             serde_json::json!({ "values": [], "until": 1_700_000_000_000_i64, "lastPage": true }),
         ))

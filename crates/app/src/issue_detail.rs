@@ -982,6 +982,14 @@ pub(crate) mod tests {
                 })))
                 .mount(&server)
                 .await;
+            Mock::given(method("GET"))
+                .and(path("/rest/api/3/worklog/deleted"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "values": [], "until": 5, "lastPage": true })),
+                )
+                .mount(&server)
+                .await;
             Mock::given(method("POST"))
                 .and(path("/rest/api/3/worklog/list"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
