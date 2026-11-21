@@ -82,6 +82,7 @@ async fn open(
         sync_waker,
         tokens,
         tempo_tokens,
+        rejected_tempo_token: Default::default(),
         sync_running: Mutex::new(()),
         signed_out: watch::channel(()).0,
     };

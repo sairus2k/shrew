@@ -147,6 +147,7 @@ pub async fn set_worklog_target(state: &AppState, target: WorklogTarget) -> anyh
     }
     current.worklog_target = target;
     auth::save_config(&state.data_dir, current).await?;
+    *state.rejected_tempo_token.lock().unwrap() = None;
     drop(saved);
     state.sync_waker.send(()).ok();
     Ok(())
@@ -166,6 +167,7 @@ pub async fn save_tempo_token(state: &AppState, api_token: &str) -> anyhow::Resu
     let token = api_token.to_owned();
     tokio::task::spawn_blocking(move || tempo_tokens.save(&token)).await??;
     current.tempo_api_token = api_token.to_owned();
+    *state.rejected_tempo_token.lock().unwrap() = None;
     drop(saved);
     state.sync_waker.send(()).ok();
     Ok(())

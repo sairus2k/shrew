@@ -47,10 +47,15 @@ pub(crate) async fn process_queue(
     delivered: &mut Vec<IssueKey>,
 ) -> anyhow::Result<()> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
-    // Set by a rejected Tempo token: the worklogs wait, the rest goes on
-    let mut tempo_rejected = false;
+    // A token Tempo rejected in an earlier pass is not sent again: the worklogs
+    // wait, the rest goes on
+    let tempo_rejected = |state: &AppState| {
+        config.worklog_target == WorklogTarget::Tempo
+            && state.rejected_tempo_token.lock().unwrap().as_deref()
+                == Some(config.tempo_api_token.as_str())
+    };
     // A retried entry is claimed again: it is still the oldest one
-    while let Some(entry) = sync_queue::claim_next(&state.pool, tempo_rejected).await? {
+    while let Some(entry) = sync_queue::claim_next(&state.pool, tempo_rejected(state)).await? {
         let error = match deliver(&client, state, config, &entry).await {
             Ok(delivered_as) => {
                 // One transaction: an issue must not stay pending with nothing left to send,
@@ -84,8 +89,10 @@ pub(crate) async fn process_queue(
             // Only the worklogs need the Tempo token: the rest of the queue
             // is still delivered, and the cycle goes on to read what Jira has
             sync_queue::release(&state.pool, entry.id).await?;
-            state.events.send(SyncEvent::TempoTokenRejected).ok();
-            tempo_rejected = true;
+            if !tempo_rejected(state) {
+                *state.rejected_tempo_token.lock().unwrap() = Some(config.tempo_api_token.clone());
+                state.events.send(SyncEvent::TempoTokenRejected).ok();
+            }
             continue;
         }
         match failure(&error) {
@@ -2933,6 +2940,106 @@ mod tests {
         assert_eq!(status, "pending");
         assert_eq!(worklog_rows(&state).await[0].1, "pending");
         assert!(delivered.is_empty());
+    }
+
+    /// A signed-in core with a worklog queued and a Tempo that answers 401
+    async fn with_a_rejected_tempo_token() -> (
+        Arc<AppState>,
+        UnboundedReceiver<SyncEvent>,
+        MockServer,
+        MockServer,
+        tempfile::TempDir,
+    ) {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        api::sign_in(&state, &jira.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        api::save_tempo_token(&state, "tempo-secret").await.unwrap();
+        store_issue(&state).await;
+        tempo_worklog_call()
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&tempo)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        received(&mut events);
+        (state, events, jira, tempo, data_dir)
+    }
+
+    #[tokio::test]
+    async fn a_rejected_tempo_token_is_reported_and_tried_once_however_many_cycles_follow() {
+        let (state, mut events, jira, tempo, _data_dir) = with_a_rejected_tempo_token().await;
+        let config = tempo_config(&jira, &tempo);
+
+        for _ in 0..3 {
+            process_queue(&state, &config, &mut Vec::new())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(received(&mut events), ["TempoTokenRejected"]);
+        assert_eq!(requests(&tempo).await.len(), 1);
+        assert_eq!(worklog_rows(&state).await[0].1, "pending");
+    }
+
+    #[tokio::test]
+    async fn saving_a_token_makes_the_next_cycle_try_tempo_again() {
+        let (state, mut events, jira, tempo, _data_dir) = with_a_rejected_tempo_token().await;
+        let config = tempo_config(&jira, &tempo);
+        process_queue(&state, &config, &mut Vec::new())
+            .await
+            .unwrap();
+        received(&mut events);
+
+        // Even the same token is tried again: saving it says it was fixed at Tempo
+        api::save_tempo_token(&state, "tempo-secret").await.unwrap();
+        process_queue(&state, &config, &mut Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(requests(&tempo).await.len(), 2);
+        assert_eq!(received(&mut events), ["TempoTokenRejected"]);
+
+        tempo.reset().await;
+        tempo_worklog_call()
+            .respond_with(ResponseTemplate::new(200).set_body_json(tempo_created(7)))
+            .mount(&tempo)
+            .await;
+        api::save_tempo_token(&state, "new-secret").await.unwrap();
+        let fixed = Config {
+            tempo_api_token: "new-secret".to_owned(),
+            ..config
+        };
+        process_queue(&state, &fixed, &mut Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(tempo_ids(&state).await, [Some(7)]);
+        assert!(received(&mut events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn choosing_the_target_makes_the_next_cycle_try_tempo_again() {
+        let (state, mut events, jira, tempo, _data_dir) = with_a_rejected_tempo_token().await;
+        let config = tempo_config(&jira, &tempo);
+        process_queue(&state, &config, &mut Vec::new())
+            .await
+            .unwrap();
+        received(&mut events);
+
+        api::set_worklog_target(&state, WorklogTarget::Tempo)
+            .await
+            .unwrap();
+        process_queue(&state, &config, &mut Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(requests(&tempo).await.len(), 2);
+        assert_eq!(received(&mut events), ["TempoTokenRejected"]);
     }
 
     #[tokio::test]

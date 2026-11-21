@@ -3,7 +3,10 @@ use crate::{
     auth::{Config, TokenStore},
 };
 use sqlx::SqlitePool;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex},
+};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 pub struct AppState {
@@ -17,6 +20,10 @@ pub struct AppState {
     pub(crate) sync_waker: watch::Sender<()>,
     pub(crate) tokens: Arc<dyn TokenStore>,
     pub(crate) tempo_tokens: Arc<dyn TokenStore>,
+    // The Tempo token that Tempo answered 401 to. Worklogs wait while it is the
+    // saved one, and the event is not repeated. Saving a token or choosing the
+    // target clears it.
+    pub(crate) rejected_tempo_token: StdMutex<Option<String>>,
     // Held by a sync cycle while it runs. A sign-out takes it before it wipes
     // the cache, so a cycle of the old account cannot write into it afterwards.
     pub(crate) sync_running: Mutex<()>,
