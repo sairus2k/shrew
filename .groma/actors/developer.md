@@ -19,3 +19,5 @@ Uses Shrew instead of the Jira web interface for the daily work on issues: finds
 | [developer](developer.md) | [issue-detail](../systems/shrew/containers/app/components/issue-detail.md) | Reads and updates issues | GPUI window |
 | [developer](developer.md) | [timer](../systems/shrew/containers/app/components/timer.md) | Tracks time | GPUI window |
 | [developer](developer.md) | [settings](../systems/shrew/containers/app/components/settings.md) | Chooses worklog target | GPUI window |
+| [developer](developer.md) | [new-token](../systems/shrew/containers/app/components/new-token.md) | Enters new token | GPUI window |
+| [developer](developer.md) | [app-shell](../systems/shrew/containers/app/components/app-shell.md) | Opens the app | macOS app |
