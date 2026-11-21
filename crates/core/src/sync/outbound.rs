@@ -279,7 +279,7 @@ async fn deliver(
         "worklog" => {
             let local_id = payload["local_id"].as_str().unwrap_or_default().to_owned();
             if config.worklog_target == WorklogTarget::Tempo {
-                let tempo_id = post_to_tempo(state, config, entry, &payload).await?;
+                let tempo_id = post_to_tempo(client, state, config, entry, &payload).await?;
                 return Ok(Delivered::TempoWorklog { local_id, tempo_id });
             }
             let started =
@@ -310,6 +310,7 @@ async fn deliver(
 
 /// Returns Tempo's id of the worklog.
 async fn post_to_tempo(
+    client: &JiraClient,
     state: &AppState,
     config: &Config,
     entry: &QueueEntry,
@@ -325,6 +326,16 @@ async fn post_to_tempo(
             .map_err(|error| {
                 anyhow::anyhow!("a worklog entry with an unreadable start: {error}")
             })?;
+    // Tempo takes a date and a time without an offset and reads them in the
+    // time zone of the author's Jira profile. Asked for each worklog: the
+    // user can change the profile at any time.
+    let time_zone: chrono_tz::Tz = client
+        .myself()
+        .await?
+        .time_zone
+        .and_then(|name| name.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("Jira did not say the time zone of the profile"))?;
+    let started = started.with_timezone(&time_zone);
     let mut body = json!({
         "issueId": issue_id,
         "authorAccountId": config.account_id,
@@ -2559,6 +2570,18 @@ mod tests {
         }
     }
 
+    /// The profile Jira answers `GET /myself` with: UTC+2 at `STARTED`.
+    async fn mount_profile(jira: &MockServer) {
+        Mock::given(path("/rest/api/3/myself"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accountId": "5b10a",
+                "displayName": "Ada",
+                "timeZone": "Europe/Paris",
+            })))
+            .mount(jira)
+            .await;
+    }
+
     fn tempo_worklog_call() -> wiremock::MockBuilder {
         Mock::given(method("POST")).and(path("/worklogs"))
     }
@@ -2595,6 +2618,7 @@ mod tests {
     #[tokio::test]
     async fn with_tempo_as_the_target_a_worklog_goes_to_tempo_and_not_to_jira() {
         let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;
@@ -2625,7 +2649,8 @@ mod tests {
                     "authorAccountId": "5b10a",
                     "timeSpentSeconds": 5400,
                     "startDate": "2026-03-29",
-                    "startTime": "08:15:00",
+                    // 08:15 UTC in the time zone of the profile
+                    "startTime": "10:15:00",
                     "description": "Pairing",
                 })
             )]
@@ -2641,6 +2666,7 @@ mod tests {
     #[tokio::test]
     async fn a_worklog_goes_to_the_target_set_when_the_queue_is_flushed() {
         let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;
@@ -2678,6 +2704,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_tempo_token_is_reported_and_the_worklog_stays_queued() {
         let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;
@@ -2709,6 +2736,7 @@ mod tests {
     #[tokio::test]
     async fn a_worklog_posted_to_tempo_is_not_stored_twice_when_the_poll_returns_it() {
         let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;
