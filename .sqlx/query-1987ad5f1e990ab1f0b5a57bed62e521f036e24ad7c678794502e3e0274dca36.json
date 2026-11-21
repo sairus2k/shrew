@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        UPDATE sync_queue SET status = 'in_progress'\n        WHERE id = (\n            SELECT id FROM sync_queue\n            WHERE status IN ('pending', 'in_progress')\n            ORDER BY id\n            LIMIT 1\n        )\n        RETURNING id AS \"id!\", entity_type, issue_key AS \"issue_key: IssueKey\",\n                  payload, retry_count\n        ",
+  "query": "\n        UPDATE sync_queue SET status = 'in_progress'\n        WHERE id = (\n            SELECT id FROM sync_queue\n            WHERE status IN ('pending', 'in_progress')\n              AND NOT (? AND entity_type = 'worklog')\n            ORDER BY id\n            LIMIT 1\n        )\n        RETURNING id AS \"id!\", entity_type, issue_key AS \"issue_key: IssueKey\",\n                  payload, retry_count\n        ",
   "describe": {
     "columns": [
       {
@@ -30,7 +30,7 @@
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       false,
@@ -40,5 +40,5 @@
       false
     ]
   },
-  "hash": "e5aeba2394719281c13b9c1100475741f40d1e66cc00aa0b347b60e62d2652d4"
+  "hash": "1987ad5f1e990ab1f0b5a57bed62e521f036e24ad7c678794502e3e0274dca36"
 }

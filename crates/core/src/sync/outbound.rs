@@ -39,15 +39,18 @@ enum Failure {
 /// marked `failed`, rolled back and announced with `SyncEvent::ChangeRejected`,
 /// and the pass goes on.
 /// The pass ends with an error when Jira cannot be reached or rejects the
-/// token: the entries then stay `pending` for a later pass.
+/// token: the entries then stay `pending` for a later pass. A rejected Tempo
+/// token only holds back the worklogs, which stay `pending` in their order.
 pub(crate) async fn process_queue(
     state: &AppState,
     config: &Config,
     delivered: &mut Vec<IssueKey>,
 ) -> anyhow::Result<()> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    // Set by a rejected Tempo token: the worklogs wait, the rest goes on
+    let mut tempo_rejected = false;
     // A retried entry is claimed again: it is still the oldest one
-    while let Some(entry) = sync_queue::claim_next(&state.pool).await? {
+    while let Some(entry) = sync_queue::claim_next(&state.pool, tempo_rejected).await? {
         let error = match deliver(&client, state, config, &entry).await {
             Ok(delivered_as) => {
                 // One transaction: an issue must not stay pending with nothing left to send,
@@ -78,11 +81,12 @@ pub(crate) async fn process_queue(
         };
         let message = format!("{error:#}");
         if matches!(error.downcast_ref(), Some(TempoError::Unauthorized)) {
-            // Only the worklogs are blocked by the Tempo token, so the cycle
-            // goes on to read what Jira has
+            // Only the worklogs need the Tempo token: the rest of the queue
+            // is still delivered, and the cycle goes on to read what Jira has
             sync_queue::release(&state.pool, entry.id).await?;
             state.events.send(SyncEvent::TempoTokenRejected).ok();
-            return Ok(());
+            tempo_rejected = true;
+            continue;
         }
         match failure(&error) {
             Failure::NotAsked => {
@@ -703,7 +707,10 @@ mod tests {
     }
 
     async fn claim(state: &AppState) {
-        let claimed = sync_queue::claim_next(&state.pool).await.unwrap().unwrap();
+        let claimed = sync_queue::claim_next(&state.pool, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(entry(state, claimed.id).await.0, "in_progress");
     }
 
@@ -2926,6 +2933,99 @@ mod tests {
         assert_eq!(status, "pending");
         assert_eq!(worklog_rows(&state).await[0].1, "pending");
         assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_tempo_token_does_not_hold_back_what_does_not_need_tempo() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&jira)
+            .await;
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created_comment()))
+            .expect(1)
+            .mount(&jira)
+            .await;
+        assignee_call("WEB-1")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&jira)
+            .await;
+        tempo_worklog_call()
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&tempo)
+            .await;
+        // The worklogs are queued around the others, the first one oldest
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        enqueue(&state, "WEB-1", "21").await;
+        api::add_comment(&state, &"WEB-1".into(), "Seen on staging")
+            .await
+            .unwrap();
+        api::log_time(&state, &"WEB-1".into(), 1200, STARTED + 7200, None)
+            .await
+            .unwrap();
+        api::assign_issue(&state, &"WEB-1".into(), Some(&grace()))
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert_eq!(received(&mut events), ["TempoTokenRejected"]);
+        let left: Vec<(String, String)> =
+            sqlx::query_as("SELECT entity_type, status FROM sync_queue ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        let pending = |entity_type: &str| (entity_type.to_owned(), "pending".to_owned());
+        let synced = |entity_type: &str| (entity_type.to_owned(), "synced".to_owned());
+        assert_eq!(
+            left,
+            [
+                pending("worklog"),
+                synced("transition"),
+                synced("comment"),
+                pending("worklog"),
+                synced("assignee"),
+            ]
+        );
+
+        // The token is replaced: both worklogs go out, the older one first
+        let fixed = Config {
+            tempo_api_token: "new-secret".to_owned(),
+            ..tempo_config(&jira, &tempo)
+        };
+        tempo.reset().await;
+        for tempo_id in [7, 8] {
+            tempo_worklog_call()
+                .respond_with(ResponseTemplate::new(200).set_body_json(tempo_created(tempo_id)))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&tempo)
+                .await;
+        }
+        process_queue(&state, &fixed, &mut delivered).await.unwrap();
+
+        let sent: Vec<Value> = requests(&tempo)
+            .await
+            .iter()
+            .map(|(_, body)| body["timeSpentSeconds"].clone())
+            .collect();
+        assert_eq!(sent, [json!(600), json!(1200)]);
+        assert!(received(&mut events).is_empty());
     }
 
     #[tokio::test]

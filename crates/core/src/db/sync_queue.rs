@@ -31,11 +31,14 @@ pub(crate) async fn enqueue(
 }
 
 /// Marks the oldest entry that still has to be sent as `in_progress` and
-/// returns it.
+/// returns it. Worklogs are passed over when `skip_worklogs` is set.
 // `created_at` has a resolution of one second; the id is the creation order.
 // Only one processor runs, so an entry that is `in_progress` here was left by
 // a crash or a quit in the middle of its delivery.
-pub(crate) async fn claim_next(pool: &SqlitePool) -> sqlx::Result<Option<QueueEntry>> {
+pub(crate) async fn claim_next(
+    pool: &SqlitePool,
+    skip_worklogs: bool,
+) -> sqlx::Result<Option<QueueEntry>> {
     sqlx::query_as!(
         QueueEntry,
         r#"
@@ -43,12 +46,14 @@ pub(crate) async fn claim_next(pool: &SqlitePool) -> sqlx::Result<Option<QueueEn
         WHERE id = (
             SELECT id FROM sync_queue
             WHERE status IN ('pending', 'in_progress')
+              AND NOT (? AND entity_type = 'worklog')
             ORDER BY id
             LIMIT 1
         )
         RETURNING id AS "id!", entity_type, issue_key AS "issue_key: IssueKey",
                   payload, retry_count
-        "#
+        "#,
+        skip_worklogs
     )
     .fetch_optional(pool)
     .await
