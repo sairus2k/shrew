@@ -23,6 +23,6 @@ Three jobs. The initial sync downloads every issue of the watched (or newly adde
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/issues.rs](../../../../../../crates/core/src/db/issues.rs) | Stores issue records | sqlx |
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/worklogs.rs](../../../../../../crates/core/src/db/worklogs.rs) | Stores remote worklogs | sqlx |
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/timer.rs](../../../../../../crates/core/src/db/timer.rs) | Follows renamed issues | sqlx |
-| [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/sync_queue.rs](../../../../../../crates/core/src/db/sync_queue.rs) | Drops entries of gone issues | sqlx |
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/auth.rs](../../../../../../crates/core/src/auth.rs) | Saves sync positions | Rust call |
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/adf.rs](../../../../../../crates/core/src/adf.rs) | Extracts searchable text | Rust call |
+| [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/sync_queue.rs](../../../../../../crates/core/src/db/sync_queue.rs) | Re-keys or drops entries | sqlx |
