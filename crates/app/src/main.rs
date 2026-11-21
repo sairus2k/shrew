@@ -20,7 +20,7 @@ use runtime::{Core, SyncBridge};
 use settings::{Settings, SettingsClosed};
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
-use timer::{ActiveTimer, TimerIssueClicked, TimerStatus};
+use timer::{ActiveTimer, TimerIssueClicked, TimerStatus, TimerWriteFailed};
 
 mod account;
 mod assignee;
@@ -169,6 +169,14 @@ impl Root {
                 })
                 .detach();
                 let timer = cx.new(ActiveTimer::new);
+                cx.subscribe_in(
+                    &timer,
+                    window,
+                    |_, _, failed: &TimerWriteFailed, window, cx| {
+                        window.push_notification(Notification::error(failed.0.clone()), cx)
+                    },
+                )
+                .detach();
                 let timer_status = cx.new(|cx| TimerStatus::new(timer.clone(), cx));
                 let opening = list.clone();
                 cx.subscribe(

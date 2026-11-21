@@ -27,23 +27,46 @@ pub struct ActiveTimer {
     _load: Task<()>,
     // The only writer: one task takes the clicks in the order they were made, so
     // a start and a stop never overtake each other on their way to SQLite
-    _writer: Task<anyhow::Result<()>>,
+    _writer: Task<()>,
 }
+
+/// The core could not save a start or a stop; the text is for the user.
+pub struct TimerWriteFailed(pub String);
+
+impl EventEmitter<TimerWriteFailed> for ActiveTimer {}
 
 impl ActiveTimer {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (writes, mut queue) = mpsc::unbounded_channel();
-        let _writer = spawn(cx, |state| async move {
+        let _writer = cx.spawn(async move |this, cx| {
+            let mut failed = false;
             while let Some(write) = queue.recv().await {
-                let done = match write {
-                    Write::Start(timer) => api::start_timer(&state, &timer).await,
-                    Write::Stop(stopped_at) => api::stop_timer(&state, stopped_at).await,
-                };
-                if let Err(error) = done {
-                    eprintln!("could not save the timer: {error}");
+                let done = cx.update(|cx| {
+                    spawn(cx, |state| async move {
+                        match write {
+                            Write::Start(timer) => api::start_timer(&state, &timer).await,
+                            Write::Stop(stopped_at) => api::stop_timer(&state, stopped_at).await,
+                        }
+                    })
+                });
+                if let Err(error) = done.await {
+                    failed = true;
+                    let message = format!("Could not save the timer: {error}");
+                    this.update(cx, |_, cx| cx.emit(TimerWriteFailed(message)))
+                        .ok();
+                }
+                // Once the queue is drained: the clicks that came after a failed
+                // one were drawn on top of a state the database never reached
+                if failed && queue.is_empty() {
+                    failed = false;
+                    let saved = cx.update(|cx| {
+                        spawn(cx, |state| async move { api::running_timer(&state).await })
+                    });
+                    if let Ok(saved) = saved.await {
+                        this.update(cx, |this, cx| this.set_running(saved, cx)).ok();
+                    }
                 }
             }
-            Ok(())
         });
         // The timer that was running when the app quit
         let saved = spawn(cx, |state| async move { api::running_timer(&state).await });
@@ -252,6 +275,7 @@ mod tests {
         models::{IssueKey, RunningTimer},
     };
     use gpui_kit::AppContext;
+    use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, ScrollDelta, TestAppContext, Window, point, px};
     use serde_json::json;
@@ -470,6 +494,45 @@ mod tests {
                     .worklogs
                     .is_empty()
         });
+    }
+
+    #[gpui_kit::test]
+    fn a_stop_that_cannot_be_saved_is_reported_and_the_timer_still_shows_as_running(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let data_dir = synced_on(
+            &tokio,
+            &server.uri(),
+            &[issue(1, "Fix login"), issue(2, "Broken checkout")],
+        );
+        running_since(&tokio, data_dir.path(), unix_now() - 6_000);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        wait_until(cx, window, |window| window.try_find("stop-timer").is_some());
+        let state = state(cx);
+        tokio
+            .block_on(state.execute(
+                "CREATE TRIGGER timer_is_stuck BEFORE DELETE ON running_timer
+                 BEGIN SELECT RAISE(ABORT, 'the timer is stuck'); END",
+            ))
+            .unwrap();
+
+        click(cx, window, "stop-timer");
+
+        wait_until(cx, window, |window| {
+            window.try_find("notification").is_some()
+        });
+        // The click took the control to "Start timer" at once; the failure takes it back
+        wait_until(cx, window, |window| {
+            window.try_find("stop-timer").is_some() && elapsed(window).is_some()
+        });
+        in_window(cx, window, |window, cx| {
+            assert_eq!(window.notifications(cx).len(), 1);
+            assert!(status_bar_timer(window).is_some());
+        });
+        assert!(running(&tokio, &state).is_some());
     }
 
     #[gpui_kit::test]
