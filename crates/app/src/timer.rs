@@ -22,6 +22,8 @@ enum Write {
 
 pub struct ActiveTimer {
     running: Option<RunningTimer>,
+    // A click is newer than the initial load, which must not overwrite it
+    clicked: bool,
     writes: mpsc::UnboundedSender<Write>,
     _tick: Task<()>,
     _load: Task<()>,
@@ -72,12 +74,17 @@ impl ActiveTimer {
         let saved = spawn(cx, |state| async move { api::running_timer(&state).await });
         let _load = cx.spawn(async move |this, cx| {
             if let Ok(Some(timer)) = saved.await {
-                this.update(cx, |this, cx| this.set_running(Some(timer), cx))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    if !this.clicked {
+                        this.set_running(Some(timer), cx)
+                    }
+                })
+                .ok();
             }
         });
         Self {
             running: None,
+            clicked: false,
             writes,
             _tick: Task::ready(()),
             _load,
@@ -91,6 +98,7 @@ impl ActiveTimer {
             issue_key,
             started_at: unix_now(),
         };
+        self.clicked = true;
         self.writes.send(Write::Start(timer.clone())).ok();
         self.set_running(Some(timer), cx);
     }
@@ -99,6 +107,7 @@ impl ActiveTimer {
         if self.running.is_none() {
             return;
         }
+        self.clicked = true;
         self.writes.send(Write::Stop(unix_now())).ok();
         self.set_running(None, cx);
     }
@@ -266,7 +275,7 @@ impl Render for TimerStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{clock, unix_now};
+    use super::{ActiveTimer, clock, unix_now};
     use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, synced_on};
     use crate::runtime::Core;
@@ -279,7 +288,10 @@ mod tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, ScrollDelta, TestAppContext, Window, point, px};
     use serde_json::json;
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
     use tokio::runtime::Runtime;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
@@ -567,6 +579,54 @@ mod tests {
         in_window(cx, window, |window, _| {
             assert!(window.try_find("stop-timer").is_some());
         });
+    }
+
+    #[gpui_kit::test]
+    fn a_start_clicked_before_the_initial_load_ends_is_not_overwritten_by_it(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let data_dir = synced_on(
+            &tokio,
+            &server.uri(),
+            &[issue(1, "Fix login"), issue(2, "Broken checkout")],
+        );
+        running_since(&tokio, data_dir.path(), unix_now() - 6_000);
+        crate::runtime::tests::init_core(cx, &tokio, data_dir.path());
+        cx.executor().allow_parking();
+
+        // The load of WEB-1 is under way when the click on WEB-2 comes
+        let timer = cx.update(|cx| cx.new(ActiveTimer::new));
+        timer.update(cx, |timer, cx| timer.start("WEB-2".into(), cx));
+
+        let state = state(cx);
+        let started = Instant::now();
+        loop {
+            cx.run_until_parked();
+            let saved = running(&tokio, &state);
+            let shown = timer.read_with(cx, |timer, _| timer.running.clone());
+            if saved
+                .as_ref()
+                .is_some_and(|t| t.issue_key == "WEB-2".into())
+            {
+                assert_eq!(shown, saved);
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the start was not saved"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the load finish; the control must not go back to WEB-1
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let shown = timer.read_with(cx, |timer, _| timer.running.clone());
+        assert_eq!(shown, running(&tokio, &state));
+        assert_eq!(shown.unwrap().issue_key, "WEB-2".into());
     }
 
     fn status_bar_timer(window: &Window) -> Option<(String, String)> {
