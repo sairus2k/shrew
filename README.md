@@ -23,13 +23,18 @@ cargo test --workspace
 
 ### Keychain prompt on every launch
 
-The API token lives in the Keychain. The linker signs a build ad hoc, and the Keychain ties "Always Allow" to the code hash of an ad hoc binary, so every rebuild asks for the login password again. To stop it, create a local code signing certificate once:
+The API tokens live in the Keychain. The Keychain ties "Always Allow" to the partition of the code that asked, and for a build the linker signed ad hoc, or one signed with a self-signed certificate, the partition is the code hash, so every rebuild asks for the login password again. For a certificate Apple issued the partition is the team, which all builds share. A free Apple Development certificate is enough; create it once:
+
+1. Install Xcode and open Settings > Accounts.
+2. Add your Apple ID, select its team and choose Manage Certificates.
+3. Add an Apple Development certificate.
 
 ```sh
-scripts/create-dev-cert.sh
+# Shows the new identity
+security find-identity -v -p codesigning
 ```
 
-The cargo runner (`scripts/dev-run.sh`, set in `.cargo/config.toml`) signs each build with this certificate before it starts. The certificate lives in a keychain of its own, `~/Library/Keychains/shrew-dev.keychain-db`, so signing brings up no dialog. The first launch asks for the token once more: answer "Always Allow". Without the certificate the builds run as before.
+The cargo runner (`scripts/dev-run.sh`, set in `.cargo/config.toml`) signs each build with this certificate before it starts. The first signing asks for access to the key and the first launch asks for each token once more: answer "Always Allow" to both. Without the certificate the builds run as before.
 
 ### UI integration tests
 
