@@ -2,7 +2,7 @@
 
 use crate::{
     AppState, SyncEvent,
-    sync::{inbound, jira_client::JiraError, outbound},
+    sync::{inbound, jira_client::JiraError, outbound, transitions},
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, time::Instant};
@@ -64,13 +64,25 @@ pub(crate) async fn run(state: Arc<AppState>, mut waker: watch::Receiver<()>) {
     // until the config holds another one.
     let mut rejected_token = None;
     loop {
-        if let Err(error) = sync_cycle(&state, &mut reconciled, &mut rejected_token).await {
-            state
-                .events
-                .send(SyncEvent::Error(format!("{error:#}")))
-                .ok();
-        }
+        let cycle = sync_cycle(&state, &mut reconciled, &mut rejected_token).await;
         let synced_at = Instant::now();
+        match cycle {
+            Err(error) => {
+                state
+                    .events
+                    .send(SyncEvent::Error(format!("{error:#}")))
+                    .ok();
+            }
+            // Jira is reachable and takes the token
+            Ok(()) if rejected_token.is_none() => {
+                tokio::select! {
+                    _ = preload_transitions(&state) => {}
+                    // The cycle that was asked for does not wait for the preload
+                    _ = waker.changed() => continue,
+                }
+            }
+            Ok(()) => {}
+        }
         loop {
             let due = synced_at + poll_interval(*window_focused.borrow(), idle_time(&state));
             let now = Instant::now();
@@ -101,6 +113,18 @@ pub(crate) async fn sync_cycle(
     tokio::select! {
         result = cycle(state, reconciled, rejected_token) => result,
         _ = signed_out.changed() => Ok(()),
+    }
+}
+
+/// One pass of the transition preload, cut short when the user signs out.
+/// It is not part of a cycle, so that a cycle is as long as before, and holds
+/// the lock of one, so that a sign-out wipes the cache only after it stopped.
+pub(crate) async fn preload_transitions(state: &AppState) {
+    let mut signed_out = state.signed_out.subscribe();
+    let _running = state.sync_running.lock().await;
+    tokio::select! {
+        _ = transitions::preload(state) => {}
+        _ = signed_out.changed() => {}
     }
 }
 

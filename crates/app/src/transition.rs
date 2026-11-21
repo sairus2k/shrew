@@ -623,6 +623,40 @@ mod tests {
         });
     }
 
+    #[gpui_kit::test]
+    fn a_second_transition_can_follow_the_first_at_once(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port()));
+        let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        // The sync stores what the status of each issue offers. WEB-2 is never
+        // opened, and it is in the status WEB-1 is about to get.
+        let state = core(cx);
+        tokio.block_on(state.sync_once()).unwrap();
+        open(cx, window, "WEB-1");
+        // Nothing can be asked or delivered from here on
+        drop(server);
+
+        in_window(cx, window, |window, cx| choose(window, cx, "Start"));
+        wait_until(cx, window, |window| {
+            let button = window.find("status-button");
+            button.label() == Some("In Progress") && button.disabled() != Some(true)
+        });
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "Review");
+            assert_eq!(status(window), "Status: In Review");
+        });
+
+        // The list shows what the core stored
+        wait_until(cx, window, |window| {
+            rows(window).contains(&"WEB-1: Fix login, In Review (pending), Unassigned".to_owned())
+        });
+        // No cached issue is in In Review, so what it offers is not known
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("status-button").disabled(), Some(true));
+        });
+    }
+
     /// WEB-1 offers a plain "Start", "Close" behind a screen asking for a
     /// resolution and a root cause, and "Reassign" behind one asking for a user.
     fn screens() -> [(&'static str, Value); 2] {

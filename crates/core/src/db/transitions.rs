@@ -78,6 +78,47 @@ pub(crate) async fn put(
     Ok(())
 }
 
+/// Up to `limit` positions that a cached issue is in and the cache has no
+/// entry for, each with an issue to ask Jira through. An issue whose change
+/// waits in the outbox is not used: Jira has it in another status.
+pub(crate) async fn missing(
+    pool: &SqlitePool,
+    limit: i64,
+) -> sqlx::Result<Vec<(IssueKey, Position)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT MIN(key) AS "key!: IssueKey", project_key AS "project_key!",
+               issue_type AS "issue_type!", status AS "status!"
+        FROM issues
+        WHERE issue_type IS NOT NULL AND sync_status = 'synced' AND NOT EXISTS (
+            SELECT 1 FROM transition_cache
+            WHERE project_key = issues.project_key
+              AND issue_type = issues.issue_type
+              AND from_status = issues.status
+        )
+        GROUP BY project_key, issue_type, status
+        -- A position Jira keeps failing to answer for must not hold the
+        -- places of the limit in every pass
+        ORDER BY RANDOM()
+        LIMIT ?
+        "#,
+        limit
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let position = Position {
+                project_key: row.project_key,
+                issue_type: row.issue_type,
+                status: row.status,
+            };
+            (row.key, position)
+        })
+        .collect())
+}
+
 /// Forgets what the status offers, so that the next open asks Jira again.
 pub(crate) async fn forget(
     executor: impl sqlx::SqliteExecutor<'_>,

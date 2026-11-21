@@ -69,10 +69,13 @@ impl AppState {
         Ok(())
     }
 
-    /// Runs one cycle of the sync engine: a core started without the engine
-    /// syncs only when the test says so.
+    /// Runs one cycle of the sync engine and the transition preload that
+    /// follows it: a core started without the engine syncs only when the test
+    /// says so.
     pub async fn sync_once(&self) -> anyhow::Result<()> {
-        crate::sync::engine::sync_cycle(self, &mut true, &mut None).await
+        crate::sync::engine::sync_cycle(self, &mut true, &mut None).await?;
+        crate::sync::engine::preload_transitions(self).await;
+        Ok(())
     }
 
     /// Runs `sql` on the cache, for a state that no API leads to.

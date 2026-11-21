@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT MIN(key) AS \"key!: IssueKey\", project_key AS \"project_key!\",\n               issue_type AS \"issue_type!\", status AS \"status!\"\n        FROM issues\n        WHERE issue_type IS NOT NULL AND sync_status = 'synced' AND NOT EXISTS (\n            SELECT 1 FROM transition_cache\n            WHERE project_key = issues.project_key\n              AND issue_type = issues.issue_type\n              AND from_status = issues.status\n        )\n        GROUP BY project_key, issue_type, status\n        -- A position Jira keeps failing to answer for must not hold the\n        -- places of the limit in every pass\n        ORDER BY RANDOM()\n        LIMIT ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "key!: IssueKey",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_key!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "issue_type!",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "14182455ddd63bd78e9b13ae88563c0aa1656d40a5d59de3c1f0dad466710393"
+}

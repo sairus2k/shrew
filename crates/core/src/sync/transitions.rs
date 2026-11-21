@@ -58,6 +58,37 @@ pub(crate) async fn get(
     }
 }
 
+// Each position costs the three requests of a confirmed fetch
+const PRELOAD_PER_PASS: i64 = 10;
+
+/// Stores the menus of the statuses that cached issues are in and the cache
+/// has no entry for, so that the menu of a status is there before the user
+/// moves an issue to it: until the outbox has delivered the move, Jira cannot
+/// be asked about that status through the moved issue.
+pub(crate) async fn preload(state: &AppState) {
+    let Some(config) = state.config.read().await.clone() else {
+        return;
+    };
+    // The initial sync is still filling the cache, with requests of its own
+    if config.last_sync_at.is_none() {
+        return;
+    }
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let Ok(missing) = cache::missing(&state.pool, PRELOAD_PER_PASS).await else {
+        return;
+    };
+    for (key, position) in missing {
+        // Offline, a rejected token or a Jira in trouble would fail the other
+        // questions too, so the rest waits for the next pass
+        if fetch_and_store(&state.pool, &client, &key, &position)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 fn ensure_same_status(key: &IssueKey, jira_status: &str, local: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         jira_status == local,
@@ -126,12 +157,14 @@ fn from_jira(transition: JiraTransition) -> Transition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api, models::StatusCategory, start_without_keychain};
+    use crate::{
+        api, models::StatusCategory, start_syncing_without_keychain, start_without_keychain,
+    };
     use serde_json::{Value, json};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
+        matchers::{method, path, path_regex, query_param},
     };
 
     fn issue(id: u32, issue_type: &str, status: &str) -> Value {
@@ -163,7 +196,12 @@ mod tests {
             .await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        api::sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+        sign_in_with(&state, server, issues).await;
+        (data_dir, state)
+    }
+
+    async fn sign_in_with(state: &AppState, server: &MockServer, issues: &[Value]) {
+        api::sign_in(state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
         for issue in issues {
@@ -172,7 +210,6 @@ mod tests {
                 .await
                 .unwrap();
         }
-        (data_dir, state)
     }
 
     /// Jira's status for `key`; without it Jira would answer nothing about the issue.
@@ -540,5 +577,325 @@ mod tests {
         assert_eq!(fetched, [expected]);
         // The entry read back from SQLite is the one that was fetched
         assert_eq!(cached, fetched);
+    }
+
+    async fn finish_initial_sync(state: &AppState) {
+        let mut config = state.config.write().await;
+        config.as_mut().unwrap().last_sync_at = Some(inbound::now_ms().unwrap());
+    }
+
+    /// `core_with` after the initial sync, which is when the preload starts.
+    async fn synced_core_with(
+        server: &MockServer,
+        issues: &[Value],
+    ) -> (tempfile::TempDir, Arc<AppState>) {
+        let (data_dir, state) = core_with(server, issues).await;
+        finish_initial_sync(&state).await;
+        (data_dir, state)
+    }
+
+    /// How many times Jira was asked what a status offers.
+    async fn menus_asked_for(server: &MockServer) -> usize {
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET" && request.url.path().ends_with("/transitions")
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_preload_stores_the_menu_of_every_status_a_cached_issue_is_in() {
+        let server = MockServer::start().await;
+        let issues = [
+            issue(1, "Bug", "To Do"),
+            issue(2, "Bug", "In Review"),
+            issue(3, "Story", "To Do"),
+        ];
+        let (_data_dir, state) = synced_core_with(&server, &issues).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        in_jira("WEB-2", "In Review").mount(&server).await;
+        in_jira("WEB-3", "To Do").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+        offers("WEB-2", &["Approve"]).mount(&server).await;
+        offers("WEB-3", &["Refine"]).mount(&server).await;
+
+        preload(&state).await;
+
+        // Nobody opened a menu, and Jira is gone: the menus are there
+        drop(server);
+        assert_eq!(names(&state, "WEB-1").await, ["Start"]);
+        assert_eq!(names(&state, "WEB-2").await, ["Approve"]);
+        assert_eq!(names(&state, "WEB-3").await, ["Refine"]);
+        // WEB-1 moved to the status of WEB-2 offline has the menu of that status
+        move_locally(&state, "WEB-1", "In Review").await;
+        assert_eq!(names(&state, "WEB-1").await, ["Approve"]);
+    }
+
+    #[tokio::test]
+    async fn a_preload_asks_once_about_a_position_and_not_about_one_in_the_cache() {
+        let server = MockServer::start().await;
+        let issues = [
+            issue(1, "Bug", "To Do"),
+            issue(2, "Bug", "To Do"),
+            issue(3, "Bug", "In Review"),
+        ];
+        let (_data_dir, state) = synced_core_with(&server, &issues).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        in_jira("WEB-2", "To Do").mount(&server).await;
+        in_jira("WEB-3", "In Review").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+        offers("WEB-2", &["Start"]).mount(&server).await;
+        offers("WEB-3", &["Approve"]).mount(&server).await;
+        assert_eq!(names(&state, "WEB-3").await, ["Approve"]);
+        assert_eq!(menus_asked_for(&server).await, 1);
+
+        preload(&state).await;
+        assert_eq!(menus_asked_for(&server).await, 2);
+        assert_eq!(stored_under(&state).await, ["In Review", "To Do"]);
+
+        // Nothing is missing any more
+        preload(&state).await;
+        assert_eq!(menus_asked_for(&server).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_preload_files_the_menu_under_the_status_jira_has() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = synced_core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        // A teammate moved the issue, and the poll has not stored it yet
+        in_jira("WEB-1", "In Review").mount(&server).await;
+        offers("WEB-1", &["Approve"]).mount(&server).await;
+
+        preload(&state).await;
+
+        assert_eq!(stored_under(&state).await, ["In Review"]);
+    }
+
+    #[tokio::test]
+    async fn a_preload_does_not_ask_through_an_issue_whose_change_waits_in_the_outbox() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = synced_core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        preload(&state).await;
+
+        assert_eq!(menus_asked_for(&server).await, 0);
+        assert_eq!(cached_entries(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_preload_asks_about_ten_positions_and_leaves_the_rest_to_the_next_one() {
+        let server = MockServer::start().await;
+        let issues: Vec<Value> = (1..=11)
+            .map(|id| issue(id, "Bug", &format!("Step {id}")))
+            .collect();
+        let (_data_dir, state) = synced_core_with(&server, &issues).await;
+        for id in 1..=11 {
+            let key = format!("WEB-{id}");
+            in_jira(&key, &format!("Step {id}")).mount(&server).await;
+            offers(&key, &["Next"]).mount(&server).await;
+        }
+
+        preload(&state).await;
+        assert_eq!(cached_entries(&state).await, 10);
+
+        preload(&state).await;
+        assert_eq!(cached_entries(&state).await, 11);
+    }
+
+    #[tokio::test]
+    async fn a_preload_ends_at_the_first_question_jira_does_not_answer() {
+        let server = MockServer::start().await;
+        let issues = [issue(1, "Bug", "To Do"), issue(2, "Bug", "In Review")];
+        let (_data_dir, state) = synced_core_with(&server, &issues).await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/rest/api/3/issue/WEB-[12]$"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        preload(&state).await;
+
+        assert_eq!(cached_entries(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_preloaded_before_the_initial_sync_has_finished() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+
+        preload(&state).await;
+
+        assert_eq!(menus_asked_for(&server).await, 0);
+    }
+
+    fn start() -> Transition {
+        Transition {
+            id: "21".to_owned(),
+            name: "Start".to_owned(),
+            to_status: "In Progress".to_owned(),
+            to_status_category: StatusCategory::InProgress,
+            required_fields: Vec::new(),
+        }
+    }
+
+    /// A core like `synced_core_with` whose sync engine is running. Every
+    /// search of Jira finds `issues`, so that a cycle changes nothing.
+    async fn syncing_core_with(
+        server: &MockServer,
+        issues: &[Value],
+    ) -> (tempfile::TempDir, Arc<AppState>) {
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/myself"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "accountId": "5b10a", "displayName": "Ada" })),
+            )
+            .mount(server)
+            .await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": issues })))
+            .mount(server)
+            .await;
+        crate::sync::no_worklog_changes().mount(server).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_syncing_without_keychain(data_dir.path())
+            .await
+            .unwrap();
+        sign_in_with(&state, server, issues).await;
+        finish_initial_sync(&state).await;
+        state.sync_waker.send(()).unwrap();
+        (data_dir, state)
+    }
+
+    /// Waits for what the engine does on its own task.
+    async fn wait_until<F: Future<Output = bool>>(what: &str, mut reached: impl FnMut() -> F) {
+        let waiting = async {
+            while !reached().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    #[tokio::test]
+    async fn the_engine_preloads_the_menus_after_a_sync_cycle() {
+        let server = MockServer::start().await;
+        in_jira("WEB-1", "To Do").mount(&server).await;
+        offers("WEB-1", &["Start"]).mount(&server).await;
+
+        let (_data_dir, state) = syncing_core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+
+        wait_until("the menu of To Do was not preloaded", || async {
+            stored_under(&state).await == ["To Do"]
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_menu_of_the_new_status_is_stored_once_jira_accepts_a_transition() {
+        let server = MockServer::start().await;
+        // The first preload reads the status twice; the transition comes after it
+        in_jira("WEB-1", "To Do")
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        offers("WEB-1", &["Start"])
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        in_jira("WEB-1", "In Progress").mount(&server).await;
+        offers("WEB-1", &["Review"]).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/WEB-1/transitions"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_data_dir, state) = syncing_core_with(&server, &[issue(1, "Bug", "To Do")]).await;
+        wait_until("the menu of To Do was not preloaded", || async {
+            stored_under(&state).await == ["To Do"]
+        })
+        .await;
+
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        // No other issue is in In Progress, and nobody opens the menu
+        wait_until("the menu of In Progress was not stored", || async {
+            stored_under(&state).await == ["In Progress", "To Do"]
+        })
+        .await;
+        drop(server);
+        assert_eq!(names(&state, "WEB-1").await, ["Review"]);
+    }
+
+    /// Jira never answers what status WEB-2 is in, so a preload never ends.
+    async fn preload_that_hangs(server: &MockServer) -> (tempfile::TempDir, Arc<AppState>) {
+        in_jira("WEB-1", "To Do").mount(server).await;
+        offers("WEB-1", &["Start"]).mount(server).await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-2"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3600)))
+            .mount(server)
+            .await;
+        let issues = [issue(1, "Bug", "To Do"), issue(2, "Bug", "In Review")];
+        let (data_dir, state) = syncing_core_with(server, &issues).await;
+        wait_until("the preload did not start", || async {
+            let requests = server.received_requests().await.unwrap();
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/rest/api/3/issue/WEB-2")
+        })
+        .await;
+        (data_dir, state)
+    }
+
+    #[tokio::test]
+    async fn a_change_made_during_a_preload_is_sent_without_waiting_for_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/WEB-1/transitions"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (_data_dir, state) = preload_that_hangs(&server).await;
+
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+
+        wait_until("the transition waited for the preload", || async {
+            let requests = server.received_requests().await.unwrap();
+            requests
+                .iter()
+                .any(|request| request.method.as_str() == "POST")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_stops_a_preload_that_waits_for_jira() {
+        let server = MockServer::start().await;
+        let (_data_dir, state) = preload_that_hangs(&server).await;
+
+        tokio::time::timeout(Duration::from_secs(5), api::sign_out(&state))
+            .await
+            .expect("the sign-out waited for the preload")
+            .unwrap();
+
+        assert_eq!(cached_entries(&state).await, 0);
     }
 }
