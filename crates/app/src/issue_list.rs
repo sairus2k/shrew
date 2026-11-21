@@ -108,7 +108,10 @@ impl IssueList {
         cx.notify();
     }
 
-    /// Moves the selection `by` rows. With nothing selected it starts at the top.
+    /// Moves the selection `by` rows. With nothing selected it starts at the
+    /// top. Beside an open issue the pane follows the selection; with none
+    /// open the keys only move the mark, so that the list can be read at its
+    /// full width.
     fn select(&mut self, by: isize, cx: &mut Context<Self>) {
         let selected = self.selected.as_ref();
         let at = selected.and_then(|key| self.issues.iter().position(|issue| &issue.key == key));
@@ -117,9 +120,16 @@ impl IssueList {
         let Some(issue) = self.issues.get(to) else {
             return;
         };
-        self.selected = Some(issue.key.clone());
+        let key = issue.key.clone();
         self.scroll.scroll_to_item(to, ScrollStrategy::Nearest);
-        cx.notify();
+        // Opening builds the pane anew, which would empty the inputs of the
+        // issue that is already open when a key hits the end of the list
+        if self.opened.as_ref().is_some_and(|opened| *opened != key) {
+            self.open(key, cx);
+        } else {
+            self.selected = Some(key);
+            cx.notify();
+        }
     }
 
     /// Opens the selected issue, or the first one when none on screen is selected.

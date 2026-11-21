@@ -62,8 +62,8 @@ pub fn init(cx: &mut App) {
 /// so the view cannot name a key that is not bound.
 fn listed() -> [(Box<dyn Action>, &'static str); 17] {
     [
-        (Box::new(SelectNext), "Select the next issue"),
-        (Box::new(SelectPrevious), "Select the previous issue"),
+        (Box::new(SelectNext), "Next issue"),
+        (Box::new(SelectPrevious), "Previous issue"),
         (Box::new(OpenSelected), "Open the selected issue"),
         (
             Box::new(Back),
@@ -323,14 +323,44 @@ mod tests {
         in_window(cx, app.window, |window, _| {
             assert_eq!(opened(window).as_deref(), Some("WEB-2"))
         });
-        // The list keeps the keys while the issue is open
-        press(cx, &app, &["j", "enter"]);
+        // With an issue open the selection takes the pane along
+        press(cx, &app, &["j"]);
         in_window(cx, app.window, |window, _| {
             assert_eq!(opened(window).as_deref(), Some("WEB-1"))
+        });
+        press(cx, &app, &["k"]);
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(opened(window).as_deref(), Some("WEB-2"))
         });
 
         press(cx, &app, &["escape"]);
         in_window(cx, app.window, |window, _| assert_eq!(opened(window), None));
+        // And without one it moves alone again
+        press(cx, &app, &["j"]);
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(selected(window).as_deref(), Some("WEB-1"));
+            assert_eq!(opened(window), None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_key_at_the_end_of_the_list_keeps_the_open_issue_and_its_unsent_comment(
+        cx: &mut TestAppContext,
+    ) {
+        let app = app(cx);
+        open_top(cx, &app);
+        in_window(cx, app.window, |window, cx| {
+            window.click("comment-input", cx);
+            window.input("Seen", cx);
+        });
+
+        // WEB-3 is the first row
+        press(cx, &app, &["escape", "k"]);
+
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(opened(window).as_deref(), Some("WEB-3"));
+            assert_eq!(window.find_by_label("New comment").value(), Some("Seen"));
+        });
     }
 
     #[gpui_kit::test]
@@ -575,8 +605,8 @@ mod tests {
         press(cx, &app, &["?"]);
 
         let listed = [
-            "J, ↓: Select the next issue",
-            "K, ↑: Select the previous issue",
+            "J, ↓: Next issue",
+            "K, ↑: Previous issue",
             "enter: Open the selected issue",
             "⎋: Leave an input or a button, then close the issue",
             "/: Search",
