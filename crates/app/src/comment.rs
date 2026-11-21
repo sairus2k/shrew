@@ -99,7 +99,7 @@ mod tests {
     use app_core::{AppState, api};
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AnyWindowHandle, TestAppContext, Window};
+    use gpui_kit::{AnyWindowHandle, ScrollDelta, TestAppContext, Window, point, px};
     use serde_json::{Value, json};
     use std::{net::TcpListener, sync::Arc};
     use wiremock::{
@@ -167,6 +167,14 @@ mod tests {
         in_window(cx, window, |window, cx| window.click("issue-WEB-1", cx));
         wait_until(cx, window, |window| {
             window.try_find("comment-input").is_some()
+        });
+        // The form is below the worklog form and the description, beyond the 600 px of the window
+        in_window(cx, window, |window, cx| {
+            window.scroll(
+                "issue-detail",
+                ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
         });
     }
 

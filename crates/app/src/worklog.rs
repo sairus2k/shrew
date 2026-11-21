@@ -151,7 +151,7 @@ mod tests {
     use crate::issue_detail::tests::painted;
     use crate::issue_list::tests::{issue, synced_on};
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{App, ScrollDelta, TestAppContext, Window, point, px};
+    use gpui_kit::{App, TestAppContext, Window};
     use serde_json::json;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
@@ -176,14 +176,6 @@ mod tests {
         wait_until(cx, window, |window| {
             window.try_find("worklog-duration").is_some()
         });
-        // The form is below the comments, beyond the 600 px of the window
-        in_window(cx, window, |window, cx| {
-            window.scroll(
-                "issue-detail",
-                ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
-                cx,
-            );
-        });
     }
 
     fn fill(window: &mut Window, cx: &mut App, id: &'static str, text: &str) {
@@ -205,6 +197,50 @@ mod tests {
         window
             .try_find("worklog-error")
             .map(|error| error.label().unwrap().to_owned())
+    }
+
+    #[gpui_kit::test]
+    fn the_form_is_in_view_on_an_issue_with_a_long_description_and_many_comments(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let mut long = issue(1, "Fix login");
+        let paragraph = json!({
+            "type": "paragraph",
+            "content": [{ "type": "text", "text": "A sentence that is repeated until it needs several lines. ".repeat(8) }],
+        });
+        long["fields"]["description"] =
+            json!({ "type": "doc", "version": 1, "content": vec![paragraph; 40] });
+        let comments: Vec<_> = (0..20)
+            .map(|index| {
+                json!({
+                    "id": index.to_string(),
+                    "author": { "accountId": "7c20b", "displayName": "Grace Hopper" },
+                    "body": { "type": "doc", "version": 1, "content": [{
+                        "type": "paragraph",
+                        "content": [{ "type": "text", "text": "Seen on staging" }],
+                    }] },
+                    "created": "2026-03-28T09:15:00.000+0100",
+                    "updated": "2026-03-28T09:15:00.000+0100",
+                })
+            })
+            .collect();
+        long["fields"]["comment"] = json!({ "total": 20, "comments": comments });
+        let data_dir = synced_on(&tokio, &server.uri(), &[long]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+
+        in_window(cx, window, |window, cx| {
+            assert!(!window.find("comment-0").visible());
+            for id in ["worklog-duration", "worklog-started", "submit-worklog"] {
+                assert!(window.find(id).visible(), "{id} is out of view");
+            }
+            fill(window, cx, "worklog-duration", "soon");
+            window.click("submit-worklog", cx);
+            window.render_frame(cx);
+            assert!(error(window).is_some());
+        });
     }
 
     #[gpui_kit::test]

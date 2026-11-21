@@ -372,6 +372,9 @@ fn body(
                 ))
                 .child(field("detail-labels", "Labels", &labels, cx)),
         )
+        // Logging time is a main action, so its form stays above the description and
+        // the comments, where a long issue does not push it out of view
+        .child(worklog_form)
         .child(if issue.description_md.is_empty() {
             div()
                 .id("no-description")
@@ -413,7 +416,6 @@ fn body(
                 .text_lg()
                 .child("Worklogs"),
         )
-        .child(worklog_form)
         .children(issue.worklogs.is_empty().then(|| {
             div()
                 .id("no-worklogs")
