@@ -218,7 +218,7 @@ mod tests {
     use std::{path::Path, time::Duration};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_partial_json, method, path},
+        matchers::{body_partial_json, method, path, path_regex},
     };
 
     #[gpui_kit::test]
@@ -338,7 +338,7 @@ mod tests {
     const WEB_LOGIN: &str = "WEB-1: Fix login, To Do, Unassigned";
     const API_LOGIN: &str = "API-101: Login endpoint, To Do, Unassigned";
 
-    /// The issues of API that Jira has, one page.
+    /// The issues of API that Jira has, one page, with no worklogs.
     fn mount_api(tokio: &tokio::runtime::Runtime, server: &MockServer, response: ResponseTemplate) {
         tokio.block_on(async {
             Mock::given(path("/rest/api/3/search/approximate-count"))
@@ -350,6 +350,14 @@ mod tests {
                     json!({ "jql": "project = \"API\" ORDER BY updated DESC" }),
                 ))
                 .respond_with(response)
+                .mount(server)
+                .await;
+            // An issue that enters the cache is asked for its existing worklogs
+            Mock::given(path_regex(r"^/rest/api/3/issue/API-\d+/worklog$"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "startAt": 0, "total": 0, "worklogs": [] })),
+                )
                 .mount(server)
                 .await;
         });

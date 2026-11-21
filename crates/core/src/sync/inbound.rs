@@ -180,6 +180,17 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             let page = client
                 .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
                 .await?;
+            let records: Vec<IssueRecord> = page
+                .issues
+                .iter()
+                .filter_map(|issue| readable_record(state, issue))
+                .collect();
+            // The worklog poll of the first setup starts from zero and brings
+            // them all; one that has moved on never will
+            let listed = match config.last_sync_at {
+                Some(_) => worklogs_of(&client, records.iter()).await?,
+                None => Vec::new(),
+            };
             // Held until the commit, as in `poll_updated_issues`: a page is
             // either stored before `watch_projects` deletes the rows of a
             // removed project or not stored at all
@@ -193,12 +204,11 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             // One transaction per page: a commit per issue would make the disk
             // the slowest part of the sync
             let mut tx = state.pool.begin().await?;
-            for issue in &page.issues {
-                if let Some(record) = readable_record(state, issue) {
-                    issues::upsert(&mut *tx, &record).await?;
-                    synced += 1;
-                }
+            for record in &records {
+                issues::upsert(&mut *tx, record).await?;
+                synced += 1;
             }
+            store_worklogs(state, &mut tx, &listed, &mut Vec::new()).await?;
             tx.commit().await?;
             drop(saved);
             report(synced);
@@ -246,6 +256,18 @@ pub(crate) async fn poll_updated_issues(
         let page = client
             .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
             .await?;
+        let records: Vec<IssueRecord> = page
+            .issues
+            .iter()
+            .filter_map(|issue| readable_record(state, issue))
+            .collect();
+        let mut entering = Vec::new();
+        for record in &records {
+            if issues::key_of(&state.pool, &record.id).await?.is_none() {
+                entering.push(record);
+            }
+        }
+        let listed = worklogs_of(&client, entering.into_iter()).await?;
         let mut written = Vec::new();
         // Held until the commit: `watch_projects` changes the list and deletes
         // the rows of a removed project under the write lock, so a page is
@@ -253,10 +275,7 @@ pub(crate) async fn poll_updated_issues(
         let saved = state.config.read().await;
         let watched = saved.as_ref().map_or(&[][..], |c| &c.watched_projects[..]);
         let mut tx = state.pool.begin().await?;
-        for issue in &page.issues {
-            let Some(record) = readable_record(state, issue) else {
-                continue;
-            };
+        for record in records {
             if !watched.contains(&record.project_key) {
                 continue;
             }
@@ -273,6 +292,7 @@ pub(crate) async fn poll_updated_issues(
                 written.extend(moved_from);
             }
         }
+        store_worklogs(state, &mut tx, &listed, &mut Vec::new()).await?;
         tx.commit().await?;
         drop(saved);
         changed.extend(written);
@@ -346,6 +366,51 @@ fn remote_worklog(worklog: &Value) -> anyhow::Result<RemoteWorklog> {
     })
 }
 
+/// Stores the worklogs as Jira sent them, those of issues the cache has. The
+/// keys of the issues whose worklogs were written are added to `changed`.
+async fn store_worklogs(
+    state: &AppState,
+    conn: &mut sqlx::SqliteConnection,
+    listed: &[Value],
+    changed: &mut Vec<IssueKey>,
+) -> anyhow::Result<()> {
+    for worklog in listed {
+        // An unreadable worklog is announced and left out, as an unreadable issue is
+        let record = match remote_worklog(worklog) {
+            Ok(record) => record,
+            Err(error) => {
+                let skipped = SyncEvent::IssueSkipped {
+                    key: format!("worklog {}", worklog["id"].as_str().unwrap_or("unknown")),
+                    reason: format!("{error:#}"),
+                };
+                state.events.send(skipped).ok();
+                continue;
+            }
+        };
+        if let Some(key) = worklogs::upsert_remote(conn, &record).await?
+            && !changed.contains(&key)
+        {
+            changed.push(key);
+        }
+    }
+    Ok(())
+}
+
+/// The worklogs of the issues on a page, asked for before the page is stored: a
+/// failure then leaves the page unstored, and the next poll brings it again.
+/// `worklog/updated` reports changes only, so an issue that enters the cache
+/// after the first worklog poll gets its existing worklogs from here.
+async fn worklogs_of(
+    client: &JiraClient,
+    records: impl Iterator<Item = &IssueRecord>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut listed = Vec::new();
+    for record in records {
+        listed.extend(client.issue_worklogs(&record.key).await?);
+    }
+    Ok(listed)
+}
+
 /// Stores the worklogs Jira changed since the last poll, those of issues the
 /// cache has, and moves the saved time forward. The keys of the issues whose
 /// worklogs were written are added to `changed`.
@@ -369,25 +434,7 @@ pub(crate) async fn poll_updated_worklogs(
             client.worklogs(&ids).await?
         };
         let mut tx = state.pool.begin().await?;
-        for worklog in &listed {
-            // An unreadable worklog is announced and left out, as an unreadable issue is
-            let record = match remote_worklog(worklog) {
-                Ok(record) => record,
-                Err(error) => {
-                    let skipped = SyncEvent::IssueSkipped {
-                        key: format!("worklog {}", worklog["id"].as_str().unwrap_or("unknown")),
-                        reason: format!("{error:#}"),
-                    };
-                    state.events.send(skipped).ok();
-                    continue;
-                }
-            };
-            if let Some(key) = worklogs::upsert_remote(&mut tx, &record).await?
-                && !changed.contains(&key)
-            {
-                changed.push(key);
-            }
-        }
+        store_worklogs(state, &mut tx, &listed, changed).await?;
         tx.commit().await?;
         // Jira's time, not the local clock: the next poll asks from where this one ended
         since = page.until.max(since);
@@ -554,7 +601,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, method, path, query_param},
+        matchers::{body_json, method, path, path_regex, query_param},
     };
 
     fn issue(id: u32, project: &str) -> Value {
@@ -619,6 +666,18 @@ mod tests {
             body["nextPageToken"] = json!(token);
         }
         ResponseTemplate::new(200).set_body_json(body)
+    }
+
+    /// Issues with no worklogs: what Jira answers for every issue a test does not
+    /// give worklogs to. A mock of a test's own has a higher priority.
+    fn no_issue_worklogs() -> Mock {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/rest/api/3/issue/[A-Z]+-\d+/worklog$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "startAt": 0, "total": 0, "worklogs": [] })),
+            )
+            .with_priority(10)
     }
 
     /// A core that is signed in to `server` and watches `projects`.
@@ -895,6 +954,7 @@ mod tests {
         assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
         mount_count(&server, "API", 1).await;
         mount_page(&server, "API", None, page(&[issue(3, "API")], None)).await;
+        no_issue_worklogs().mount(&server).await;
 
         api::initial_sync(&state).await.unwrap();
 
@@ -918,6 +978,7 @@ mod tests {
         mount_count(&server, "API", 2).await;
         mount_page(&server, "API", None, page(&[issue(3, "API")], Some("tok"))).await;
         mount_page(&server, "API", Some("tok"), ResponseTemplate::new(503)).await;
+        no_issue_worklogs().mount(&server).await;
 
         let error = api::initial_sync(&state).await.unwrap_err();
 
@@ -929,6 +990,7 @@ mod tests {
         mount_count(&server, "API", 2).await;
         mount_page(&server, "API", None, page(&[issue(3, "API")], Some("tok"))).await;
         mount_page(&server, "API", Some("tok"), page(&[issue(4, "API")], None)).await;
+        no_issue_worklogs().mount(&server).await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
         assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
@@ -1002,6 +1064,7 @@ mod tests {
         received(&mut events);
         listing(ids(1..10)).mount(server).await;
         crate::sync::no_worklog_changes().mount(server).await;
+        no_issue_worklogs().mount(server).await;
         (state, events)
     }
 
@@ -1558,6 +1621,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "synced");
+    }
+
+    /// Jira's answer to `GET /issue/{key}/worklog`, one page of `total` worklogs.
+    fn issue_worklogs(key: &str, start_at: usize, total: usize, worklogs: &[Value]) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/api/3/issue/{key}/worklog")))
+            .and(query_param("startAt", start_at.to_string()))
+            .and(query_param("expand", "properties"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "startAt": start_at, "total": total, "worklogs": worklogs }),
+            ))
+            .expect(1)
+    }
+
+    #[tokio::test]
+    async fn the_worklogs_of_a_project_added_after_setup_are_stored_once() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        // WEB is cached already: asking Jira for the worklogs of its issues would get a 404
+        let (state, mut events) = downloaded(&server, data_dir.path(), &["WEB"]).await;
+        api::watch_projects(&state, &["WEB".to_owned(), "API".to_owned()])
+            .await
+            .unwrap();
+        mount_count(&server, "API", 1).await;
+        mount_page(&server, "API", None, page(&[issue(3, "API")], None)).await;
+        issue_worklogs("API-3", 0, 1, &[jira_worklog("31", "3", 1800)])
+            .mount(&server)
+            .await;
+
+        api::initial_sync(&state).await.unwrap();
+
+        let rows = stored_worklogs(&state).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].2), ("API-3", 1800));
+
+        // The worklog poll that follows reports the same worklog: still one row
+        received(&mut events);
+        listing(ids(1..10)).mount(&server).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        worklogs_updated(0, &[31], 9_000, true).mount(&server).await;
+        worklog_list(&[31], &[jira_worklog("31", "3", 1800)])
+            .mount(&server)
+            .await;
+        crate::sync::no_worklog_changes().mount(&server).await;
+        state.sync_waker.send(()).unwrap();
+        cycle(&mut events).await;
+
+        assert_eq!(stored_worklogs(&state).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_worklogs_of_an_issue_created_after_setup_are_stored_with_the_issue() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[issue(1, "WEB"), issue(5, "API")], None))
+            .mount(&server)
+            .await;
+        // Two pages of worklogs; WEB-1 is cached, so only API-5 is asked
+        issue_worklogs("API-5", 0, 2, &[jira_worklog("51", "5", 60)])
+            .mount(&server)
+            .await;
+        issue_worklogs("API-5", 1, 2, &[jira_worklog("52", "5", 120)])
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("API-5")])"#,
+                "Completed"
+            ]
+        );
+        let rows = stored_worklogs(&state).await;
+        let seconds: Vec<_> = rows.iter().map(|row| (row.0.as_str(), row.2)).collect();
+        assert_eq!(seconds, [("API-5", 60), ("API-5", 120)]);
+    }
+
+    #[tokio::test]
+    async fn an_issue_whose_worklogs_cannot_be_read_is_stored_again_by_the_next_poll() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[issue(5, "API")], None))
+            .mount(&server)
+            .await;
+        Mock::given(path("/rest/api/3/issue/API-5/worklog"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+        let failed = cycle(&mut events).await;
+
+        assert!(failed.last().unwrap().starts_with("Error"), "{failed:?}");
+        assert_eq!(stored_keys(&state).await, ["WEB-1"]);
+
+        issue_worklogs("API-5", 0, 1, &[jira_worklog("51", "5", 60)])
+            .mount(&server)
+            .await;
+        state.sync_waker.send(()).unwrap();
+        cycle(&mut events).await;
+
+        assert_eq!(stored_keys(&state).await, ["API-5", "WEB-1"]);
+        assert_eq!(stored_worklogs(&state).await.len(), 1);
     }
 
     #[tokio::test]

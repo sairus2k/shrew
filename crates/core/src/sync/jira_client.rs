@@ -390,6 +390,33 @@ impl JiraClient {
         self.send(request).await
     }
 
+    /// Every worklog of the issue with its properties, as Jira sent them. For an
+    /// issue the cache has just got: `updated_worklogs` reports changes only.
+    pub(crate) async fn issue_worklogs(&self, key: &IssueKey) -> Result<Vec<Value>, JiraError> {
+        #[derive(Deserialize)]
+        struct Page {
+            total: usize,
+            worklogs: Vec<Value>,
+        }
+        let mut worklogs = Vec::new();
+        loop {
+            let request = self
+                .http
+                .get(self.url(&format!("/issue/{key}/worklog")))
+                .query(&[
+                    ("startAt", worklogs.len().to_string()),
+                    ("maxResults", "1000".to_owned()),
+                    ("expand", "properties".to_owned()),
+                ]);
+            let page: Page = self.send(request).await?;
+            let empty = page.worklogs.is_empty();
+            worklogs.extend(page.worklogs);
+            if empty || worklogs.len() >= page.total {
+                return Ok(worklogs);
+            }
+        }
+    }
+
     /// The worklogs with these ids and their properties, as Jira sent them.
     /// Jira takes at most a thousand ids, which is also the size of a page of
     /// `updated_worklogs`.
