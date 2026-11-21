@@ -35,8 +35,9 @@ pub(crate) async fn start(
 /// Turns the timer into a worklog for the time up to `stopped_at` and deletes
 /// it, in one transaction: a crash leaves the timer running or the worklog
 /// logged, never both and never neither. Returns the issue that got the
-/// worklog. A timer that ran for no time, as one does when the clock was set
-/// back, is deleted and logs nothing.
+/// worklog. A timer that ran for less than the shortest worklog Jira takes,
+/// as an accidental start does or one whose clock was set back, is deleted
+/// and logs nothing.
 pub(crate) async fn stop(
     pool: &sqlx::SqlitePool,
     stopped_at: i64,
@@ -54,7 +55,7 @@ pub(crate) async fn stop(
         started_at,
     };
     let time_spent_sec = i64::try_from(timer.elapsed_secs(stopped_at))?;
-    if time_spent_sec == 0 {
+    if time_spent_sec < worklogs::MIN_TIME_SPENT_SEC {
         tx.commit().await?;
         return Ok(None);
     }
@@ -192,6 +193,29 @@ mod tests {
         assert_eq!(stop(&pool, 1_774_771_290).await.unwrap(), None);
         assert!(worklogs(&pool).await.is_empty());
         assert!(queue(&pool).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn a_timer_stopped_within_its_first_minute_logs_nothing(pool: SqlitePool) {
+        start(&pool, &timer("WEB-1", 1_774_771_200)).await.unwrap();
+
+        assert_eq!(stop(&pool, 1_774_771_259).await.unwrap(), None);
+
+        assert_eq!(get(&pool).await.unwrap(), None);
+        assert!(worklogs(&pool).await.is_empty());
+        assert!(queue(&pool).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn a_timer_stopped_after_a_minute_logs_it(pool: SqlitePool) {
+        start(&pool, &timer("WEB-1", 1_774_771_200)).await.unwrap();
+
+        assert_eq!(
+            stop(&pool, 1_774_771_260).await.unwrap(),
+            Some("WEB-1".into())
+        );
+
+        assert_eq!(worklogs(&pool).await[0].1, 60);
     }
 
     #[sqlx::test]

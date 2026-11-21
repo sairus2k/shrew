@@ -3,6 +3,9 @@
 use crate::models::{IssueKey, SyncStatus, Worklog};
 use chrono::{DateTime, SecondsFormat, Utc};
 
+/// Jira refuses a worklog shorter than this ("You must indicate the time spent working").
+pub(crate) const MIN_TIME_SPENT_SEC: i64 = 60;
+
 /// A worklog logged here. `started_at` is UTC with a fixed width.
 pub(crate) struct NewWorklog {
     pub issue_key: IssueKey,

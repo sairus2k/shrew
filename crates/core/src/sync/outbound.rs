@@ -1216,10 +1216,13 @@ mod tests {
         store_issue(&state).await;
 
         let unknown = api::log_time(&state, &"WEB-9".into(), 60, STARTED, None).await;
-        let zero = api::log_time(&state, &"WEB-1".into(), 0, STARTED, None).await;
+        let too_short = api::log_time(&state, &"WEB-1".into(), 59, STARTED, None).await;
 
         assert_eq!(unknown.unwrap_err().to_string(), "issue WEB-9 not found");
-        assert!(zero.is_err());
+        assert_eq!(
+            too_short.unwrap_err().to_string(),
+            "the time spent cannot be less than a minute"
+        );
         let rows: i64 = sqlx::query_scalar(
             "SELECT (SELECT COUNT(*) FROM worklogs) + (SELECT COUNT(*) FROM sync_queue)",
         )

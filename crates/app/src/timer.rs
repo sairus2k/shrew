@@ -271,7 +271,9 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_timer_counts_every_second_and_stopping_it_logs_a_pending_worklog(cx: &mut TestAppContext) {
+    fn a_timer_counts_every_second_and_stopped_within_a_minute_it_logs_nothing(
+        cx: &mut TestAppContext,
+    ) {
         let tokio = tokio_runtime();
         let server = tokio.block_on(jira());
         let data_dir = synced_on(
@@ -303,12 +305,38 @@ mod tests {
         wait_until(cx, window, |window| {
             window.try_find("start-timer").is_some() && elapsed(window).is_none()
         });
+        wait_until(cx, window, |_| running(&tokio, &state).is_none());
+        // Jira takes no worklog shorter than a minute
+        let key: IssueKey = "WEB-1".into();
+        let issue = tokio.block_on(api::get_issue(&state, &key)).unwrap();
+        assert!(issue.worklogs.is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn stopping_a_timer_logs_its_time_as_a_pending_worklog(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let data_dir = synced_on(
+            &tokio,
+            &server.uri(),
+            &[issue(1, "Fix login"), issue(2, "Broken checkout")],
+        );
+        running_since(&tokio, data_dir.path(), unix_now() - 6_000);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        wait_until(cx, window, |window| window.try_find("stop-timer").is_some());
+
+        click(cx, window, "stop-timer");
+        wait_until(cx, window, |window| {
+            window.try_find("start-timer").is_some() && elapsed(window).is_none()
+        });
         scroll_to_worklogs(cx, window);
         wait_until(cx, window, |window| {
             worklog_lines(window)
                 .iter()
-                .any(|line| line.starts_with("You, ") && line.ends_with(", <1m, pending"))
+                .any(|line| line.starts_with("You, ") && line.ends_with(", 1h 40m, pending"))
         });
+        let state = state(cx);
         assert_eq!(running(&tokio, &state), None);
     }
 

@@ -383,7 +383,7 @@ pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow
 /// Logs time on the issue, locally and at once: Jira gets the worklog from
 /// the outbox, with the `started_at` given here however late it is delivered.
 /// `started_at` is Unix seconds. The comment is trimmed and left out when
-/// empty. Zero time, and an issue the cache does not have, are refused.
+/// empty. Less than a minute, and an issue the cache does not have, are refused.
 pub async fn log_time(
     state: &AppState,
     key: &IssueKey,
@@ -391,8 +391,8 @@ pub async fn log_time(
     started_at: i64,
     comment: Option<&str>,
 ) -> anyhow::Result<()> {
-    if time_spent_secs == 0 {
-        bail!("the time spent cannot be zero");
+    if time_spent_secs < db::worklogs::MIN_TIME_SPENT_SEC as u64 {
+        bail!("the time spent cannot be less than a minute");
     }
     let started_at =
         db::worklogs::started_at_from_unix(started_at).context("the start time is out of range")?;
