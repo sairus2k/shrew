@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "neither auth nor the sync engine calls Jira yet")
-)]
-
 use crate::models::IssueKey;
 use reqwest::{RequestBuilder, Response, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -51,7 +46,6 @@ impl From<reqwest::Error> for JiraError {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Myself {
     pub account_id: String,
-    pub display_name: String,
     /// The IANA name of the profile's time zone, such as `Europe/Paris`.
     #[serde(default)]
     pub time_zone: Option<String>,
@@ -66,7 +60,6 @@ pub(crate) struct JiraUser {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct Project {
-    pub id: String,
     pub key: String,
     pub name: String,
 }
@@ -227,22 +220,6 @@ impl JiraClient {
             projects.extend(page.values);
             if done {
                 return Ok(projects);
-            }
-        }
-    }
-
-    /// Returns the issues of all pages as Jira sent them, with only `fields` filled in.
-    pub(crate) async fn search(&self, jql: &str, fields: &[&str]) -> Result<Vec<Value>, JiraError> {
-        let mut issues = Vec::new();
-        let mut next_page_token = None;
-        loop {
-            let page = self
-                .search_page(jql, fields, next_page_token.as_deref())
-                .await?;
-            issues.extend(page.issues);
-            next_page_token = page.next_page_token;
-            if next_page_token.is_none() {
-                return Ok(issues);
             }
         }
     }
@@ -557,17 +534,16 @@ mod tests {
 
         let myself = client.myself().await.unwrap();
         assert_eq!(myself.account_id, "abc");
-        assert_eq!(myself.display_name, "Dev");
         let projects = client.projects().await.unwrap();
         assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].id, "10000");
         assert_eq!(projects[0].key, "PROJ");
         assert_eq!(projects[0].name, "Project");
         assert_eq!(
             client
-                .search("project = PROJ", &["summary"])
+                .search_page("project = PROJ", &["summary"], None)
                 .await
                 .unwrap()
+                .issues
                 .len(),
             1
         );
@@ -607,7 +583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_follows_next_page_token_and_returns_all_pages() {
+    async fn search_page_returns_the_token_of_the_next_page_and_sends_it_back() {
         let server = MockServer::start().await;
         let jql = "project IN (PROJ)";
         Mock::given(path("/rest/api/3/search/jql"))
@@ -632,9 +608,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let found = client(&server).search(jql, &["summary"]).await.unwrap();
+        let client = client(&server);
+        let first = client.search_page(jql, &["summary"], None).await.unwrap();
+        let second = client
+            .search_page(jql, &["summary"], first.next_page_token.as_deref())
+            .await
+            .unwrap();
 
-        assert_eq!(found, issues(0..150));
+        assert_eq!(first.issues, issues(0..100));
+        assert_eq!(second.issues, issues(100..150));
+        assert_eq!(second.next_page_token, None);
     }
 
     #[tokio::test]
