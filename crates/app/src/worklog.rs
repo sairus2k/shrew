@@ -5,8 +5,8 @@ use crate::runtime::spawn;
 use app_core::{api, models::IssueKey};
 use chrono::Local;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Sizable, WindowExt as _,
-    button::{Button, ButtonVariants},
+    ActiveTheme, Disableable, WindowExt as _,
+    button::Button,
     input::{Input, InputState},
     notification::Notification,
 };
@@ -102,25 +102,31 @@ impl Render for WorklogForm {
                     .w_full()
                     .gap_2()
                     .child(
-                        div().w(px(120.)).child(
+                        div().w(px(90.)).flex_none().child(
                             Input::new(&self.duration)
                                 .id("worklog-duration")
                                 .aria_label("Time spent"),
                         ),
                     )
                     .child(
-                        div().w(px(180.)).child(
+                        div().w(px(150.)).flex_none().child(
                             Input::new(&self.started)
                                 .id("worklog-started")
                                 .aria_label("Started"),
                         ),
                     )
                     .child(
-                        div().flex_1().child(
+                        div().flex_1().min_w_0().child(
                             Input::new(&self.comment)
                                 .id("worklog-comment-input")
                                 .aria_label("Worklog comment"),
                         ),
+                    )
+                    .child(
+                        Button::new("submit-worklog")
+                            .label("Log time")
+                            .disabled(self.sending)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
             .children(self.error.map(|error| {
@@ -133,14 +139,6 @@ impl Render for WorklogForm {
                     .text_color(cx.theme().danger)
                     .child(error)
             }))
-            .child(
-                Button::new("submit-worklog")
-                    .primary()
-                    .small()
-                    .label("Log time")
-                    .disabled(self.sending)
-                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-            )
     }
 }
 

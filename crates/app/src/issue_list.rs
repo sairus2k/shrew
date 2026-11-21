@@ -1,6 +1,7 @@
 //! The main screen: the cached issues and the search over them.
 
 use crate::runtime::{Core, spawn};
+use crate::theme::{status_dot, tabular_digits};
 use app_core::{
     SyncEvent, api,
     models::{IssueKey, IssueRow, StatusCategory, SyncStatus},
@@ -137,6 +138,8 @@ fn row(
     cx: &mut Context<IssueList>,
 ) -> impl IntoElement + use<> {
     let muted = cx.theme().muted_foreground;
+    let hover = cx.theme().list_hover;
+    let done = issue.status_category == StatusCategory::Done;
     let key = issue.key.clone();
     let assignee = issue.assignee_name.as_deref().unwrap_or("Unassigned");
     // The status is the user's own change and Jira does not have it yet
@@ -160,15 +163,19 @@ fn row(
         .flex()
         .items_center()
         .gap_3()
-        .when(opened == Some(&issue.key), |row| {
-            row.bg(cx.theme().list_active)
+        .cursor_pointer()
+        .map(|row| match opened == Some(&issue.key) {
+            true => row.bg(cx.theme().list_active),
+            false => row.hover(|row| row.bg(hover)),
         })
         .on_click(cx.listener(move |this, _, _, cx| this.open(key.clone(), cx)))
+        .child(status_dot(issue.status_category, cx))
         .child(
             div()
-                .w(px(96.))
+                .w(px(KEY_WIDTH))
                 .flex_none()
                 .truncate()
+                .font_features(tabular_digits())
                 .text_color(muted)
                 .child(issue.key.to_string()),
         )
@@ -177,6 +184,7 @@ fn row(
                 .flex_1()
                 .min_w_0()
                 .truncate()
+                .when(done, |summary| summary.text_color(muted))
                 .child(issue.summary.clone()),
         )
         // Beside an open issue the list is too narrow for these two, and the
@@ -184,13 +192,10 @@ fn row(
         .when(opened.is_none(), |row| {
             row.child(
                 div()
-                    .w(px(120.))
+                    .w(px(STATUS_WIDTH))
                     .flex_none()
                     .truncate()
-                    .text_color(match issue.status_category {
-                        StatusCategory::Done => muted,
-                        StatusCategory::Todo | StatusCategory::InProgress => cx.theme().foreground,
-                    })
+                    .text_color(if done { muted } else { cx.theme().foreground })
                     .child(if pending {
                         format!("↑ {}", issue.status)
                     } else {
@@ -199,13 +204,38 @@ fn row(
             )
             .child(
                 div()
-                    .w(px(140.))
+                    .w(px(ASSIGNEE_WIDTH))
                     .flex_none()
                     .truncate()
                     .text_color(muted)
                     .child(assignee.to_owned()),
             )
         })
+}
+
+const KEY_WIDTH: f32 = 96.;
+const STATUS_WIDTH: f32 = 120.;
+const ASSIGNEE_WIDTH: f32 = 140.;
+
+/// The names of the columns, over a list wide enough to show them all.
+fn column_names(cx: &App) -> impl IntoElement {
+    div()
+        .h(px(24.))
+        .flex_none()
+        .px_4()
+        .flex()
+        .items_center()
+        .gap_3()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .text_size(px(11.))
+        .text_color(cx.theme().muted_foreground)
+        // The dot of the status stands before the key
+        .child(div().w(px(8.)).flex_none())
+        .child(div().w(px(KEY_WIDTH)).flex_none().child("KEY"))
+        .child(div().flex_1().min_w_0().child("SUMMARY"))
+        .child(div().w(px(STATUS_WIDTH)).flex_none().child("STATUS"))
+        .child(div().w(px(ASSIGNEE_WIDTH)).flex_none().child("ASSIGNEE"))
 }
 
 impl Render for IssueList {
@@ -251,6 +281,7 @@ impl Render for IssueList {
                         )
                     }),
             )
+            .children(self.opened.is_none().then(|| column_names(cx)))
             .child(
                 // Only the rows in view are built, so the cost of a frame does
                 // not grow with the number of issues

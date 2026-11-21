@@ -5,6 +5,7 @@ use crate::runtime::spawn;
 use app_core::{api, models::User};
 use gpui_kit::component::{
     Disableable, Sizable, WindowExt as _,
+    avatar::Avatar,
     button::Button,
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
@@ -107,9 +108,18 @@ impl Render for AssigneeButton {
             .and_then(|detail| detail.assignee_name.clone())
             .unwrap_or_else(|| "Unassigned".to_owned());
 
+        let assigned = self.issue.read(cx).detail.as_ref();
+        let avatar = assigned
+            .and_then(|detail| detail.assignee_name.clone())
+            .map(|name| Avatar::new().name(name).xsmall());
+
         Button::new("assignee-button")
             .small()
-            .label(assignee)
+            .outline()
+            .dropdown_caret(true)
+            .accessibility_label(assignee.clone())
+            .children(avatar)
+            .child(assignee)
             .disabled(people.is_empty())
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu.scrollable(true).max_h(px(320.));

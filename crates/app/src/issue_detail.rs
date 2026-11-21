@@ -5,6 +5,7 @@ use crate::comment::CommentForm;
 use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
+use crate::theme::{badge, tabular_digits};
 use crate::timer::{ActiveTimer, TimerControl};
 use crate::transition::StatusButton;
 use crate::worklog::WorklogForm;
@@ -12,8 +13,10 @@ use app_core::{
     api,
     models::{Comment, IssueDetail, SyncStatus, Worklog},
 };
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme, Sizable,
+    avatar::Avatar,
     button::{Button, ButtonVariants},
     text::{MarkdownExtensions, MarkdownNode, TextView, TextViewStyle, markdown_ast},
 };
@@ -76,12 +79,14 @@ fn field_line(
         .id(id)
         .test_support()
         .aria_label(format!("{name}: {value}"))
+        .min_h(px(24.))
+        .min_w_0()
         .flex()
         .items_center()
         .gap_3()
         .child(
             div()
-                .w(px(80.))
+                .w(px(72.))
                 .flex_none()
                 .text_color(cx.theme().muted_foreground)
                 .child(name.to_owned()),
@@ -141,28 +146,56 @@ fn code_block(node: &MarkdownNode, _: &mut Window, _: &mut App) -> Stateful<Div>
         .child(div().flex_none().child(code))
 }
 
-fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
-    let when = if comment.pending {
-        "pending".to_owned()
-    } else if comment.rejected.is_some() {
-        "not sent".to_owned()
-    } else {
-        minute(&comment.created)
-    };
-    let heading = format!("{}, {when}", comment.author_name);
+/// A comment or a worklog: the picture of its author, and beside it the
+/// `lines`, the first of which is the heading.
+fn entry(author: &str, lines: Div) -> impl IntoElement {
     div()
         .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .id(SharedString::from(format!("comment-{index}")))
-                .test_support()
-                .aria_label(heading.clone())
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(heading),
-        )
+        .gap_2p5()
+        .child(Avatar::new().name(author.to_owned()).small().flex_none())
+        .child(lines.flex_1().min_w_0().flex().flex_col().gap_1())
+}
+
+/// The first line of an entry, with the author in it. Tests read `label`.
+fn heading(id: String, label: String, author: &str) -> impl IntoElement + ParentElement {
+    div()
+        .id(SharedString::from(id))
+        .test_support()
+        .aria_label(label)
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().font_semibold().child(author.to_owned()))
+}
+
+fn when(time: String, cx: &App) -> impl IntoElement {
+    div()
+        .text_size(px(12.))
+        .font_features(tabular_digits())
+        .text_color(cx.theme().muted_foreground)
+        .child(time)
+}
+
+fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
+    let state = if comment.pending {
+        Some("Pending")
+    } else if comment.rejected.is_some() {
+        Some("Not sent")
+    } else {
+        None
+    };
+    let time = minute(&comment.created);
+    let label = match state {
+        Some(state) => format!("{}, {}", comment.author_name, state.to_lowercase()),
+        None => format!("{}, {time}", comment.author_name),
+    };
+    let heading = heading(format!("comment-{index}"), label, &comment.author_name);
+    let heading = match state {
+        Some(state) => heading.child(badge(state, cx)),
+        None => heading.child(when(time, cx)),
+    };
+    let lines = div()
+        .child(heading)
         .child(markdown(("comment-body", index), &comment.body_md))
         .children(comment.rejected.as_ref().map(|rejected| {
             refused(
@@ -171,34 +204,34 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
                 &rejected.reason,
                 cx,
             )
-        }))
+        }));
+    entry(&comment.author_name, lines)
 }
 
 fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
-    let mut heading = format!(
-        "{}, {}, {}",
-        worklog.author_name,
-        local_minute(worklog.started_at),
-        format_duration(worklog.time_spent_secs)
-    );
-    match worklog.status {
-        SyncStatus::Synced => {}
-        SyncStatus::Pending => heading.push_str(", pending"),
-        SyncStatus::Failed => heading.push_str(", not sent"),
+    let started = local_minute(worklog.started_at);
+    let spent = format_duration(worklog.time_spent_secs);
+    let state = match worklog.status {
+        SyncStatus::Synced => None,
+        SyncStatus::Pending => Some("Pending"),
+        SyncStatus::Failed => Some("Not sent"),
+    };
+    let mut label = format!("{}, {started}, {spent}", worklog.author_name);
+    if let Some(state) = state {
+        label.push_str(&format!(", {}", state.to_lowercase()));
     }
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
+    let heading = heading(format!("worklog-{index}"), label, &worklog.author_name)
+        .child(when(started, cx))
+        .children(state.map(|state| badge(state, cx)))
         .child(
             div()
-                .id(SharedString::from(format!("worklog-{index}")))
-                .test_support()
-                .aria_label(heading.clone())
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(heading),
-        )
+                .ml_auto()
+                .font_semibold()
+                .font_features(tabular_digits())
+                .child(spent),
+        );
+    let lines = div()
+        .child(heading)
         .children(
             worklog
                 .comment
@@ -212,7 +245,8 @@ fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
                 &rejected.reason,
                 cx,
             )
-        }))
+        }));
+    entry(&worklog.author_name, lines)
 }
 
 /// A change that was refused, by its outbox entry.
@@ -291,6 +325,35 @@ fn refused(index: usize, refused: Refused, reason: &str, cx: &App) -> impl IntoE
         )
 }
 
+/// The title of the comments or of the worklogs, with how many there are.
+fn section_title(
+    id: &'static str,
+    label: String,
+    title: &'static str,
+    count: Option<String>,
+    cx: &App,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_2()
+        .child(
+            div()
+                .id(id)
+                .test_support()
+                .aria_label(label)
+                .text_size(px(14.))
+                .font_semibold()
+                .child(title),
+        )
+        .children(count.map(|count| {
+            div()
+                .text_size(px(12.))
+                .text_color(cx.theme().muted_foreground)
+                .child(count)
+        }))
+}
+
 fn body(
     issue: &IssueDetail,
     status: Entity<StatusButton>,
@@ -307,35 +370,40 @@ fn body(
         issue.labels.join(", ")
     };
     let assignee = issue.assignee_name.as_deref().unwrap_or("Unassigned");
-    let comments_heading = if issue.comments.len() < issue.comment_total {
+    let shown = issue.comments.len();
+    let (comments_heading, comment_count) = if shown < issue.comment_total {
         // Jira sends only part of a long thread with a search page
-        format!(
-            "Comments ({} of {})",
-            issue.comments.len(),
-            issue.comment_total
-        )
+        let part = format!("{shown} of {}", issue.comment_total);
+        (format!("Comments ({part})"), Some(part))
     } else {
-        "Comments".to_owned()
+        (
+            "Comments".to_owned(),
+            (shown > 0).then(|| shown.to_string()),
+        )
     };
+    let worklog_count = (!issue.worklogs.is_empty()).then(|| issue.worklogs.len().to_string());
 
-    div()
+    let about = div()
+        .px_5()
+        .pb_4()
         .flex()
         .flex_col()
-        .gap_4()
+        .gap_3p5()
         .child(
             div()
                 .id("detail-summary")
                 .test_support()
                 .aria_label(issue.summary.clone())
-                .text_xl()
+                .text_size(px(19.))
+                .font_semibold()
                 .child(issue.summary.clone()),
         )
         .child(
             div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .text_sm()
+                .grid()
+                .grid_cols(2)
+                .gap_x_6()
+                .gap_y_1p5()
                 .child(
                     field_line("detail-status", "Status", &issue.status, cx)
                         .child(status)
@@ -345,23 +413,22 @@ fn body(
                                 .id("sync-badge")
                                 .test_support()
                                 .aria_label("Pending")
-                                .text_color(muted)
-                                .child("Pending")
+                                .child(badge("Pending", cx))
                         })),
                 )
                 .child(
                     field_line("detail-assignee", "Assignee", assignee, cx).child(assignee_button),
                 )
                 .child(field(
-                    "detail-reporter",
-                    "Reporter",
-                    &or_none(&issue.reporter_name),
-                    cx,
-                ))
-                .child(field(
                     "detail-type",
                     "Type",
                     &or_none(&issue.issue_type),
+                    cx,
+                ))
+                .child(field(
+                    "detail-reporter",
+                    "Reporter",
+                    &or_none(&issue.reporter_name),
                     cx,
                 ))
                 .child(field(
@@ -384,15 +451,20 @@ fn body(
                 .into_any_element()
         } else {
             markdown("description", &issue.description_md).into_any_element()
-        })
-        .child(
-            div()
-                .id("detail-comments")
-                .test_support()
-                .aria_label(comments_heading.clone())
-                .text_lg()
-                .child(comments_heading),
-        )
+        });
+
+    let comments = div()
+        .py_3()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(section_title(
+            "detail-comments",
+            comments_heading,
+            "Comments",
+            comment_count,
+            cx,
+        ))
         .children(issue.comments.is_empty().then(|| {
             div()
                 .id("no-comments")
@@ -407,15 +479,22 @@ fn body(
                 .enumerate()
                 .map(|(index, each)| comment(index, each, cx)),
         )
-        .child(comment_form)
-        .child(
-            div()
-                .id("detail-worklogs")
-                .test_support()
-                .aria_label("Worklogs")
-                .text_lg()
-                .child("Worklogs"),
-        )
+        .child(comment_form);
+
+    let worklogs = div()
+        .py_3()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .child(section_title(
+            "detail-worklogs",
+            "Worklogs".to_owned(),
+            "Worklogs",
+            worklog_count,
+            cx,
+        ))
         .children(issue.worklogs.is_empty().then(|| {
             div()
                 .id("no-worklogs")
@@ -429,6 +508,24 @@ fn body(
                 .iter()
                 .enumerate()
                 .map(|(index, each)| worklog(index, each, cx)),
+        );
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .child(about)
+        // What people wrote and logged lies on a surface of its own, so that
+        // it does not read as more of the description
+        .child(
+            div()
+                .flex_1()
+                .px_5()
+                .bg(cx.theme().sidebar)
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(comments)
+                .child(worklogs),
         )
 }
 
@@ -448,6 +545,34 @@ impl Render for DetailPane {
                 .on_click(move |_, _, cx| cx.open_url(&url))
         });
 
+        let top = div()
+            .flex_none()
+            .px_5()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .font_features(tabular_digits())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(issue.key.to_string()),
+            )
+            .child(self.timer.clone())
+            .children(open_in_jira)
+            .child(close);
+        let body = issue.detail.as_ref().map(|detail| {
+            body(
+                detail,
+                self.status.clone(),
+                self.assignee.clone(),
+                self.comment_form.clone(),
+                self.worklog_form.clone(),
+                cx,
+            )
+        });
+
         div()
             .id("issue-detail")
             .test_support()
@@ -456,33 +581,16 @@ impl Render for DetailPane {
             .overflow_y_scroll()
             // Without it a sideways swipe over code or a table also moves the pane
             .restrict_scroll_to_axis()
-            .p_4()
+            // At least as tall as the pane, so that the surface of the
+            // comments reaches its bottom under a short issue
             .child(
                 div()
+                    .min_h_full()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .pb_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(issue.key.to_string()),
-                    )
-                    .child(self.timer.clone())
-                    .children(open_in_jira)
-                    .child(close),
+                    .flex_col()
+                    .child(top)
+                    .children(body),
             )
-            .children(issue.detail.as_ref().map(|detail| {
-                body(
-                    detail,
-                    self.status.clone(),
-                    self.assignee.clone(),
-                    self.comment_form.clone(),
-                    self.worklog_form.clone(),
-                    cx,
-                )
-            }))
     }
 }
 

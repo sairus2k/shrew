@@ -4,7 +4,7 @@ use app_core::{
     models::{IssueKey, SetupStep},
 };
 use gpui_kit::component::{
-    ActiveTheme, Sizable, WindowExt as _,
+    ActiveTheme, Sizable, Theme, WindowExt as _,
     button::{Button, ButtonVariants},
     notification::Notification,
 };
@@ -38,6 +38,7 @@ mod runtime;
 mod settings;
 mod sign_in;
 mod sync_status;
+mod theme;
 mod timer;
 mod transition;
 mod worklog;
@@ -77,6 +78,10 @@ impl Root {
     fn new(step: SetupStep, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sync = cx.global::<Core>().sync.clone();
         cx.subscribe_in(&sync, window, Self::on_sync_event).detach();
+        cx.observe_window_appearance(window, |_, window, cx| {
+            Theme::sync_system_appearance(Some(window), cx)
+        })
+        .detach();
         Self {
             screen: Self::screen(step, window, cx),
             notified_error: None,
@@ -306,7 +311,9 @@ impl Render for Root {
                                 .h_full()
                                 .min_w_0()
                                 .map(|list| match detail {
-                                    Some(_) => list.w(relative(0.4)).flex_none(),
+                                    Some(_) => {
+                                        list.w(relative(0.4)).flex_none().bg(cx.theme().sidebar)
+                                    }
                                     None => list.flex_1(),
                                 })
                                 .child(list.clone()),
@@ -328,10 +335,11 @@ impl Render for Root {
                         .px_4()
                         .flex()
                         .items_center()
-                        .text_sm()
+                        .text_size(px(12.))
                         .text_color(cx.theme().muted_foreground)
+                        .bg(cx.theme().status_bar)
                         .border_t_1()
-                        .border_color(cx.theme().border)
+                        .border_color(cx.theme().status_bar_border)
                         .child(div().flex_1().min_w_0().child(status.clone()))
                         .child(div().mr_2().child(timer_status.clone()))
                         .child(
@@ -381,6 +389,7 @@ fn main() -> anyhow::Result<()> {
 
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
+        theme::init(cx);
 
         let sync = cx.new(|cx| SyncBridge::new(events, cx));
         cx.set_global(Core {

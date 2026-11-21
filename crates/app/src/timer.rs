@@ -2,6 +2,7 @@
 //! rendering and sends every start and stop to the core.
 
 use crate::runtime::spawn;
+use crate::theme::tabular_digits;
 use app_core::{
     api,
     models::{IssueKey, RunningTimer},
@@ -176,6 +177,7 @@ impl Render for TimerControl {
                 .test_support()
                 .aria_label(text.clone())
                 .text_sm()
+                .font_features(tabular_digits())
                 .text_color(cx.theme().muted_foreground)
                 .child(text)
         };
@@ -246,6 +248,13 @@ impl Render for TimerStatus {
             .gap_2()
             .child(
                 div()
+                    .size(px(7.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(cx.theme().red),
+            )
+            .child(
+                div()
                     .id("running-timer-issue")
                     .test_support()
                     .aria_label(key.clone())
@@ -261,6 +270,8 @@ impl Render for TimerStatus {
                     .id("running-timer-elapsed")
                     .test_support()
                     .aria_label(elapsed.clone())
+                    .font_features(tabular_digits())
+                    .text_color(cx.theme().foreground)
                     .child(elapsed),
             )
             .child(

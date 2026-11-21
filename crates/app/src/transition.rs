@@ -2,6 +2,7 @@
 
 use crate::issue::IssueModel;
 use crate::runtime::spawn;
+use crate::theme::status_dot;
 use app_core::{
     api,
     models::{RequiredField, Transition},
@@ -150,6 +151,10 @@ impl Render for StatusButton {
         let transitions = self.transitions.clone();
         let issue = self.issue.read(cx);
         let status = issue.detail.as_ref().map(|detail| detail.status.clone());
+        let dot = issue
+            .detail
+            .as_ref()
+            .map(|detail| status_dot(detail.status_category, cx));
         let url = issue.detail.as_ref().map(|detail| detail.url.clone());
 
         div()
@@ -160,7 +165,11 @@ impl Render for StatusButton {
             .child(
                 Button::new("status-button")
                     .small()
-                    .label(status.unwrap_or_default())
+                    .outline()
+                    .dropdown_caret(true)
+                    .accessibility_label(status.clone().unwrap_or_default())
+                    .children(dot)
+                    .child(status.unwrap_or_default())
                     .disabled(transitions.is_empty())
                     .dropdown_menu(move |mut menu, window, _| {
                         for transition in transitions.iter().cloned() {
