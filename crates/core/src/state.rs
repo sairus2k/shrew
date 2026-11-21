@@ -53,6 +53,12 @@ impl AppState {
         *self.window_focused.borrow()
     }
 
+    /// Changes each time the sync engine is asked for a cycle: a core started
+    /// without the engine has nothing else to show for the request.
+    pub fn sync_requests(&self) -> watch::Receiver<()> {
+        self.sync_waker.subscribe()
+    }
+
     pub fn emit(&self, event: SyncEvent) {
         self.events.send(event).ok();
     }

@@ -172,6 +172,12 @@ pub async fn save_tempo_token(state: &AppState, api_token: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// Starts a sync cycle without waiting for the poll interval. A request made
+/// while a cycle runs is served by one more cycle after it, however many came.
+pub fn sync_now(state: &AppState) {
+    state.sync_waker.send(()).ok();
+}
+
 /// When the last sync that completed had started, in Unix milliseconds.
 /// `None` until the initial sync has finished.
 pub async fn last_sync_at(state: &AppState) -> Option<i64> {

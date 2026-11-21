@@ -1188,6 +1188,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sync_the_user_asks_for_polls_jira_at_once() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let polled = [changed(issue(1, "WEB"), LATER, "Renamed")];
+        poll(JUST_SYNCED, page(&polled, None)).mount(&server).await;
+
+        crate::api::sync_now(&state);
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed",
+            ]
+        );
+        assert_eq!(summary(&state, "WEB-1").await, "Renamed");
+    }
+
+    #[tokio::test]
     async fn a_poll_that_started_before_a_project_was_unwatched_does_not_store_its_issues() {
         let server = MockServer::start().await;
         let data_dir = tempfile::tempdir().unwrap();
