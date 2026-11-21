@@ -82,6 +82,15 @@ impl Root {
             Theme::sync_system_appearance(Some(window), cx)
         })
         .detach();
+        cx.global::<Core>()
+            .state
+            .set_window_focused(window.is_window_active());
+        cx.observe_window_activation(window, |_, window, cx| {
+            cx.global::<Core>()
+                .state
+                .set_window_focused(window.is_window_active())
+        })
+        .detach();
         Self {
             screen: Self::screen(step, window, cx),
             notified_error: None,
@@ -409,7 +418,30 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::rejection_message;
+    use super::{Core, rejection_message};
+    use crate::harness::{launch, tokio_runtime};
+    use gpui_kit::{AppContext, TestAppContext, VisualTestContext};
+
+    #[gpui_kit::test]
+    fn the_core_is_told_when_the_window_loses_and_gains_focus(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = tempfile::tempdir().unwrap();
+        let window = launch(cx, &tokio, data_dir.path());
+        let focused =
+            |cx: &mut TestAppContext| cx.read(|cx| cx.global::<Core>().state.window_focused());
+        cx.update_window(window, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(focused(cx));
+
+        VisualTestContext::from_window(window, cx).deactivate_window();
+        assert!(!focused(cx));
+
+        cx.update_window(window, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(focused(cx));
+    }
 
     #[test]
     fn a_rejection_names_the_issue_the_action_and_jiras_reason() {

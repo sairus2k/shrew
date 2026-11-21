@@ -18,6 +18,11 @@ pub struct AppState {
     pub(crate) data_dir: PathBuf,
     // Sending wakes the sync engine before its poll interval is over
     pub(crate) sync_waker: watch::Sender<()>,
+    // Whether the app's window is the focused one; sets the poll interval
+    pub(crate) window_focused: watch::Sender<bool>,
+    // Stands in for the system's idle time; see `engine::idle_time`
+    #[cfg(test)]
+    pub(crate) idle_time: StdMutex<std::time::Duration>,
     pub(crate) tokens: Arc<dyn TokenStore>,
     pub(crate) tempo_tokens: Arc<dyn TokenStore>,
     // The Tempo token that Tempo answered 401 to. Worklogs wait while it is the
@@ -35,8 +40,19 @@ pub struct AppState {
     pub(crate) signed_out: watch::Sender<()>,
 }
 
+impl AppState {
+    /// Called by the UI when the window gains or loses focus.
+    pub fn set_window_focused(&self, focused: bool) {
+        self.window_focused.send_replace(focused);
+    }
+}
+
 #[cfg(feature = "test-support")]
 impl AppState {
+    pub fn window_focused(&self) -> bool {
+        *self.window_focused.borrow()
+    }
+
     pub fn emit(&self, event: SyncEvent) {
         self.events.send(event).ok();
     }

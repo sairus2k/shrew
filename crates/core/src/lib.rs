@@ -80,6 +80,10 @@ async fn open(
         config: RwLock::new(config),
         data_dir: data_dir.to_owned(),
         sync_waker,
+        // The window opens focused, and the UI reports every change
+        window_focused: watch::channel(true).0,
+        #[cfg(test)]
+        idle_time: Default::default(),
         tokens,
         tempo_tokens,
         rejected_tempo_token: Default::default(),

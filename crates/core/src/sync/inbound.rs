@@ -1270,13 +1270,93 @@ mod tests {
         assert!(events.try_recv().is_err());
 
         tokio::time::pause();
-        tokio::time::advance(crate::sync::engine::POLL_INTERVAL).await;
+        tokio::time::advance(crate::sync::engine::ACTIVE_INTERVAL).await;
         tokio::time::resume();
 
         assert_eq!(
             cycle(&mut events).await[1],
             r#"IssuesUpdated([IssueKey("WEB-1")])"#
         );
+    }
+
+    /// Moves only the timer of the engine, as the test above does.
+    async fn pass(time: std::time::Duration) {
+        tokio::time::pause();
+        tokio::time::advance(time).await;
+        tokio::time::resume();
+    }
+
+    async fn assert_no_cycle(events: &mut UnboundedReceiver<SyncEvent>) {
+        let wait = std::time::Duration::from_millis(300);
+        let event = tokio::time::timeout(wait, events.recv()).await;
+        assert!(event.is_err(), "a sync cycle started: {event:?}");
+    }
+
+    #[tokio::test]
+    async fn a_window_in_the_background_is_polled_after_fifteen_minutes() {
+        use crate::sync::engine::{ACTIVE_INTERVAL, BACKGROUND_INTERVAL};
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        state.set_window_focused(false);
+
+        pass(ACTIVE_INTERVAL).await;
+        assert_no_cycle(&mut events).await;
+
+        pass(BACKGROUND_INTERVAL - ACTIVE_INTERVAL).await;
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+    }
+
+    #[tokio::test]
+    async fn an_idle_user_is_polled_after_thirty_minutes() {
+        use crate::sync::engine::{BACKGROUND_INTERVAL, IDLE_AFTER, IDLE_INTERVAL};
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        // The window is still focused: the user walked away from it
+        *state.idle_time.lock().unwrap() = IDLE_AFTER;
+
+        pass(BACKGROUND_INTERVAL).await;
+        assert_no_cycle(&mut events).await;
+
+        pass(IDLE_INTERVAL - BACKGROUND_INTERVAL).await;
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+    }
+
+    #[tokio::test]
+    async fn focusing_the_window_after_a_longer_interval_syncs_right_away() {
+        use crate::sync::engine::ACTIVE_INTERVAL;
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        state.set_window_focused(false);
+        pass(ACTIVE_INTERVAL * 2).await;
+        assert_no_cycle(&mut events).await;
+
+        // No time passes: the focus alone starts the cycle
+        state.set_window_focused(true);
+
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
+    }
+
+    #[tokio::test]
+    async fn a_user_back_from_idle_is_synced_at_the_next_look() {
+        use crate::sync::engine::{ACTIVE_INTERVAL, ACTIVITY_CHECK, IDLE_AFTER};
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        *state.idle_time.lock().unwrap() = IDLE_AFTER;
+        pass(ACTIVE_INTERVAL * 2).await;
+        assert_no_cycle(&mut events).await;
+
+        *state.idle_time.lock().unwrap() = std::time::Duration::ZERO;
+        pass(ACTIVITY_CHECK).await;
+
+        assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
     }
 
     #[tokio::test]
