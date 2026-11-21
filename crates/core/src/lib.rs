@@ -83,6 +83,8 @@ async fn open(
         tokens,
         tempo_tokens,
         rejected_tempo_token: Default::default(),
+        #[cfg(test)]
+        tempo_url: std::sync::Mutex::new(auth::TEMPO_URL.to_owned()),
         sync_running: Mutex::new(()),
         signed_out: watch::channel(()).0,
     };

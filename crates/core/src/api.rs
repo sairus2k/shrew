@@ -65,7 +65,6 @@ pub async fn sign_in(
         last_worklog_sync_at: 0,
         last_worklog_delete_sync_at: 0,
         worklog_target: Default::default(),
-        tempo_url: auth::TEMPO_URL.to_owned(),
         tempo_api_token: String::new(),
     };
     // What a sign-out that failed halfway, or a config deleted by hand, left behind
@@ -589,7 +588,6 @@ mod tests {
                 "last_worklog_sync_at": 0,
                 "last_worklog_delete_sync_at": 0,
                 "worklog_target": "jira",
-                "tempo_url": "https://api.tempo.io/4",
             })
         );
         assert_eq!(

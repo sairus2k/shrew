@@ -8,10 +8,6 @@ const KEYCHAIN_ACCOUNT: &str = "jira-api-token";
 const TEMPO_KEYCHAIN_ACCOUNT: &str = "tempo-api-token";
 pub(crate) const TEMPO_URL: &str = "https://api.tempo.io/4";
 
-fn default_tempo_url() -> String {
-    TEMPO_URL.to_owned()
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Config {
     pub site_url: String, // https://{site}.atlassian.net
@@ -41,10 +37,6 @@ pub(crate) struct Config {
     pub last_worklog_delete_sync_at: i64,
     #[serde(default)]
     pub worklog_target: WorklogTarget,
-    // Part of the config so that tests can point Tempo at a mock server, as
-    // `site_url` does for Jira
-    #[serde(default = "default_tempo_url")]
-    pub tempo_url: String,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,
@@ -208,5 +200,39 @@ mod tests {
         assert_eq!(keychain.load().unwrap(), None);
         // There is nothing left to delete
         keychain.delete().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tempo_url_left_by_an_earlier_build_is_neither_used_nor_written_back() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(TokenFile(data_dir.path().join("api-token")));
+        tokens.save("secret").unwrap();
+        let old = serde_json::json!({
+            "site_url": "https://acme.atlassian.net",
+            "email": "ada@example.com",
+            "account_id": "5b10a",
+            "tempo_url": "https://elsewhere.example/4",
+        });
+        std::fs::write(data_dir.path().join(CONFIG_FILE), old.to_string()).unwrap();
+        let tempo_tokens = Arc::new(TokenFile(data_dir.path().join("tempo-token")));
+
+        let config = load(data_dir.path(), tokens, tempo_tokens)
+            .await
+            .expect("an old config still loads");
+        save_config(data_dir.path(), &config).await.unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data_dir.path().join(CONFIG_FILE)).unwrap())
+                .unwrap();
+        assert!(saved.get("tempo_url").is_none());
+        assert_eq!(
+            crate::sync::outbound::tempo_url(
+                &crate::start_without_keychain(data_dir.path())
+                    .await
+                    .unwrap()
+                    .0
+            ),
+            TEMPO_URL
+        );
     }
 }

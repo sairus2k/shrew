@@ -24,6 +24,9 @@ pub struct AppState {
     // saved one, and the event is not repeated. Saving a token or choosing the
     // target clears it.
     pub(crate) rejected_tempo_token: StdMutex<Option<String>>,
+    // Only tests can move it, to a mock server; see `outbound::tempo_url`
+    #[cfg(test)]
+    pub(crate) tempo_url: StdMutex<String>,
     // Held by a sync cycle while it runs. A sign-out takes it before it wipes
     // the cache, so a cycle of the old account cannot write into it afterwards.
     pub(crate) sync_running: Mutex<()>,

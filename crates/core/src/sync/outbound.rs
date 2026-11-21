@@ -323,6 +323,18 @@ async fn deliver(
     }
 }
 
+/// The base URL is not a setting: the Tempo token goes only to Tempo. Tests
+/// point it at a mock server through the state.
+pub(crate) fn tempo_url(state: &AppState) -> String {
+    #[cfg(test)]
+    return state.tempo_url.lock().unwrap().clone();
+    #[cfg(not(test))]
+    {
+        let _ = state;
+        crate::auth::TEMPO_URL.to_owned()
+    }
+}
+
 /// Returns Tempo's id of the worklog.
 async fn post_to_tempo(
     client: &JiraClient,
@@ -361,7 +373,7 @@ async fn post_to_tempo(
     if let Some(comment) = payload["comment"].as_str() {
         body["description"] = comment.into();
     }
-    Ok(TempoClient::new(&config.tempo_url, &config.tempo_api_token)
+    Ok(TempoClient::new(&tempo_url(state), &config.tempo_api_token)
         .create_worklog(&body)
         .await?)
 }
@@ -424,7 +436,6 @@ mod tests {
             last_worklog_sync_at: 0,
             last_worklog_delete_sync_at: 0,
             worklog_target: Default::default(),
-            tempo_url: crate::auth::TEMPO_URL.to_owned(),
             api_token: TOKEN.to_owned(),
             tempo_api_token: String::new(),
         }
@@ -2770,10 +2781,10 @@ mod tests {
         );
     }
 
-    fn tempo_config(jira: &MockServer, tempo: &MockServer) -> Config {
+    fn tempo_config(state: &AppState, jira: &MockServer, tempo: &MockServer) -> Config {
+        *state.tempo_url.lock().unwrap() = tempo.uri();
         Config {
             worklog_target: WorklogTarget::Tempo,
-            tempo_url: tempo.uri(),
             tempo_api_token: "tempo-secret".to_owned(),
             ..config(&jira.uri())
         }
@@ -2845,7 +2856,7 @@ mod tests {
             .unwrap();
 
         let mut delivered = Vec::new();
-        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+        process_queue(&state, &tempo_config(&state, &jira, &tempo), &mut delivered)
             .await
             .unwrap();
 
@@ -2894,7 +2905,7 @@ mod tests {
 
         // The target is Tempo when the queue is flushed
         let mut delivered = Vec::new();
-        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+        process_queue(&state, &tempo_config(&state, &jira, &tempo), &mut delivered)
             .await
             .unwrap();
         assert_eq!(worklog_requests(&jira).await, 0);
@@ -2928,7 +2939,7 @@ mod tests {
         received(&mut events);
 
         let mut delivered = Vec::new();
-        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+        process_queue(&state, &tempo_config(&state, &jira, &tempo), &mut delivered)
             .await
             .unwrap();
 
@@ -2973,7 +2984,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_tempo_token_is_reported_and_tried_once_however_many_cycles_follow() {
         let (state, mut events, jira, tempo, _data_dir) = with_a_rejected_tempo_token().await;
-        let config = tempo_config(&jira, &tempo);
+        let config = tempo_config(&state, &jira, &tempo);
 
         for _ in 0..3 {
             process_queue(&state, &config, &mut Vec::new())
@@ -2989,7 +3000,7 @@ mod tests {
     #[tokio::test]
     async fn saving_a_token_makes_the_next_cycle_try_tempo_again() {
         let (state, mut events, jira, tempo, _data_dir) = with_a_rejected_tempo_token().await;
-        let config = tempo_config(&jira, &tempo);
+        let config = tempo_config(&state, &jira, &tempo);
         process_queue(&state, &config, &mut Vec::new())
             .await
             .unwrap();
@@ -3025,7 +3036,7 @@ mod tests {
     #[tokio::test]
     async fn choosing_the_target_makes_the_next_cycle_try_tempo_again() {
         let (state, mut events, jira, tempo, _data_dir) = with_a_rejected_tempo_token().await;
-        let config = tempo_config(&jira, &tempo);
+        let config = tempo_config(&state, &jira, &tempo);
         process_queue(&state, &config, &mut Vec::new())
             .await
             .unwrap();
@@ -3086,7 +3097,7 @@ mod tests {
         received(&mut events);
 
         let mut delivered = Vec::new();
-        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+        process_queue(&state, &tempo_config(&state, &jira, &tempo), &mut delivered)
             .await
             .unwrap();
 
@@ -3113,7 +3124,7 @@ mod tests {
         // The token is replaced: both worklogs go out, the older one first
         let fixed = Config {
             tempo_api_token: "new-secret".to_owned(),
-            ..tempo_config(&jira, &tempo)
+            ..tempo_config(&state, &jira, &tempo)
         };
         tempo.reset().await;
         for tempo_id in [7, 8] {
@@ -3155,7 +3166,7 @@ mod tests {
         received(&mut events);
 
         let mut delivered = Vec::new();
-        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+        process_queue(&state, &tempo_config(&state, &jira, &tempo), &mut delivered)
             .await
             .unwrap();
 
@@ -3182,7 +3193,7 @@ mod tests {
             .unwrap();
 
         let mut delivered = Vec::new();
-        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+        process_queue(&state, &tempo_config(&state, &jira, &tempo), &mut delivered)
             .await
             .unwrap();
 
@@ -3196,7 +3207,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;
-        let mut config = tempo_config(&jira, &tempo);
+        let mut config = tempo_config(&state, &jira, &tempo);
         // The pass for deleted issues would find WEB-1 missing from this Jira
         config.last_reconcile_at = inbound::now_ms().unwrap();
         *state.config.write().await = Some(config);
