@@ -2734,6 +2734,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tempo_token_without_the_worklog_scope_is_reported_and_the_worklog_stays_queued() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        tempo_worklog_call()
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "This operation requires one of the following scopes: worklogs:manage.",
+            ))
+            .expect(1)
+            .mount(&tempo)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(received(&mut events), ["TempoTokenRejected"]);
+        assert_eq!(worklog_rows(&state).await[0].1, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_403_from_tempo_that_is_not_about_the_token_marks_the_worklog_failed() {
+        let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
+        mount_profile(&jira).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        tempo_worklog_call()
+            .respond_with(ResponseTemplate::new(403).set_body_json(
+                json!({ "errors": [{ "message": "You do not have permission to log work" }] }),
+            ))
+            .expect(1)
+            .mount(&tempo)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &tempo_config(&jira, &tempo), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(worklog_rows(&state).await[0].1, "failed");
+    }
+
+    #[tokio::test]
     async fn a_worklog_posted_to_tempo_is_not_stored_twice_when_the_poll_returns_it() {
         let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
         mount_profile(&jira).await;

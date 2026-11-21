@@ -6,7 +6,8 @@ use std::fmt;
 
 #[derive(Debug)]
 pub(crate) enum TempoError {
-    /// The Tempo token is wrong or has expired (401).
+    /// The Tempo token is wrong or has expired (401), or it lacks the scope
+    /// for the request (403).
     Unauthorized,
     Status(StatusCode, String),
     Http(reqwest::Error),
@@ -66,6 +67,12 @@ impl TempoClient {
             StatusCode::UNAUTHORIZED => Err(TempoError::Unauthorized),
             status if !status.is_success() => {
                 let body = response.text().await.unwrap_or_default();
+                // A token without the scope gets "This operation requires one
+                // of the following scopes: worklogs:manage." Any other 403 is
+                // about this worklog, such as no permission to log on the issue.
+                if status == StatusCode::FORBIDDEN && body.contains("following scopes") {
+                    return Err(TempoError::Unauthorized);
+                }
                 Err(TempoError::Status(status, body))
             }
             _ => {
