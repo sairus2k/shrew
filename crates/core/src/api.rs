@@ -845,8 +845,9 @@ mod tests {
             time_spent_sec: 5580,
             started_at: "2026-03-27T09:00:00.000Z".to_owned(),
             comment: Some("Pairing".to_owned()),
+            tempo_id: None,
         };
-        db::worklogs::upsert_remote(&state.pool, &grace)
+        db::worklogs::upsert_remote(&mut state.pool.acquire().await.unwrap(), &grace)
             .await
             .unwrap();
         log_time(&state, &"WEB-1".into(), 900, 1_774_771_200, Some("Review"))

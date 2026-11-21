@@ -19,6 +19,8 @@ pub(crate) struct RemoteWorklog {
     pub time_spent_sec: i64,
     pub started_at: String,
     pub comment: Option<String>,
+    /// Set when the worklog is Jira's mirror of a Tempo worklog.
+    pub tempo_id: Option<i64>,
 }
 
 /// Unix seconds as the stored `started_at`.
@@ -97,6 +99,21 @@ pub(crate) async fn confirm(
     Ok(())
 }
 
+/// Records Tempo's id for a worklog that has been delivered to Tempo. Jira's
+/// id follows when the poll returns the mirror.
+pub(crate) async fn confirm_tempo(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    local_id: &str,
+    tempo_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE worklogs SET tempo_id = ?, sync_status = 'synced' WHERE local_id = ?")
+        .bind(tempo_id)
+        .bind(local_id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn mark_failed(
     executor: impl sqlx::SqliteExecutor<'_>,
     local_id: &str,
@@ -113,9 +130,19 @@ pub(crate) async fn mark_failed(
 /// of an issue the cache does not have is not stored. Returns the key of the
 /// issue, or `None` if it was not stored.
 pub(crate) async fn upsert_remote(
-    executor: impl sqlx::SqliteExecutor<'_>,
+    conn: &mut sqlx::SqliteConnection,
     worklog: &RemoteWorklog,
 ) -> sqlx::Result<Option<IssueKey>> {
+    if let Some(tempo_id) = worklog.tempo_id {
+        // The row posted to Tempo from here gets Jira's id, so the upsert below finds it
+        sqlx::query("UPDATE worklogs SET remote_id = ? WHERE tempo_id = ? AND remote_id IS NULL")
+            .bind(&worklog.remote_id)
+            .bind(tempo_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    // Tempo does not copy the description into the mirror (Jira shows a fixed
+    // text there), so a worklog posted to Tempo from here keeps its comment
     sqlx::query_scalar(
         "INSERT INTO worklogs
              (remote_id, issue_key, author_name, time_spent_sec, started_at, comment, sync_status)
@@ -125,7 +152,8 @@ pub(crate) async fn upsert_remote(
              author_name    = excluded.author_name,
              time_spent_sec = excluded.time_spent_sec,
              started_at     = excluded.started_at,
-             comment        = excluded.comment,
+             comment        = CASE WHEN worklogs.tempo_id IS NULL
+                                   THEN excluded.comment ELSE worklogs.comment END,
              sync_status    = 'synced'
          RETURNING issue_key",
     )
@@ -135,7 +163,7 @@ pub(crate) async fn upsert_remote(
     .bind(&worklog.started_at)
     .bind(&worklog.comment)
     .bind(&worklog.issue_id)
-    .fetch_optional(executor)
+    .fetch_optional(conn)
     .await
 }
 

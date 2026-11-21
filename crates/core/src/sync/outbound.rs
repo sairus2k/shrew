@@ -62,6 +62,9 @@ pub(crate) async fn process_queue(
                         local_id,
                         remote_id,
                     } => worklogs::confirm(&mut *tx, local_id, remote_id).await?,
+                    Delivered::TempoWorklog { local_id, tempo_id } => {
+                        worklogs::confirm_tempo(&mut *tx, local_id, *tempo_id).await?;
+                    }
                     Delivered::Nothing => {}
                 }
                 issues::confirm(&mut *tx, &entry.issue_key).await?;
@@ -276,11 +279,8 @@ async fn deliver(
         "worklog" => {
             let local_id = payload["local_id"].as_str().unwrap_or_default().to_owned();
             if config.worklog_target == WorklogTarget::Tempo {
-                let remote_id = post_to_tempo(state, config, entry, &payload).await?;
-                return Ok(Delivered::Worklog {
-                    local_id,
-                    remote_id,
-                });
+                let tempo_id = post_to_tempo(state, config, entry, &payload).await?;
+                return Ok(Delivered::TempoWorklog { local_id, tempo_id });
             }
             let started =
                 worklogs::started_at_for_jira(payload["started_at"].as_str().unwrap_or_default())
@@ -308,13 +308,13 @@ async fn deliver(
     }
 }
 
-/// Returns the id of the Jira worklog Tempo mirrored the worklog into.
+/// Returns Tempo's id of the worklog.
 async fn post_to_tempo(
     state: &AppState,
     config: &Config,
     entry: &QueueEntry,
     payload: &Value,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<i64> {
     // Tempo takes the numeric id of the issue, not its key
     let issue_id: i64 = issues::id_of(&state.pool, &entry.issue_key)
         .await?
@@ -344,6 +344,7 @@ enum Delivered {
     Nothing,
     Comment(Value),
     Worklog { local_id: String, remote_id: String },
+    TempoWorklog { local_id: String, tempo_id: i64 },
 }
 
 fn failure(error: &anyhow::Error) -> Failure {
@@ -2562,6 +2563,27 @@ mod tests {
         Mock::given(method("POST")).and(path("/worklogs"))
     }
 
+    /// The part of Tempo's answer to a created worklog that matters here. It
+    /// has no id of the Jira worklog Tempo mirrors the worklog into.
+    fn tempo_created(tempo_id: i64) -> Value {
+        json!({
+            "self": format!("https://api.tempo.io/4/worklogs/{tempo_id}"),
+            "tempoWorklogId": tempo_id,
+            "issue": { "id": 10001 },
+            "timeSpentSeconds": 5400,
+            "startDate": "2026-03-29",
+            "startTime": "08:15:00",
+            "startDateTimeUtc": "2026-03-29T08:15:00Z",
+        })
+    }
+
+    async fn tempo_ids(state: &AppState) -> Vec<Option<i64>> {
+        sqlx::query_scalar("SELECT tempo_id FROM worklogs ORDER BY created_at, rowid")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
     async fn worklog_requests(server: &MockServer) -> usize {
         let requests = requests(server).await;
         requests
@@ -2581,10 +2603,7 @@ mod tests {
                 "authorization",
                 "Bearer tempo-secret",
             ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "tempoWorklogId": 7, "jiraWorklogId": 30001 })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(tempo_created(7)))
             .expect(1)
             .mount(&tempo)
             .await;
@@ -2612,12 +2631,10 @@ mod tests {
             )]
         );
         assert_eq!(worklog_requests(&jira).await, 0);
-        assert_eq!(
-            worklog_rows(&state).await[0].0.as_deref(),
-            Some("30001"),
-            "the id of the mirrored Jira worklog is the remote id"
-        );
-        assert_eq!(worklog_rows(&state).await[0].1, "synced");
+        let rows = worklog_rows(&state).await;
+        assert_eq!(rows[0].0, None, "Jira's id comes with the mirror");
+        assert_eq!(rows[0].1, "synced");
+        assert_eq!(tempo_ids(&state).await, [Some(7)]);
         assert_eq!(delivered, keys(&["WEB-1"]));
     }
 
@@ -2632,9 +2649,7 @@ mod tests {
             .mount(&jira)
             .await;
         tempo_worklog_call()
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "jiraWorklogId": "30002" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(tempo_created(8)))
             .mount(&tempo)
             .await;
         // Queued while the target was Jira
@@ -2702,9 +2717,8 @@ mod tests {
         config.last_reconcile_at = inbound::now_ms().unwrap();
         *state.config.write().await = Some(config);
         tempo_worklog_call()
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "jiraWorklogId": 30001 })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(tempo_created(7)))
+            .expect(1)
             .mount(&tempo)
             .await;
         Mock::given(path("/rest/api/3/search/jql"))
@@ -2721,16 +2735,23 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/rest/api/3/worklog/list"))
+            .and(wiremock::matchers::query_param("expand", "properties"))
+            // The mirror as Jira sends it: Tempo's id in a property, and a
+            // fixed text in place of the description
             .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
                 "id": "30001",
                 "issueId": "10001",
                 "author": { "accountId": "5b10a", "displayName": "Ada" },
                 "timeSpentSeconds": 5400,
                 "started": "2026-03-29T08:15:00.000+0000",
+                "comment": { "type": "doc", "version": 1, "content": [
+                    { "type": "paragraph", "content": [{ "type": "text", "text": "time-tracking" }] },
+                ] },
+                "properties": [{ "key": "tempo", "value": { "shadow": "true", "tempo_id": 7 } }],
             }])))
             .mount(&jira)
             .await;
-        api::log_time(&state, &"WEB-1".into(), 5400, STARTED, None)
+        api::log_time(&state, &"WEB-1".into(), 5400, STARTED, Some("Pairing"))
             .await
             .unwrap();
 
@@ -2742,5 +2763,10 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0.as_deref(), Some("30001"));
         assert_eq!(rows[0].1, "synced");
+        let comment: Option<String> = sqlx::query_scalar("SELECT comment FROM worklogs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(comment.as_deref(), Some("Pairing"));
     }
 }

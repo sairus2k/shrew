@@ -358,12 +358,14 @@ impl JiraClient {
         self.send(request).await
     }
 
-    /// The worklogs with these ids, as Jira sent them. Jira takes at most a
-    /// thousand ids, which is also the size of a page of `updated_worklogs`.
+    /// The worklogs with these ids and their properties, as Jira sent them.
+    /// Jira takes at most a thousand ids, which is also the size of a page of
+    /// `updated_worklogs`.
     pub(crate) async fn worklogs(&self, ids: &[i64]) -> Result<Vec<Value>, JiraError> {
         let request = self
             .http
             .post(self.url("/worklog/list"))
+            .query(&[("expand", "properties")])
             .json(&json!({ "ids": ids }));
         self.send(request).await
     }

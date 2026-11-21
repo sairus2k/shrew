@@ -53,9 +53,8 @@ impl TempoClient {
         }
     }
 
-    /// Creates the worklog and returns the id of the Jira worklog Tempo
-    /// mirrored it into.
-    pub(crate) async fn create_worklog(&self, body: &Value) -> Result<String, TempoError> {
+    /// Creates the worklog and returns Tempo's id of it.
+    pub(crate) async fn create_worklog(&self, body: &Value) -> Result<i64, TempoError> {
         let response = self
             .http
             .post(format!("{}/worklogs", self.base_url))
@@ -71,24 +70,13 @@ impl TempoClient {
             }
             _ => {
                 let created: Value = response.json().await?;
-                mirrored_jira_id(&created).ok_or_else(|| {
-                    TempoError::Status(StatusCode::OK, "the answer has no jiraWorklogId".to_owned())
+                created["tempoWorklogId"].as_i64().ok_or_else(|| {
+                    TempoError::Status(
+                        StatusCode::OK,
+                        "the answer has no tempoWorklogId".to_owned(),
+                    )
                 })
             }
         }
-    }
-}
-
-// The one place that decides how a worklog posted to Tempo is told apart when
-// it comes back through the Jira poll. Constraint: UNVERIFIED against a real
-// Tempo (the spike SHR-20 has no findings). It is assumed that the create
-// response carries the id of the mirrored Jira worklog as `jiraWorklogId`,
-// and that this id is what Jira's worklog list returns later. If the spike
-// shows otherwise, this function is the only thing to change.
-fn mirrored_jira_id(created: &Value) -> Option<String> {
-    match &created["jiraWorklogId"] {
-        Value::Number(id) => Some(id.to_string()),
-        Value::String(id) if !id.is_empty() => Some(id.clone()),
-        _ => None,
     }
 }

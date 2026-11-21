@@ -304,6 +304,8 @@ struct JiraWorklog {
     time_spent_seconds: i64,
     started: String,
     comment: Option<Value>,
+    #[serde(default)]
+    properties: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +322,7 @@ fn remote_worklog(worklog: &Value) -> anyhow::Result<RemoteWorklog> {
         time_spent_seconds,
         started,
         comment,
+        properties,
     } = JiraWorklog::deserialize(worklog)
         .with_context(|| format!("unexpected worklog from Jira: {}", worklog["id"]))?;
     let comment = adf::to_plain_text(comment.as_ref());
@@ -334,6 +337,12 @@ fn remote_worklog(worklog: &Value) -> anyhow::Result<RemoteWorklog> {
             .unwrap_or_else(|| "Unknown".to_owned()),
         time_spent_sec: time_spent_seconds,
         comment: (!comment.is_empty()).then_some(comment),
+        // Tempo marks the Jira worklog it mirrors one of its own into with
+        // the property `tempo`: `{ "shadow": "true", "tempo_id": 3 }`
+        tempo_id: properties
+            .iter()
+            .find(|property| property["key"] == "tempo")
+            .and_then(|property| property["value"]["tempo_id"].as_i64()),
     })
 }
 
@@ -373,7 +382,7 @@ pub(crate) async fn poll_updated_worklogs(
                     continue;
                 }
             };
-            if let Some(key) = worklogs::upsert_remote(&mut *tx, &record).await?
+            if let Some(key) = worklogs::upsert_remote(&mut tx, &record).await?
                 && !changed.contains(&key)
             {
                 changed.push(key);
