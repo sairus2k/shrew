@@ -468,6 +468,27 @@ pub async fn discard_comment(state: &AppState, entry_id: i64) -> anyhow::Result<
     Ok(())
 }
 
+/// Queues a worklog Jira or Tempo refused again, as it was logged. `entry_id`
+/// comes from `Worklog::rejected`.
+pub async fn retry_worklog(state: &AppState, entry_id: i64) -> anyhow::Result<()> {
+    let key = db::worklogs::retry(&state.pool, entry_id)
+        .await?
+        .with_context(|| format!("entry {entry_id} is not a refused worklog"))?;
+    state.events.send(SyncEvent::IssuesUpdated(vec![key])).ok();
+    state.sync_waker.send(()).ok();
+    Ok(())
+}
+
+/// Throws away a worklog Jira or Tempo refused. `entry_id` comes from
+/// `Worklog::rejected`.
+pub async fn discard_worklog(state: &AppState, entry_id: i64) -> anyhow::Result<()> {
+    let key = db::worklogs::discard(&state.pool, entry_id)
+        .await?
+        .with_context(|| format!("entry {entry_id} is not a refused worklog"))?;
+    state.events.send(SyncEvent::IssuesUpdated(vec![key])).ok();
+    Ok(())
+}
+
 /// The 50 best matches of `query` in the local cache, best first. Every word
 /// must match a key, a summary or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
@@ -870,6 +891,7 @@ mod tests {
                 time_spent_secs,
                 comment: comment.map(str::to_owned),
                 status,
+                rejected: None,
             };
         assert_eq!(
             worklogs,

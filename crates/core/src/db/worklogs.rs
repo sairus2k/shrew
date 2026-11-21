@@ -1,6 +1,6 @@
 //! The worklogs of the cached issues: the ones logged here and the ones Jira has.
 
-use crate::models::{IssueKey, SyncStatus, Worklog};
+use crate::models::{IssueKey, RejectedWorklog, SyncStatus, Worklog};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 /// Jira refuses a worklog shorter than this ("You must indicate the time spent working").
@@ -176,24 +176,97 @@ pub(crate) async fn for_issue(
     executor: impl sqlx::SqliteExecutor<'_>,
     key: &IssueKey,
 ) -> sqlx::Result<Vec<Worklog>> {
-    type Row = (Option<String>, String, i64, Option<String>, SyncStatus);
+    type Row = (
+        Option<String>,
+        String,
+        i64,
+        Option<String>,
+        SyncStatus,
+        Option<i64>,
+        Option<String>,
+    );
+    // The outbox entry of a refused worklog holds the reason
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT author_name, started_at, time_spent_sec, comment, sync_status
-         FROM worklogs WHERE issue_key = ? ORDER BY started_at DESC, created_at DESC",
+        "SELECT w.author_name, w.started_at, w.time_spent_sec, w.comment, w.sync_status,
+                q.id, q.error_msg
+         FROM worklogs w
+         LEFT JOIN sync_queue q
+                ON q.entity_type = 'worklog' AND q.status = 'failed'
+               AND json_extract(q.payload, '$.local_id') = w.local_id
+         WHERE w.issue_key = ? ORDER BY w.started_at DESC, w.created_at DESC",
     )
     .bind(key)
     .fetch_all(executor)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(author, started_at, seconds, comment, status)| Worklog {
-            author_name: author.unwrap_or_else(|| "You".to_owned()),
-            started_at: DateTime::parse_from_rfc3339(&started_at).map_or(0, |at| at.timestamp()),
-            time_spent_secs: seconds.try_into().unwrap_or_default(),
-            comment,
-            status,
-        })
+        .map(
+            |(author, started_at, seconds, comment, status, entry_id, error)| Worklog {
+                author_name: author.unwrap_or_else(|| "You".to_owned()),
+                started_at: DateTime::parse_from_rfc3339(&started_at)
+                    .map_or(0, |at| at.timestamp()),
+                time_spent_secs: seconds.try_into().unwrap_or_default(),
+                comment,
+                status,
+                rejected: entry_id.map(|entry_id| RejectedWorklog {
+                    entry_id,
+                    reason: error.unwrap_or_default(),
+                }),
+            },
+        )
         .collect())
+}
+
+/// Puts a refused worklog back in the queue. Returns the key of its issue, or
+/// `None` if the entry is not a refused worklog.
+pub(crate) async fn retry(
+    pool: &sqlx::SqlitePool,
+    entry_id: i64,
+) -> sqlx::Result<Option<IssueKey>> {
+    let mut tx = pool.begin().await?;
+    let entry: Option<(IssueKey, String)> = sqlx::query_as(
+        "UPDATE sync_queue SET status = 'pending', retry_count = 0, error_msg = NULL
+         WHERE id = ? AND entity_type = 'worklog' AND status = 'failed'
+         RETURNING issue_key, json_extract(payload, '$.local_id')",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((key, local_id)) = entry else {
+        return Ok(None);
+    };
+    sqlx::query("UPDATE worklogs SET sync_status = 'pending' WHERE local_id = ?")
+        .bind(local_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(key))
+}
+
+/// Deletes a refused worklog and its outbox entry. Returns the key of its
+/// issue, or `None` if the entry is not a refused worklog.
+pub(crate) async fn discard(
+    pool: &sqlx::SqlitePool,
+    entry_id: i64,
+) -> sqlx::Result<Option<IssueKey>> {
+    let mut tx = pool.begin().await?;
+    let entry: Option<(IssueKey, String)> = sqlx::query_as(
+        "DELETE FROM sync_queue
+         WHERE id = ? AND entity_type = 'worklog' AND status = 'failed'
+         RETURNING issue_key, json_extract(payload, '$.local_id')",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((key, local_id)) = entry else {
+        return Ok(None);
+    };
+    sqlx::query("DELETE FROM worklogs WHERE local_id = ?")
+        .bind(local_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(key))
 }
 
 /// Follows an issue that was moved to another project: its worklogs, and the

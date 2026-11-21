@@ -1399,6 +1399,79 @@ mod tests {
         assert!(events[1].starts_with("ChangeRejected") && events[1].contains("worklog"));
     }
 
+    /// Logs ten minutes on WEB-1 and lets Jira refuse them. Returns the entry
+    /// that `api::retry_worklog` and `api::discard_worklog` take.
+    async fn refused_worklog(state: &AppState, server: &MockServer) -> i64 {
+        // `api::get_issue` reads the site from the account
+        *state.config.write().await = Some(config(&server.uri()));
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("no permission"))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        api::log_time(state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        process_queue(state, &config(&server.uri()), &mut Vec::new())
+            .await
+            .unwrap();
+        let issue = api::get_issue(state, &"WEB-1".into()).await.unwrap();
+        let rejected = issue.worklogs[0].rejected.clone().unwrap();
+        assert_eq!(
+            rejected.reason,
+            "Jira returned 400 Bad Request: no permission"
+        );
+        rejected.entry_id
+    }
+
+    #[tokio::test]
+    async fn a_refused_worklog_says_why_and_a_retry_delivers_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        let entry_id = refused_worklog(&state, &server).await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "30001" })))
+            .mount(&server)
+            .await;
+
+        api::retry_worklog(&state, entry_id).await.unwrap();
+
+        assert_eq!(worklog_rows(&state).await[0].1, "pending");
+        process_queue(&state, &config(&server.uri()), &mut Vec::new())
+            .await
+            .unwrap();
+        let rows = worklog_rows(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0.as_deref(), rows[0].1.as_str()),
+            (Some("30001"), "synced")
+        );
+        let issue = api::get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.worklogs[0].rejected, None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_worklog_can_be_discarded_with_its_outbox_entry() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        let entry_id = refused_worklog(&state, &server).await;
+
+        api::discard_worklog(&state, entry_id).await.unwrap();
+
+        assert!(worklog_rows(&state).await.is_empty());
+        let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_queue")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(entries, 0);
+        // The entry is gone, so there is nothing to discard twice
+        assert!(api::discard_worklog(&state, entry_id).await.is_err());
+    }
+
     #[tokio::test]
     async fn a_rejected_transition_shows_the_status_jira_has_and_drops_its_cached_menu() {
         let server = MockServer::start().await;

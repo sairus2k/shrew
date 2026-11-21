@@ -10,7 +10,7 @@ use crate::transition::StatusButton;
 use crate::worklog::WorklogForm;
 use app_core::{
     api,
-    models::{Comment, IssueDetail, RejectedComment, SyncStatus, Worklog},
+    models::{Comment, IssueDetail, SyncStatus, Worklog},
 };
 use gpui_kit::component::{
     ActiveTheme, Sizable,
@@ -164,12 +164,14 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
                 .child(heading),
         )
         .child(markdown(("comment-body", index), &comment.body_md))
-        .children(
-            comment
-                .rejected
-                .as_ref()
-                .map(|rejected| rejected_comment(index, rejected, cx)),
-        )
+        .children(comment.rejected.as_ref().map(|rejected| {
+            refused(
+                index,
+                Refused::Comment(rejected.entry_id),
+                &rejected.reason,
+                cx,
+            )
+        }))
 }
 
 fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
@@ -182,7 +184,6 @@ fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
     match worklog.status {
         SyncStatus::Synced => {}
         SyncStatus::Pending => heading.push_str(", pending"),
-        // Jira refused it; there is nothing to retry from here yet
         SyncStatus::Failed => heading.push_str(", not sent"),
     }
     div()
@@ -204,12 +205,50 @@ fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
                 .as_ref()
                 .map(|text| markdown(("worklog-comment", index), text)),
         )
+        .children(worklog.rejected.as_ref().map(|rejected| {
+            refused(
+                index,
+                Refused::Worklog(rejected.entry_id),
+                &rejected.reason,
+                cx,
+            )
+        }))
 }
 
-/// What Jira said about a comment it refused, and what the user can do about it.
-fn rejected_comment(index: usize, rejected: &RejectedComment, cx: &App) -> impl IntoElement {
-    let reason = format!("Not sent: {}", rejected.reason);
-    let entry_id = rejected.entry_id;
+/// A change that was refused, by its outbox entry.
+#[derive(Clone, Copy)]
+enum Refused {
+    Comment(i64),
+    Worklog(i64),
+}
+
+impl Refused {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Comment(_) => "comment",
+            Self::Worklog(_) => "worklog",
+        }
+    }
+
+    async fn retry(self, state: &app_core::AppState) -> anyhow::Result<()> {
+        match self {
+            Self::Comment(entry_id) => api::retry_comment(state, entry_id).await,
+            Self::Worklog(entry_id) => api::retry_worklog(state, entry_id).await,
+        }
+    }
+
+    async fn discard(self, state: &app_core::AppState) -> anyhow::Result<()> {
+        match self {
+            Self::Comment(entry_id) => api::discard_comment(state, entry_id).await,
+            Self::Worklog(entry_id) => api::discard_worklog(state, entry_id).await,
+        }
+    }
+}
+
+/// Why a comment or a worklog was refused, and what the user can do about it.
+fn refused(index: usize, refused: Refused, reason: &str, cx: &App) -> impl IntoElement {
+    let reason = format!("Not sent: {reason}");
+    let kind = refused.kind();
     div()
         .flex()
         .flex_col()
@@ -217,7 +256,7 @@ fn rejected_comment(index: usize, rejected: &RejectedComment, cx: &App) -> impl 
         .gap_1()
         .child(
             div()
-                .id(SharedString::from(format!("comment-reason-{index}")))
+                .id(SharedString::from(format!("{kind}-reason-{index}")))
                 .test_support()
                 .aria_label(reason.clone())
                 .text_sm()
@@ -229,24 +268,23 @@ fn rejected_comment(index: usize, rejected: &RejectedComment, cx: &App) -> impl 
                 .flex()
                 .gap_2()
                 .child(
-                    Button::new(SharedString::from(format!("retry-comment-{index}")))
+                    Button::new(SharedString::from(format!("retry-{kind}-{index}")))
                         .small()
                         .label("Retry")
                         .on_click(move |_, _, cx| {
-                            spawn(cx, move |state| async move {
-                                api::retry_comment(&state, entry_id).await
-                            })
-                            .detach_and_log_err(cx)
+                            spawn(cx, move |state| async move { refused.retry(&state).await })
+                                .detach_and_log_err(cx)
                         }),
                 )
                 .child(
-                    Button::new(SharedString::from(format!("discard-comment-{index}")))
+                    Button::new(SharedString::from(format!("discard-{kind}-{index}")))
                         .small()
                         .label("Discard")
                         .on_click(move |_, _, cx| {
-                            spawn(cx, move |state| async move {
-                                api::discard_comment(&state, entry_id).await
-                            })
+                            spawn(
+                                cx,
+                                move |state| async move { refused.discard(&state).await },
+                            )
                             .detach_and_log_err(cx)
                         }),
                 ),
@@ -1013,5 +1051,44 @@ pub(crate) mod tests {
         wait_until(cx, window, |window| {
             worklog_lines(window) == [format!("You, {earlier}, 15m, not sent")]
         });
+        in_window(cx, window, |window, _| {
+            assert_eq!(
+                window.find("worklog-reason-0").label(),
+                Some(
+                    r#"Not sent: Jira returned 400 Bad Request: {"errorMessages":["No permission"]}"#
+                )
+            );
+        });
+
+        // Jira refuses it again
+        in_window(cx, window, |window, cx| {
+            window.scroll(
+                "issue-detail",
+                ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+            window.click("retry-worklog-0", cx);
+        });
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("You, {earlier}, 15m, pending")]
+        });
+        tokio.block_on(state.sync_once()).unwrap();
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("You, {earlier}, 15m, not sent")]
+        });
+
+        in_window(cx, window, |window, cx| {
+            window.scroll(
+                "issue-detail",
+                ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+                cx,
+            );
+            window.click("discard-worklog-0", cx);
+        });
+        wait_until(cx, window, |window| {
+            window.try_find("no-worklogs").is_some()
+        });
+        let unsent = tokio.block_on(api::unsent_changes(&state)).unwrap();
+        assert_eq!(unsent, 0);
     }
 }

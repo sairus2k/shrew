@@ -107,6 +107,17 @@ pub struct Worklog {
     pub comment: Option<String>,
     /// `Pending` until Jira has received it; `Failed` if Jira refused it.
     pub status: SyncStatus,
+    /// Set for a worklog Jira or Tempo refused. It stays until the user retries
+    /// or discards it.
+    pub rejected: Option<RejectedWorklog>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedWorklog {
+    /// What `api::retry_worklog` and `api::discard_worklog` take.
+    pub entry_id: i64,
+    /// Why it was refused.
+    pub reason: String,
 }
 
 /// The timer that is running now. Only the start is stored: the elapsed time is
