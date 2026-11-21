@@ -32,6 +32,7 @@ mod initial_sync;
 mod issue;
 mod issue_detail;
 mod issue_list;
+mod menu;
 mod new_token;
 mod projects;
 mod runtime;
@@ -399,6 +400,7 @@ fn main() -> anyhow::Result<()> {
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
         theme::init(cx);
+        menu::init(cx);
 
         let sync = cx.new(|cx| SyncBridge::new(events, cx));
         cx.set_global(Core {

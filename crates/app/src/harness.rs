@@ -42,6 +42,7 @@ pub(crate) fn launch(
 ) -> AnyWindowHandle {
     cx.update(gpui_kit::init);
     cx.update(crate::theme::init);
+    cx.update(crate::menu::init);
     let step = init_core(cx, tokio, data_dir);
     // The tokio side is outside GPUI's deterministic scheduler
     cx.executor().allow_parking();

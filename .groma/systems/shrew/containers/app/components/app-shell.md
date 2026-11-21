@@ -8,6 +8,9 @@ groma:
   code:
     - scanner: rust
       file: crates/app/src/main.rs
+    - scanner: rust
+      file: crates/app/src/menu.rs
+      symbol: init
   group: Application shell
   technology: Rust, GPUI
 description: Starts the app, owns the window and decides which screen is shown
@@ -16,6 +19,8 @@ description: Starts the app, owns the window and decides which screen is shown
 The entry point. It starts the tokio runtime and the core, opens the window and asks the core which setup step applies, then shows the matching screen: sign-in, project choice, initial sync, or the home screen with the issue list, the detail pane, the status line and the running timer. Each screen reports when it is done and the shell puts the next one in its place.
 
 It also turns core events into notifications (sync errors, changes Jira refused, a rejected Tempo token), shows the banner that asks for a new Jira token, and tells the core when the window gains or loses focus, which sets the poll interval.
+
+At startup it installs the application menu of the macOS menu bar: Hide Shrew, Hide Others, Show All and Quit Shrew, with the standard shortcuts, which also work while a text input has focus.
 
 ## Relationships
 
