@@ -1,0 +1,25 @@
+{
+  "scanners": [
+    {
+      "id": "rust",
+      "source": "@groma/scanner-rust@0.2.3",
+      "include": [
+        "**/*.rs",
+        "**/Cargo.toml"
+      ],
+      "exclude": [
+        "target/",
+        "vendor/"
+      ]
+    }
+  ],
+  "workSources": [
+    {
+      "id": "backlog",
+      "version": "1.55.3"
+    }
+  ],
+  "exclude": [
+    "/crates/app/src/harness.rs"
+  ]
+}
