@@ -21,3 +21,4 @@ Shows the issues of the watched projects from the local cache, filtered by proje
 | --- | --- | --- | --- |
 | [crates/app/src/issue_list.rs](../../../../../../crates/app/src/issue_list.rs) | [crates/core/src/api.rs](../../../../../../crates/core/src/api.rs) | Lists and searches issues | async call through the Core bridge |
 | [crates/app/src/issue_list.rs](../../../../../../crates/app/src/issue_list.rs) | [crates/app/src/runtime.rs](../../../../../../crates/app/src/runtime.rs) | Reloads on changes | GPUI event subscription |
+| [crates/app/src/issue_list.rs](../../../../../../crates/app/src/issue_list.rs) | [crates/app/src/keys.rs](../../../../../../crates/app/src/keys.rs) | Handles list shortcuts | GPUI action |

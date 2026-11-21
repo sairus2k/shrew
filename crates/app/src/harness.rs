@@ -43,6 +43,7 @@ pub(crate) fn launch(
     cx.update(gpui_kit::init);
     cx.update(crate::theme::init);
     cx.update(crate::menu::init);
+    cx.update(crate::keys::init);
     let step = init_core(cx, tokio, data_dir);
     // The tokio side is outside GPUI's deterministic scheduler
     cx.executor().allow_parking();
@@ -115,6 +116,18 @@ fn wait_at_most(
             .collect::<String>()
     });
     panic!("the window did not reach the expected state in {timeout:?}. On screen:{on_screen}");
+}
+
+/// Presses Tab until the button or the checkbox `id` has the focus.
+#[track_caller]
+pub(crate) fn tab_to(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) {
+    for _ in 0..40 {
+        if in_window(cx, window, |window, _| window.find(id).focused()) == Some(true) {
+            return;
+        }
+        in_window(cx, window, |window, cx| window.press("tab", cx));
+    }
+    panic!("Tab did not reach {id}");
 }
 
 /// A data dir of an app that is signed in to `server` and watches WEB, but

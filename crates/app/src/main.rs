@@ -14,6 +14,10 @@ use initial_sync::{InitialSync, InitialSyncDone};
 use issue::IssueModel;
 use issue_detail::{DetailClosed, DetailPane};
 use issue_list::{IssueList, IssueOpened};
+use keys::{
+    Back, ChangeAssignee, ChangeStatus, EditProjects, EditTimeTracking, LogTime, OpenInJira,
+    OpenTimerIssue, ShowShortcuts, SyncNow, ToggleTimer, WriteComment,
+};
 use new_token::{NewToken, TokenRenewed};
 use projects::{ProjectPicker, ProjectsCancelled, ProjectsChosen};
 use runtime::{Core, SyncBridge};
@@ -32,6 +36,7 @@ mod initial_sync;
 mod issue;
 mod issue_detail;
 mod issue_list;
+mod keys;
 mod menu;
 mod new_token;
 mod projects;
@@ -67,6 +72,9 @@ enum Screen {
 
 struct Root {
     screen: Screen,
+    // Has the focus on a screen without the issue list while no control of
+    // it does: Tab does not start from nowhere
+    focus: FocusHandle,
     // The sync error the user was last told about. While Jira is down every
     // cycle fails the same way, and one notification is enough.
     notified_error: Option<String>,
@@ -92,10 +100,25 @@ impl Root {
                 .set_window_focused(window.is_window_active())
         })
         .detach();
-        Self {
+        let this = Self {
             screen: Self::screen(step, window, cx),
+            focus: cx.focus_handle(),
             notified_error: None,
             tempo_rejection_shown: false,
+        };
+        this.rest_focus(window, cx);
+        this
+    }
+
+    /// Gives the focus to where the keys are expected when no control has
+    /// it: the issue list, which the shortcuts are bound to, or the screen.
+    /// Called when the view that may have had the focus goes away. The focus
+    /// does not become empty by itself then: GPUI Kit keeps the last focused
+    /// input alive.
+    fn rest_focus(&self, window: &mut Window, cx: &mut App) {
+        match &self.screen {
+            Screen::Home { list, .. } => list.focus_handle(cx).focus(window, cx),
+            _ => self.focus.focus(window, cx),
         }
     }
 
@@ -137,10 +160,11 @@ impl Root {
             return;
         }
         let banner = cx.new(|cx| NewToken::new(window, cx));
-        cx.subscribe(&banner, |this, _, _: &TokenRenewed, cx| {
+        cx.subscribe_in(&banner, window, |this, _, _: &TokenRenewed, window, cx| {
             if let Screen::Home { new_token, .. } = &mut this.screen {
                 *new_token = None;
             }
+            this.rest_focus(window, cx);
             cx.notify();
         })
         .detach();
@@ -150,6 +174,7 @@ impl Root {
 
     fn show(&mut self, step: SetupStep, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = Self::screen(step, window, cx);
+        self.rest_focus(window, cx);
         cx.notify();
     }
 
@@ -246,13 +271,67 @@ impl Root {
         )
         .detach();
         self.screen = Screen::Settings(settings);
+        self.rest_focus(window, cx);
         cx.notify();
     }
 
     fn edit_projects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.screen, Screen::Home { .. }) {
             self.screen = Screen::ChooseProjects(Self::picker(true, window, cx));
+            self.rest_focus(window, cx);
             cx.notify();
+        }
+    }
+
+    /// Escape leads back to the list from wherever the focus is, and from the
+    /// list it closes the issue.
+    fn back(&mut self, _: &Back, window: &mut Window, cx: &mut Context<Self>) {
+        let Screen::Home { list, detail, .. } = &mut self.screen else {
+            return;
+        };
+        let focus = list.focus_handle(cx);
+        if !focus.is_focused(window) {
+            focus.focus(window, cx);
+        } else if detail.take().is_some() {
+            list.update(cx, |list, cx| list.closed(cx));
+            cx.notify();
+        }
+    }
+
+    /// Runs `act` on the open issue. Without one its shortcuts do nothing.
+    fn in_detail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        act: fn(&mut DetailPane, &mut Window, &mut Context<DetailPane>),
+    ) {
+        if let Screen::Home {
+            detail: Some(detail),
+            ..
+        } = &self.screen
+        {
+            detail.update(cx, |detail, cx| act(detail, window, cx));
+        }
+    }
+
+    fn toggle_timer(&mut self, _: &ToggleTimer, _: &mut Window, cx: &mut Context<Self>) {
+        if let Screen::Home {
+            detail: Some(detail),
+            timer,
+            ..
+        } = &self.screen
+        {
+            let key = detail.read(cx).key(cx);
+            timer.update(cx, |timer, cx| timer.toggle(key, cx));
+        }
+    }
+
+    fn open_timer_issue(&mut self, _: &OpenTimerIssue, _: &mut Window, cx: &mut Context<Self>) {
+        let Screen::Home { list, timer, .. } = &self.screen else {
+            return;
+        };
+        if let Some(key) = timer.read(cx).issue().cloned() {
+            list.update(cx, |list, cx| list.open(key, cx));
         }
     }
 
@@ -276,22 +355,29 @@ impl Root {
         let timer = timer.clone();
         let pane = cx.new(|cx| DetailPane::new(issue, timer, window, cx));
         let list = list.clone();
-        cx.subscribe(&pane, move |this, _, _: &DetailClosed, cx| {
-            if let Screen::Home { detail, .. } = &mut this.screen {
-                *detail = None;
-            }
-            list.update(cx, |list, cx| list.closed(cx));
-            cx.notify();
-        })
+        cx.subscribe_in(
+            &pane,
+            window,
+            move |this, _, _: &DetailClosed, window, cx| {
+                if let Screen::Home { detail, .. } = &mut this.screen {
+                    *detail = None;
+                }
+                list.update(cx, |list, cx| list.closed(cx));
+                this.rest_focus(window, cx);
+                cx.notify();
+            },
+        )
         .detach();
         *detail = Some(pane);
+        // The issue shown until now may have had the focus in its comment
+        self.rest_focus(window, cx);
         cx.notify();
     }
 }
 
 impl Render for Root {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.screen {
+        let screen = match &self.screen {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
             Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
             Screen::InitialSync(sync) => sync.clone().into_any_element(),
@@ -307,6 +393,35 @@ impl Render for Root {
             } => div()
                 .id("home")
                 .test_support()
+                .key_context(keys::HOME)
+                .on_action(cx.listener(Self::back))
+                .on_action(cx.listener(|this, _: &ChangeStatus, window, cx| {
+                    this.in_detail(window, cx, DetailPane::change_status)
+                }))
+                .on_action(cx.listener(|this, _: &ChangeAssignee, window, cx| {
+                    this.in_detail(window, cx, DetailPane::change_assignee)
+                }))
+                .on_action(cx.listener(|this, _: &WriteComment, window, cx| {
+                    this.in_detail(window, cx, DetailPane::write_comment)
+                }))
+                .on_action(cx.listener(|this, _: &LogTime, window, cx| {
+                    this.in_detail(window, cx, DetailPane::log_time)
+                }))
+                .on_action(cx.listener(|this, _: &OpenInJira, window, cx| {
+                    this.in_detail(window, cx, DetailPane::open_in_jira)
+                }))
+                .on_action(cx.listener(Self::toggle_timer))
+                .on_action(cx.listener(Self::open_timer_issue))
+                .on_action(|_: &SyncNow, _, cx| app_core::api::sync_now(&cx.global::<Core>().state))
+                .on_action(cx.listener(|this, _: &EditTimeTracking, window, cx| {
+                    this.edit_settings(window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &EditProjects, window, cx| {
+                        this.edit_projects(window, cx)
+                    }),
+                )
+                .on_action(|_: &ShowShortcuts, window, cx| keys::show(window, cx))
                 .size_full()
                 .flex()
                 .flex_col()
@@ -370,10 +485,19 @@ impl Render for Root {
                                     this.edit_projects(window, cx)
                                 })),
                         )
-                        .child(account.clone()),
+                        .child(account.clone())
+                        .child(
+                            Button::new("show-shortcuts")
+                                .ghost()
+                                .xsmall()
+                                .label("?")
+                                .accessibility_label("Keyboard shortcuts")
+                                .on_click(|_, window, cx| keys::show(window, cx)),
+                        ),
                 )
                 .into_any_element(),
-        }
+        };
+        div().size_full().track_focus(&self.focus).child(screen)
     }
 }
 
@@ -401,6 +525,7 @@ fn main() -> anyhow::Result<()> {
         init(cx);
         theme::init(cx);
         menu::init(cx);
+        keys::init(cx);
 
         let sync = cx.new(|cx| SyncBridge::new(events, cx));
         cx.set_global(Core {

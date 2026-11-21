@@ -19,6 +19,8 @@ pub struct AssigneeButton {
     // The account id of the signed-in user
     me: Option<String>,
     loading: bool,
+    // Of the button, for the shortcut that opens its menu
+    focus: FocusHandle,
     _load: Task<()>,
     _issue_changed: Subscription,
 }
@@ -32,11 +34,19 @@ impl AssigneeButton {
             people: Vec::new(),
             me: None,
             loading: false,
+            focus: cx.focus_handle(),
             _load: Task::ready(()),
             _issue_changed,
         };
         this.load_people(cx);
         this
+    }
+
+    /// Opens the menu, unless the button is disabled for having nobody to offer.
+    pub fn open_menu(&self, window: &mut Window, cx: &mut App) {
+        if !self.people.is_empty() {
+            crate::keys::open_menu(&self.focus, window, cx);
+        }
     }
 
     // The list does not depend on the assignee, so choosing one needs no new
@@ -114,6 +124,7 @@ impl Render for AssigneeButton {
             .map(|name| Avatar::new().name(name).xsmall());
 
         Button::new("assignee-button")
+            .track_focus(&self.focus)
             .small()
             .outline()
             .dropdown_caret(true)

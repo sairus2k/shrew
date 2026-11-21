@@ -11,9 +11,9 @@ use crate::transition::StatusButton;
 use crate::worklog::WorklogForm;
 use app_core::{
     api,
-    models::{Comment, IssueDetail, SyncStatus, Worklog},
+    models::{Comment, IssueDetail, IssueKey, SyncStatus, Worklog},
 };
-use gpui_kit::base::StyledExt as _;
+use gpui_kit::base::{ElementExt as _, StyledExt as _};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     avatar::Avatar,
@@ -21,6 +21,7 @@ use gpui_kit::component::{
     text::{MarkdownExtensions, MarkdownNode, TextView, TextViewStyle, markdown_ast},
 };
 use gpui_kit::*;
+use std::{cell::Cell, rc::Rc};
 
 /// Emitted when the user closes the pane.
 pub struct DetailClosed;
@@ -32,6 +33,9 @@ pub struct DetailPane {
     comment_form: Entity<CommentForm>,
     worklog_form: Entity<WorklogForm>,
     timer: Entity<TimerControl>,
+    scroll: ScrollHandle,
+    // Where the comment form was painted last, to scroll it into view
+    comment_bounds: Rc<Cell<Bounds<Pixels>>>,
     _issue_changed: Subscription,
 }
 
@@ -52,8 +56,52 @@ impl DetailPane {
             comment_form: cx.new(|cx| CommentForm::new(key.clone(), window, cx)),
             worklog_form: cx.new(|cx| WorklogForm::new(key.clone(), window, cx)),
             timer: cx.new(|cx| TimerControl::new(key, timer, cx)),
+            scroll: ScrollHandle::new(),
+            comment_bounds: Rc::default(),
             issue,
             _issue_changed,
+        }
+    }
+
+    pub fn key(&self, cx: &App) -> IssueKey {
+        self.issue.read(cx).key.clone()
+    }
+
+    pub fn change_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.status
+            .update(cx, |status, cx| status.open_menu(window, cx));
+    }
+
+    pub fn change_assignee(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.assignee
+            .update(cx, |assignee, cx| assignee.open_menu(window, cx));
+    }
+
+    /// Puts the cursor into the comment input. Under a long description the
+    /// input is out of view, and nothing scrolls to a focused element by itself.
+    pub fn write_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_form
+            .update(cx, |form, cx| form.focus(window, cx));
+        let (pane, form) = (self.scroll.bounds(), self.comment_bounds.get());
+        let below = (form.bottom() - pane.bottom()).max(px(0.));
+        let above = (pane.top() - form.top()).max(px(0.));
+        let mut offset = self.scroll.offset();
+        // A form taller than the pane shows its top
+        offset.y += if above > px(0.) { above } else { -below };
+        self.scroll.set_offset(offset);
+        cx.notify();
+    }
+
+    pub fn log_time(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.worklog_form
+            .update(cx, |form, cx| form.focus(window, cx));
+        self.scroll.set_offset(Point::default());
+        cx.notify();
+    }
+
+    pub fn open_in_jira(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(detail) = &self.issue.read(cx).detail {
+            cx.open_url(&detail.url);
         }
     }
 }
@@ -359,6 +407,7 @@ fn body(
     status: Entity<StatusButton>,
     assignee_button: Entity<AssigneeButton>,
     comment_form: Entity<CommentForm>,
+    comment_bounds: Rc<Cell<Bounds<Pixels>>>,
     worklog_form: Entity<WorklogForm>,
     cx: &App,
 ) -> impl IntoElement {
@@ -479,7 +528,12 @@ fn body(
                 .enumerate()
                 .map(|(index, each)| comment(index, each, cx)),
         )
-        .child(comment_form);
+        .child(
+            div()
+                .w_full()
+                .on_prepaint(move |bounds, _, _| comment_bounds.set(bounds))
+                .child(comment_form),
+        );
 
     let worklogs = div()
         .py_3()
@@ -568,6 +622,7 @@ impl Render for DetailPane {
                 self.status.clone(),
                 self.assignee.clone(),
                 self.comment_form.clone(),
+                self.comment_bounds.clone(),
                 self.worklog_form.clone(),
                 cx,
             )
@@ -579,6 +634,7 @@ impl Render for DetailPane {
             .aria_label(issue.key.to_string())
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             // Without it a sideways swipe over code or a table also moves the pane
             .restrict_scroll_to_axis()
             // At least as tall as the pane, so that the surface of the
@@ -597,7 +653,9 @@ impl Render for DetailPane {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::duration::local_minute;
-    use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
+    use crate::harness::{
+        in_window, launch, no_worklog_changes, tab_to, tokio_runtime, wait_until,
+    };
     use crate::issue_list::tests::{issue, rows, sync_brings, synced, synced_on};
     use crate::runtime::Core;
     use app_core::{SyncEvent, api};
@@ -1185,6 +1243,17 @@ pub(crate) mod tests {
             );
             window.click("retry-worklog-0", cx);
         });
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("You, {earlier}, 15m, pending")]
+        });
+        tokio.block_on(state.sync_once()).unwrap();
+        wait_until(cx, window, |window| {
+            worklog_lines(window) == [format!("You, {earlier}, 15m, not sent")]
+        });
+
+        // And again when the retry comes from the keyboard
+        tab_to(cx, window, "retry-worklog-0");
+        in_window(cx, window, |window, cx| window.press("enter", cx));
         wait_until(cx, window, |window| {
             worklog_lines(window) == [format!("You, {earlier}, 15m, pending")]
         });

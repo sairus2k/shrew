@@ -136,7 +136,7 @@ impl Render for Account {
 #[cfg(test)]
 mod tests {
     use crate::{
-        harness::{in_window, launch, tokio_runtime, wait_until},
+        harness::{in_window, launch, tab_to, tokio_runtime, wait_until},
         issue_list::tests::{issue, rows, synced},
         runtime::Core,
         sign_in::tests::{fill_in_and_submit, jira},
@@ -216,6 +216,20 @@ mod tests {
             assert!(window.try_find("site-url").is_some());
             assert!(window.try_find("home").is_none());
         });
+    }
+
+    #[gpui_kit::test]
+    fn tab_and_enter_sign_out(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for(cx, window, "sign-out");
+
+        tab_to(cx, window, "sign-out");
+        in_window(cx, window, |window, cx| window.press("enter", cx));
+
+        wait_for(cx, window, "site-url");
+        assert!(!credentials_are_saved(data_dir.path()));
     }
 
     #[gpui_kit::test]

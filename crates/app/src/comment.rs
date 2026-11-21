@@ -22,13 +22,26 @@ pub struct CommentForm {
 impl CommentForm {
     pub fn new(key: IssueKey, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10));
-        let _typing = cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify());
+        let _typing = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            // Enter alone is a new line of the comment
+            if let InputEvent::PressEnter {
+                secondary: true, ..
+            } = event
+            {
+                this.submit(window, cx);
+            }
+            cx.notify()
+        });
         Self {
             key,
             input,
             sending: false,
             _typing,
         }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.input.update(cx, |input, cx| input.focus(window, cx));
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -92,7 +105,9 @@ impl Render for CommentForm {
 
 #[cfg(test)]
 mod tests {
-    use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
+    use crate::harness::{
+        in_window, launch, no_worklog_changes, tab_to, tokio_runtime, wait_until,
+    };
     use crate::issue_detail::tests::painted;
     use crate::issue_list::tests::{issue, synced_on};
     use crate::runtime::Core;
@@ -452,5 +467,95 @@ mod tests {
         // Nothing is left to send
         tokio.block_on(core(cx).sync_once()).unwrap();
         assert_eq!(posts(&tokio, &server).len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn a_comment_jira_refuses_is_discarded_with_tab_and_enter(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([issue(1, "Fix login")])));
+        tokio.block_on(refuse_one_comment(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+        comment_that_jira_refuses(cx, &tokio, window);
+
+        tab_to(cx, window, "discard-comment-0");
+        in_window(cx, window, |window, cx| window.press("enter", cx));
+
+        wait_until(cx, window, |window| {
+            window.try_find("no-comments").is_some()
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_comment_jira_refuses_is_retried_with_tab_and_space(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([issue(1, "Fix login")])));
+        tokio.block_on(refuse_one_comment(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+        comment_that_jira_refuses(cx, &tokio, window);
+
+        tab_to(cx, window, "retry-comment-0");
+        in_window(cx, window, |window, cx| window.press("space", cx));
+
+        wait_until(cx, window, |window| headings(window) == ["You, pending"]);
+    }
+
+    #[gpui_kit::test]
+    fn a_comment_under_a_long_thread_is_written_and_sent_from_the_keyboard(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let mut long = issue(1, "Fix login");
+        let thread = vec![jira_comment(); 30];
+        long["fields"]["comment"] = json!({ "total": 30, "comments": thread });
+        let server = tokio.block_on(jira(local_port(), json!([long])));
+        let data_dir = synced_on(&tokio, &server.uri(), &[long]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+        wait_until(cx, window, |window| {
+            window.try_find("comment-input").is_some()
+        });
+        let in_view = |window: &Window| {
+            let pane = window.find("issue-detail").bounds();
+            let input = window.find("comment-input").bounds();
+            pane.top() <= input.top() && input.bottom() <= pane.bottom()
+        };
+        // The description is laid out a moment after the pane opens
+        in_window(cx, window, |window, cx| {
+            let to_the_top = ScrollDelta::Pixels(point(px(0.), px(100_000.)));
+            window.scroll("issue-detail", to_the_top, cx);
+            window.render_frame(cx);
+            assert!(!in_view(window));
+        });
+
+        in_window(cx, window, |window, cx| {
+            window.press("c", cx);
+            window.render_frame(cx);
+            assert!(in_view(window));
+            window.input("Seen on staging", cx);
+            // Enter alone is a new line
+            window.press("enter", cx);
+            window.input("and in production", cx);
+        });
+        cx.run_until_parked();
+        in_window(cx, window, |window, cx| {
+            assert!(window.try_find("comment-30").is_none());
+            window.press("cmd-enter", cx);
+        });
+
+        wait_until(cx, window, |window| {
+            window
+                .try_find("comment-30")
+                .is_some_and(|comment| comment.label() == Some("You, pending"))
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(
+                painted(window, ("comment-body", 30usize)),
+                "Seen on staging\nand in production"
+            );
+        });
     }
 }

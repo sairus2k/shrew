@@ -1,5 +1,6 @@
 //! The main screen: the cached issues and the search over them.
 
+use crate::keys::{self, FilterByProject, FocusSearch, OpenSelected, SelectNext, SelectPrevious};
 use crate::runtime::{Core, spawn};
 use crate::theme::{status_dot, tabular_digits};
 use app_core::{
@@ -28,19 +29,38 @@ pub struct IssueList {
     issues: Vec<IssueRow>,
     // The issue shown beside the list
     opened: Option<IssueKey>,
+    // The issue the keyboard is on
+    selected: Option<IssueKey>,
+    // Rests here while the user types nowhere, which is when the shortcuts apply
+    focus: FocusHandle,
+    filter_focus: FocusHandle,
+    scroll: UniformListScrollHandle,
     loading: Task<()>,
 }
 
 impl EventEmitter<IssueOpened> for IssueList {}
 
+impl Focusable for IssueList {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl IssueList {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search issues"));
-        cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
-            if let InputEvent::Change = event {
-                this.reload(cx);
-            }
-        })
+        cx.subscribe_in(
+            &query,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.reload(cx),
+                InputEvent::PressEnter { .. } => {
+                    this.open_selected(cx);
+                    this.focus.focus(window, cx);
+                }
+                _ => {}
+            },
+        )
         .detach();
         let sync = cx.global::<Core>().sync.clone();
         cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
@@ -56,6 +76,10 @@ impl IssueList {
             project: None,
             issues: Vec::new(),
             opened: None,
+            selected: None,
+            focus: cx.focus_handle(),
+            filter_focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
             loading: Task::ready(()),
         };
         this.reload(cx);
@@ -84,7 +108,35 @@ impl IssueList {
         cx.notify();
     }
 
+    /// Moves the selection `by` rows. With nothing selected it starts at the top.
+    fn select(&mut self, by: isize, cx: &mut Context<Self>) {
+        let selected = self.selected.as_ref();
+        let at = selected.and_then(|key| self.issues.iter().position(|issue| &issue.key == key));
+        let last = self.issues.len().saturating_sub(1);
+        let to = at.map_or(0, |at| at.saturating_add_signed(by).min(last));
+        let Some(issue) = self.issues.get(to) else {
+            return;
+        };
+        self.selected = Some(issue.key.clone());
+        self.scroll.scroll_to_item(to, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// Opens the selected issue, or the first one when none on screen is selected.
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected.as_ref();
+        let issue = self
+            .issues
+            .iter()
+            .find(|issue| Some(&issue.key) == selected)
+            .or(self.issues.first());
+        if let Some(issue) = issue {
+            self.open(issue.key.clone(), cx);
+        }
+    }
+
     pub fn open(&mut self, key: IssueKey, cx: &mut Context<Self>) {
+        self.selected = Some(key.clone());
         self.opened = Some(key.clone());
         cx.emit(IssueOpened(key));
         cx.notify();
@@ -127,7 +179,9 @@ impl IssueList {
     fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         self.issues[range]
             .iter()
-            .map(|issue| row(issue, self.opened.as_ref(), cx).into_any_element())
+            .map(|issue| {
+                row(issue, self.opened.as_ref(), self.selected.as_ref(), cx).into_any_element()
+            })
             .collect()
     }
 }
@@ -135,8 +189,10 @@ impl IssueList {
 fn row(
     issue: &IssueRow,
     opened: Option<&IssueKey>,
+    selected: Option<&IssueKey>,
     cx: &mut Context<IssueList>,
 ) -> impl IntoElement + use<> {
+    let selected = selected == Some(&issue.key);
     let muted = cx.theme().muted_foreground;
     let hover = cx.theme().list_hover;
     let done = issue.status_category == StatusCategory::Done;
@@ -156,10 +212,18 @@ fn row(
         .role(Role::ListItem)
         .test_support()
         .aria_label(label)
+        .aria_selected(selected)
         // uniform_list gives every row the height of the first one
         .h(px(32.))
         .w_full()
         .px_4()
+        // Every row has the border, so that the selected one does not shift
+        .border_l_2()
+        .border_color(if selected {
+            cx.theme().ring
+        } else {
+            transparent_black()
+        })
         .flex()
         .items_center()
         .gap_3()
@@ -168,7 +232,11 @@ fn row(
             true => row.bg(cx.theme().list_active),
             false => row.hover(|row| row.bg(hover)),
         })
-        .on_click(cx.listener(move |this, _, _, cx| this.open(key.clone(), cx)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            // The keys follow the mouse to the list
+            this.focus.focus(window, cx);
+            this.open(key.clone(), cx)
+        }))
         .child(status_dot(issue.status_category, cx))
         .child(
             div()
@@ -262,6 +330,7 @@ impl Render for IssueList {
                     .when(choosable, |bar| {
                         bar.child(
                             Button::new("project-filter")
+                                .track_focus(&self.filter_focus)
                                 .small()
                                 .label(self.project.clone().unwrap_or("All projects".to_owned()))
                                 .dropdown_menu(move |mut menu, window, _| {
@@ -290,6 +359,20 @@ impl Render for IssueList {
                     self.issues.len(),
                     cx.processor(|this, range, _, cx| this.rows(range, cx)),
                 )
+                .track_scroll(&self.scroll)
+                .track_focus(&self.focus)
+                .key_context(keys::LIST)
+                .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select(1, cx)))
+                .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.select(-1, cx)))
+                .on_action(cx.listener(|this, _: &OpenSelected, _, cx| this.open_selected(cx)))
+                .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                    this.query.update(cx, |query, cx| query.focus(window, cx))
+                }))
+                .on_action(cx.listener(move |this, _: &FilterByProject, window, cx| {
+                    if choosable {
+                        keys::open_menu(&this.filter_focus, window, cx)
+                    }
+                }))
                 .flex_1()
                 .min_h_0(),
             )
@@ -573,6 +656,50 @@ pub(crate) mod tests {
             choose_project(window, cx, "All projects")
         });
         wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+    }
+
+    #[gpui_kit::test]
+    fn the_project_is_chosen_from_the_keyboard(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &two_projects());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+
+        // The menu holds All projects, WEB and API
+        for key in ["p", "down", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+
+        wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("project-filter").label(), Some("WEB"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_selection_stays_in_view_while_it_moves_down_a_long_list(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let issues: Vec<_> = (1..=60)
+            .map(|id| issue(id, &format!("Task {id}")))
+            .collect();
+        let data_dir = synced(&tokio, &issues);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| !rows(window).is_empty());
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("issue-WEB-21").is_none());
+        });
+
+        // WEB-60 is the first row
+        for _ in 0..40 {
+            in_window(cx, window, |window, cx| window.press("j", cx));
+        }
+
+        in_window(cx, window, |window, _| {
+            let row = window.find("issue-WEB-21");
+            assert_eq!(row.selected(), Some(true));
+            let list = window.find("home").bounds();
+            assert!(row.bounds().top() >= list.top() && row.bounds().bottom() <= list.bottom());
+        });
     }
 
     #[gpui_kit::test]

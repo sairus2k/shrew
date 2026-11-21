@@ -113,6 +113,19 @@ impl ActiveTimer {
         self.set_running(None, cx);
     }
 
+    /// Stops the timer when it runs on `issue_key`, and starts it there otherwise.
+    pub fn toggle(&mut self, issue_key: IssueKey, cx: &mut Context<Self>) {
+        match &self.running {
+            Some(timer) if timer.issue_key == issue_key => self.stop(cx),
+            _ => self.start(issue_key, cx),
+        }
+    }
+
+    /// The issue the timer runs on.
+    pub fn issue(&self) -> Option<&IssueKey> {
+        self.running.as_ref().map(|timer| &timer.issue_key)
+    }
+
     fn set_running(&mut self, running: Option<RunningTimer>, cx: &mut Context<Self>) {
         // The loop only repaints; the elapsed time comes from the start. Assigning
         // the task drops the previous loop.

@@ -27,6 +27,8 @@ pub struct StatusButton {
     saving: bool,
     // Open while the user fills in the fields of a transition
     form: Option<Entity<TransitionFieldsForm>>,
+    // Of the button, for the shortcut that opens its menu
+    focus: FocusHandle,
     _form_events: Option<Subscription>,
     _load: Task<()>,
     _issue_changed: Subscription,
@@ -44,12 +46,20 @@ impl StatusButton {
             loaded_for: None,
             saving: false,
             form: None,
+            focus: cx.focus_handle(),
             _form_events: None,
             _load: Task::ready(()),
             _issue_changed,
         };
         this.load_transitions(cx);
         this
+    }
+
+    /// Opens the menu, unless the button is disabled for having no transitions.
+    pub fn open_menu(&self, window: &mut Window, cx: &mut App) {
+        if !self.transitions.is_empty() {
+            crate::keys::open_menu(&self.focus, window, cx);
+        }
     }
 
     fn load_transitions(&mut self, cx: &mut Context<Self>) {
@@ -164,6 +174,7 @@ impl Render for StatusButton {
             .gap_2()
             .child(
                 Button::new("status-button")
+                    .track_focus(&self.focus)
                     .small()
                     .outline()
                     .dropdown_caret(true)

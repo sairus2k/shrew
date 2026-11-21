@@ -7,7 +7,7 @@ use chrono::Local;
 use gpui_kit::component::{
     ActiveTheme, Disableable, WindowExt as _,
     button::Button,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     notification::Notification,
 };
 use gpui_kit::*;
@@ -22,6 +22,7 @@ pub struct WorklogForm {
     // The input stays filled until the core has queued the entry, so a failed
     // write loses nothing; the flag keeps a second click from queueing it twice
     sending: bool,
+    _enter: [Subscription; 3],
 }
 
 impl WorklogForm {
@@ -33,6 +34,13 @@ impl WorklogForm {
             input
         });
         let comment = cx.new(|cx| InputState::new(window, cx).placeholder("Comment (optional)"));
+        let _enter = [&duration, &started, &comment].map(|input| {
+            cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit(window, cx);
+                }
+            })
+        });
         Self {
             key,
             duration,
@@ -40,7 +48,14 @@ impl WorklogForm {
             comment,
             error: None,
             sending: false,
+            _enter,
         }
+    }
+
+    /// Puts the cursor into the time spent.
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.duration
+            .update(cx, |input, cx| input.focus(window, cx));
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
