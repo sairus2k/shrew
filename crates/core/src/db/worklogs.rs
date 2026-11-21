@@ -117,15 +117,16 @@ pub(crate) async fn confirm_tempo(
     Ok(())
 }
 
+/// Returns whether the worklog is still in the cache.
 pub(crate) async fn mark_failed(
     executor: impl sqlx::SqliteExecutor<'_>,
     local_id: &str,
-) -> sqlx::Result<()> {
-    sqlx::query("UPDATE worklogs SET sync_status = 'failed' WHERE local_id = ?")
+) -> sqlx::Result<bool> {
+    let updated = sqlx::query("UPDATE worklogs SET sync_status = 'failed' WHERE local_id = ?")
         .bind(local_id)
         .execute(executor)
         .await?;
-    Ok(())
+    Ok(updated.rows_affected() > 0)
 }
 
 /// The worklog Jira has under `remote_id` replaces the cached one, so a worklog

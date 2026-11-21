@@ -125,6 +125,19 @@ pub(crate) async fn remove_for_issue(
     .await
 }
 
+/// Deletes the refused worklogs of an issue, which no view can show once the
+/// worklog rows of the issue are gone.
+pub(crate) async fn remove_failed_worklogs(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    key: &IssueKey,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM sync_queue WHERE issue_key = ? AND entity_type = 'worklog' AND status = 'failed'")
+        .bind(key)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
 /// Drops the status changes of an issue that have not been sent. Returns how
 /// many there were.
 pub(crate) async fn drop_unsent_transitions(

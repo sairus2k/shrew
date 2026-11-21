@@ -120,7 +120,11 @@ pub(crate) async fn process_queue(
                     if entry.entity_type == "worklog" {
                         let payload: Value = serde_json::from_str(&entry.payload)?;
                         let local_id = payload["local_id"].as_str().unwrap_or_default();
-                        worklogs::mark_failed(&state.pool, local_id).await?;
+                        // After the project was unwatched no row is left to show the
+                        // refusal on (the user is told by the event below)
+                        if !worklogs::mark_failed(&state.pool, local_id).await? {
+                            sync_queue::remove(&state.pool, entry.id).await?;
+                        }
                     }
                 }
                 // A refused comment moves from the pending ones to the refused ones
@@ -383,7 +387,7 @@ mod tests {
     use super::*;
     use crate::{
         api,
-        models::{StatusCategory, SyncStatus, Transition, User},
+        models::{RunningTimer, StatusCategory, SyncStatus, Transition, User},
         start_syncing_without_keychain, start_without_keychain,
         sync::inbound,
     };
@@ -2027,6 +2031,120 @@ mod tests {
                 .is_none()
         );
         assert_eq!(received(&mut events), Vec::<String>::new());
+    }
+
+    async fn worklogs_of(state: &AppState, key: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM worklogs WHERE issue_key = ?")
+            .bind(key)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn worklog_entries(state: &AppState) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT status FROM sync_queue WHERE entity_type = 'worklog' ORDER BY id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unwatching_a_project_removes_its_worklogs_and_timer_but_still_delivers_the_pending_worklog()
+     {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "30002"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, sync_status)
+             VALUES ('1', 'WEB-1', 60, '2026-03-29T08:15:00.000Z', 'synced'),
+                    ('2', 'API-1', 60, '2026-03-29T08:15:00.000Z', 'synced')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        api::start_timer(
+            &state,
+            &RunningTimer {
+                issue_key: "WEB-1".into(),
+                started_at: STARTED,
+            },
+        )
+        .await
+        .unwrap();
+
+        unwatch_web(&state, &server).await;
+
+        assert_eq!(worklogs_of(&state, "WEB-1").await, 0);
+        assert_eq!(worklogs_of(&state, "API-1").await, 1);
+        assert!(api::running_timer(&state).await.unwrap().is_none());
+        assert_eq!(worklog_entries(&state).await, ["pending"]);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(delivered, keys(&["WEB-1"]));
+        assert_eq!(worklog_entries(&state).await, ["synced"]);
+        assert_eq!(worklogs_of(&state, "WEB-1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_worklog_of_a_removed_project_leaves_no_entry_that_nothing_can_show() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        worklog_call("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("no permission"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        api::log_time(&state, &"WEB-1".into(), 600, STARTED, None)
+            .await
+            .unwrap();
+        api::log_time(&state, &"WEB-1".into(), 900, STARTED + 3600, None)
+            .await
+            .unwrap();
+        // The first one was refused before the project was removed
+        let first: i64 = sqlx::query_scalar("SELECT MIN(id) FROM sync_queue")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET status = 'failed' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        unwatch_web(&state, &server).await;
+
+        assert_eq!(worklog_entries(&state).await, ["pending"]);
+        received(&mut events);
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        assert!(delivered.is_empty());
+        assert!(worklog_entries(&state).await.is_empty());
+        assert!(
+            received(&mut events)
+                .iter()
+                .any(|event| event.starts_with("ChangeRejected") && event.contains("worklog"))
+        );
     }
 
     #[tokio::test]

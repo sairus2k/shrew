@@ -205,8 +205,9 @@ pub async fn projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
 
 /// Saves the projects whose issues the app keeps locally. After the initial
 /// sync the added projects wait for `initial_sync` to download them, and the
-/// cached issues of the removed ones are deleted. Their queued changes are
-/// still sent to Jira: the user made them on purpose.
+/// cached issues of the removed ones are deleted, with their worklogs and
+/// timer. Their queued changes are still sent to Jira: the user made them on
+/// purpose.
 pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow::Result<()> {
     if project_keys.is_empty() {
         bail!("Choose at least one project");
@@ -236,6 +237,10 @@ pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow
     for issue in db::issues::cached(&mut *tx).await? {
         if !project_keys.contains(&issue.project_key) {
             db::issues::delete(&mut *tx, &issue.id).await?;
+            db::worklogs::delete_for_issue(&mut *tx, &issue.key).await?;
+            db::timer::delete_for_issue(&mut *tx, &issue.key).await?;
+            // A refused worklog has no row left to be retried or discarded from
+            db::sync_queue::remove_failed_worklogs(&mut *tx, &issue.key).await?;
             removed.push(issue.key);
         }
     }
