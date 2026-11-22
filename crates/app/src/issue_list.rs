@@ -870,7 +870,8 @@ pub(crate) mod tests {
     };
     use gpui_kit::test::{TestEventExt, TestQueryExt, TestWindowExt};
     use gpui_kit::{
-        AnyWindowHandle, AppContext, MouseButton, Role, TestAppContext, Window, WindowOptions, px,
+        AnyWindowHandle, AppContext, Entity, MouseButton, Role, TestAppContext, Window,
+        WindowOptions, px,
     };
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
@@ -1112,6 +1113,41 @@ pub(crate) mod tests {
         wait_until(cx, window, |window| {
             window.try_find("project-filter").is_some()
         });
+    }
+
+    /// Waits until `list` has read the watched projects and they are `expected`.
+    #[track_caller]
+    fn wait_for_projects(cx: &mut TestAppContext, list: &Entity<IssueList>, expected: &[&str]) {
+        let started = Instant::now();
+        while list.read_with(cx, |list, _| list.projects != expected) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the projects were not read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+    }
+
+    /// The same for the list of the home screen of `window`: with one project
+    /// there is no button, so nothing on screen tells that they are read.
+    #[track_caller]
+    pub(crate) fn wait_for_watched(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        expected: &[&str],
+    ) {
+        let list = cx
+            .update_window(window, |root, _, cx| {
+                let root = root.downcast::<gpui_kit::base::Root>().unwrap();
+                let home = root.read(cx).view().clone().downcast::<crate::Root>();
+                match &home.unwrap().read(cx).screen {
+                    crate::Screen::Home { list, .. } => list.clone(),
+                    _ => panic!("the home screen is not open"),
+                }
+            })
+            .unwrap();
+        wait_for_projects(cx, &list, expected);
     }
 
     /// Opens the project menu and clicks the item `name`.
@@ -1865,15 +1901,7 @@ pub(crate) mod tests {
         });
         // Nothing on screen tells that the projects are read, and before
         // that the button is missing whatever their number
-        let started = Instant::now();
-        while list.read_with(cx, |list, _| list.projects != ["WEB"]) {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the projects were not read"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-            cx.run_until_parked();
-        }
+        wait_for_projects(cx, &list, &["WEB"]);
 
         in_window(cx, window, |window, _| {
             assert!(window.try_find("project-filter").is_none());
