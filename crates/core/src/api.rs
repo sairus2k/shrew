@@ -960,6 +960,7 @@ mod tests {
                 status: "In Review".to_owned(),
                 status_category: StatusCategory::InProgress,
                 sync_status: SyncStatus::Synced,
+                status_pending: false,
                 issue_type: Some("Bug".to_owned()),
                 assignee_name: Some("Ada Lovelace".to_owned()),
                 reporter_name: Some("Grace Hopper".to_owned()),
@@ -1180,6 +1181,7 @@ mod tests {
         assert_eq!(issue.status, "In Progress");
         assert_eq!(issue.status_category, StatusCategory::InProgress);
         assert_eq!(issue.sync_status, SyncStatus::Pending);
+        assert!(issue.status_pending);
         let queued = queued(&state).await;
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].0, "transition");
@@ -1250,6 +1252,8 @@ mod tests {
         let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
         assert_eq!(issue.assignee_name.as_deref(), Some("Grace Hopper"));
         assert_eq!(issue.sync_status, SyncStatus::Pending);
+        // The status is the one Jira has
+        assert!(!issue.status_pending);
         let row = db::issues::get(&state.pool, &"WEB-1".into()).await.unwrap();
         assert_eq!(row.unwrap().assignee_name.as_deref(), Some("Grace Hopper"));
         let queued = queued(&state).await;

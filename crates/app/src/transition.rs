@@ -538,7 +538,7 @@ mod tests {
     }
 
     fn pending(window: &Window) -> bool {
-        rows(window).iter().any(|row| row.contains("(pending)"))
+        window.try_find("sync-badge").is_some()
     }
 
     /// Opens the status menu and returns the names of its items.
@@ -602,8 +602,8 @@ mod tests {
             choose(window, cx, "Start");
             // The frame of the click: the core has not stored anything yet
             assert_eq!(status(window), "Status: In Progress");
+            assert!(pending(window));
         });
-        wait_until(cx, window, |window| pending(window));
         // The menu follows the new status, and Jira is not asked about it
         wait_until(cx, window, |window| {
             let button = window.find("status-button");
@@ -1030,9 +1030,9 @@ mod tests {
         in_window(cx, window, |window, cx| {
             choose(window, cx, "Start");
             assert_eq!(status(window), "Status: In Progress");
+            assert!(pending(window));
             assert_eq!(window.notifications(cx).len(), 0);
         });
-        wait_until(cx, window, |window| pending(window));
 
         // A sync cycle sends it and Jira says no
         let state = core(cx);

@@ -190,10 +190,24 @@ pub(crate) async fn get_detail(
         .map_or(&[][..], Vec::as_slice);
     let pending = pending_comments(pool, &row.key, &url).await?;
     let worklogs = worklogs::for_issue(pool, &row.key).await?;
+    // A pending issue with nothing in the outbox shows a status that was
+    // refused and could not be rolled back
+    let (transition, assignee): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM sync_queue
+                        WHERE issue_key = ?1 AND entity_type = 'transition'
+                          AND status IN ('pending', 'in_progress')),
+                EXISTS (SELECT 1 FROM sync_queue
+                        WHERE issue_key = ?1 AND entity_type = 'assignee'
+                          AND status IN ('pending', 'in_progress'))",
+    )
+    .bind(&row.key)
+    .fetch_one(pool)
+    .await?;
     Ok(Some(IssueDetail {
         summary: row.summary,
         status: row.status,
         status_category: row.status_category,
+        status_pending: row.sync_status == SyncStatus::Pending && (transition || !assignee),
         sync_status: row.sync_status,
         issue_type: row.issue_type,
         assignee_name: row.assignee_name,

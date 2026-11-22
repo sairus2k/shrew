@@ -225,7 +225,7 @@ mod tests {
     }
 
     fn pending(window: &Window) -> bool {
-        rows(window).iter().any(|row| row.contains("(pending)"))
+        window.try_find("sync-badge").is_some()
     }
 
     /// Opens the assignee menu and returns the names of its items.
@@ -301,7 +301,11 @@ mod tests {
             // The frame of the click: the core has not stored anything yet
             assert_eq!(assignee(window), "Assignee: Grace Hopper");
         });
-        wait_until(cx, window, |window| pending(window));
+        // The badge beside the status is for a change of the status
+        wait_until(cx, window, |window| {
+            rows(window).iter().any(|row| row.contains("(pending)"))
+        });
+        in_window(cx, window, |window, _| assert!(!pending(window)));
         wait_until(cx, window, |window| {
             window.find("assignee-button").label() == Some("Grace Hopper")
         });
@@ -351,7 +355,9 @@ mod tests {
         let state = core(cx);
         tokio.block_on(state.sync_once()).unwrap();
 
-        wait_until(cx, window, |window| !pending(window));
+        wait_until(cx, window, |window| {
+            !rows(window).iter().any(|row| row.contains("(pending)"))
+        });
         assert_eq!(
             puts(&tokio, &server),
             [

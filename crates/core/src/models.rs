@@ -105,6 +105,9 @@ pub struct IssueDetail {
     pub status_category: StatusCategory,
     /// `Pending` while a change made here has not reached Jira.
     pub sync_status: SyncStatus,
+    /// Whether `status` is such a change. A pending issue whose status Jira
+    /// has is one with another assignee.
+    pub status_pending: bool,
     pub issue_type: Option<String>,
     pub assignee_name: Option<String>,
     pub reporter_name: Option<String>,

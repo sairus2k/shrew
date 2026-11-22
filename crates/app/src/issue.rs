@@ -63,6 +63,7 @@ impl IssueModel {
             detail.status = transition.to_status.clone();
             detail.status_category = transition.to_status_category;
             detail.sync_status = SyncStatus::Pending;
+            detail.status_pending = true;
         }
         cx.notify();
     }
