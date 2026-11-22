@@ -4,6 +4,7 @@
 use crate::runtime::{Core, spawn};
 use app_core::{SyncEvent, api};
 use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -136,6 +137,13 @@ impl Render for SyncStatus {
             .role(Role::Status)
             .test_support()
             .aria_label(text.clone())
+            // A request made while a cycle runs would start one more after it
+            .when(!self.running, |status| {
+                status
+                    .cursor_pointer()
+                    .tooltip(|window, cx| Tooltip::new("Sync now").build(window, cx))
+                    .on_click(|_, _, cx| api::sync_now(&cx.global::<Core>().state))
+            })
             .child(text);
         let skipped = (!self.skipped.is_empty()).then(|| {
             let keys = self.skipped.keys().cloned().collect::<Vec<_>>().join(", ");
@@ -246,6 +254,37 @@ mod tests {
         emit(cx, SyncEvent::Error("Jira returned 502".to_owned()));
         wait_for_status(cx, window, "Last sync failed · last synced just now");
         assert_eq!(notifications(cx), 3);
+    }
+
+    #[gpui_kit::test]
+    fn a_click_on_the_status_asks_for_a_sync_unless_one_is_running(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[]);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            window.try_find("sync-status").is_some()
+        });
+        let mut sync_requests = cx.update(|cx| cx.global::<Core>().state.sync_requests());
+        assert!(!sync_requests.has_changed().unwrap());
+
+        in_window(cx, window, |window, cx| window.click("sync-status", cx));
+        assert!(sync_requests.has_changed().unwrap());
+        sync_requests.mark_unchanged();
+
+        emit(cx, SyncEvent::Started);
+        wait_until(cx, window, |window| {
+            let status = window.find("sync-status");
+            status
+                .label()
+                .is_some_and(|label| label.starts_with("Syncing…"))
+        });
+        in_window(cx, window, |window, cx| window.click("sync-status", cx));
+        assert!(!sync_requests.has_changed().unwrap());
+
+        emit(cx, SyncEvent::Completed);
+        wait_for_status(cx, window, "Synced just now");
+        in_window(cx, window, |window, cx| window.click("sync-status", cx));
+        assert!(sync_requests.has_changed().unwrap());
     }
 
     fn skip(cx: &mut TestAppContext, key: &str, reason: &str) {
