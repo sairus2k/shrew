@@ -561,8 +561,9 @@ mod tests {
         tab_to(cx, app.window, "cancel-projects");
         press(cx, &app, &["space"]);
 
-        // The list has the keys again after either screen
-        wait_until(cx, app.window, |window| window.try_find("home").is_some());
+        // The list has the keys again after either screen, and it is a new
+        // list, which the core fills a moment later
+        wait_until(cx, app.window, |window| rows(window).len() == 3);
         press(cx, &app, &["j"]);
         in_window(cx, app.window, |window, _| {
             assert_eq!(selected(window).as_deref(), Some("WEB-3"))
@@ -597,6 +598,10 @@ mod tests {
 
         press(cx, &app, &["k"]);
 
+        // The pane of WEB-2 has its form once the core has given the issue
+        wait_until(cx, app.window, |window| {
+            window.try_find_by_label("New comment").is_some()
+        });
         in_window(cx, app.window, |window, _| {
             assert_eq!(selected(window).as_deref(), Some("WEB-2"));
             assert_eq!(window.find_by_label("New comment").value(), Some(""));
