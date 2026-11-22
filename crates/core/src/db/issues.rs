@@ -1,6 +1,6 @@
 use crate::{
     adf,
-    db::{sync_queue, timer, worklogs},
+    db::{assignable, sync_queue, timer, worklogs},
     models::{
         AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
         RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
@@ -129,7 +129,8 @@ pub(crate) struct Stored {
 
 /// `upsert` for an issue read from Jira, which may have moved to another
 /// project since the cache last saw it: the outbox entries, the worklogs and
-/// the running timer of the old key follow it. Every path that stores an issue
+/// the running timer of the old key follow it, and its cached assignee
+/// candidates are dropped, since the new project may allow other people. Every path that stores an issue
 /// of Jira goes through here, because the upsert rewrites the key and a later
 /// poll then finds no move to repair.
 pub(crate) async fn store(
@@ -146,6 +147,7 @@ pub(crate) async fn store(
         sync_queue::rename_issue(&mut *conn, old, &issue.key).await?;
         worklogs::rename_issue(&mut *conn, old, &issue.key).await?;
         timer::rename_issue(&mut *conn, old, &issue.key).await?;
+        assignable::forget(&mut *conn, old).await?;
     }
     Ok(Stored {
         written,
@@ -1180,6 +1182,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    async fn store_drops_the_cached_assignees_of_the_old_key_of_a_moved_issue(pool: SqlitePool) {
+        let someone = User {
+            account_id: "a1".to_owned(),
+            display_name: "Ann".to_owned(),
+        };
+        let kept = User {
+            account_id: "a2".to_owned(),
+            display_name: "Bob".to_owned(),
+        };
+        let mut conn = pool.acquire().await.unwrap();
+        store(&mut conn, &issue("1", "PROJ-1", T1, "title"))
+            .await
+            .unwrap();
+        store(&mut conn, &issue("2", "PROJ-2", T1, "other"))
+            .await
+            .unwrap();
+        drop(conn);
+        crate::db::assignable::put(&pool, &"PROJ-1".into(), &[someone])
+            .await
+            .unwrap();
+        crate::db::assignable::put(&pool, &"PROJ-2".into(), &[kept])
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let stored = store(&mut conn, &issue("1", "OTHER-7", T2, "title"))
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(stored.moved_from, Some("PROJ-1".into()));
+        for (key, cached) in [("PROJ-1", false), ("OTHER-7", false), ("PROJ-2", true)] {
+            let row = crate::db::assignable::get(&pool, &key.into())
+                .await
+                .unwrap();
+            assert_eq!(row.is_some(), cached, "{key}");
+        }
     }
 
     #[sqlx::test]
