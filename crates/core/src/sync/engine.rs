@@ -169,6 +169,8 @@ async fn cycle(
             changed.extend(inbound::reconcile_removed_issues(state, &config, watched).await?);
             *reconciled = true;
         }
+        // After the issue poll, which brings the issues a sprint was given
+        inbound::refresh_sprints(state, &config, watched, &mut changed).await?;
         anyhow::Ok(())
     }
     .await;

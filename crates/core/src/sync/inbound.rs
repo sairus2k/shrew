@@ -5,6 +5,7 @@ use crate::{
     auth::Config,
     db::{
         issues::{self, IssueRecord, JiraTimestamp},
+        sprints::{self, SprintRecord},
         sync_queue,
         sync_state::{self, Position},
         timer,
@@ -17,7 +18,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -229,6 +230,13 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
     if state.config.read().await.is_some() {
         sync_state::finish_initial_sync(&state.pool, started_at).await?;
     }
+    // After the sync is marked as finished: a failure here is then retried
+    // without downloading the issues again
+    let mut in_sprints = Vec::new();
+    refresh_sprints(state, &config, &sync.watched_projects, &mut in_sprints).await?;
+    if !in_sprints.is_empty() {
+        state.events.send(SyncEvent::IssuesUpdated(in_sprints)).ok();
+    }
     state.events.send(SyncEvent::InitialSyncComplete).ok();
     Ok(())
 }
@@ -308,6 +316,97 @@ pub(crate) async fn poll_updated_issues(
         }
         page_token = page.next_page_token;
     }
+}
+
+#[derive(Deserialize)]
+struct JiraSprint {
+    id: i64,
+    name: String,
+    state: String,
+}
+
+/// The sprint of `issue` that is running, or else the one that is planned.
+/// `field` is the id of the sprint field, which holds every sprint the issue
+/// has been in.
+fn open_sprint(issue: &Value, field: &str) -> Option<SprintRecord> {
+    let sprints = issue["fields"][field].as_array()?;
+    let open = |state| {
+        sprints
+            .iter()
+            .filter_map(|sprint| JiraSprint::deserialize(sprint).ok())
+            .find(|sprint| sprint.state == state)
+    };
+    let sprint = open("active").or_else(|| open("future"))?;
+    Some(SprintRecord {
+        id: sprint.id,
+        active: sprint.state == "active",
+        name: sprint.name,
+    })
+}
+
+/// Makes the cache hold the active and the future sprints of
+/// `watched_projects` and the issues that are in them, as Jira has them now.
+/// The keys of the issues whose sprint changed are added to `changed`.
+// The issue poll cannot do this. A sprint that starts or is completed leaves
+// `updated` of its issues as it was, so the poll never sees them, and the cache
+// would show a sprint as running long after its end.
+pub(crate) async fn refresh_sprints(
+    state: &AppState,
+    config: &Config,
+    watched_projects: &[String],
+    changed: &mut Vec<IssueKey>,
+) -> anyhow::Result<()> {
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let mut found: Vec<SprintRecord> = Vec::new();
+    let mut sprint_of = BTreeMap::new();
+    // Without the field the JQL below is an error to Jira
+    if let Some(field) = client.sprint_field().await? {
+        let jql = format!(
+            "{} AND (sprint in openSprints() OR sprint in futureSprints())",
+            in_projects(watched_projects),
+        );
+        let mut page_token = None;
+        loop {
+            let page = client
+                .search_page(&jql, &[&field], page_token.as_deref())
+                .await?;
+            for issue in &page.issues {
+                let (Some(id), Some(sprint)) = (issue["id"].as_str(), open_sprint(issue, &field))
+                else {
+                    continue;
+                };
+                sprint_of.insert(id.to_owned(), sprint.id);
+                if !found.iter().any(|known| known.id == sprint.id) {
+                    found.push(sprint);
+                }
+            }
+            if page.next_page_token.is_none() {
+                break;
+            }
+            page_token = page.next_page_token;
+        }
+    }
+
+    // As in `poll_updated_issues`: held until the commit
+    let saved = state.config.read().await;
+    let mut tx = crate::db::begin(&state.pool).await?;
+    // After a sign-in or a change of the watched projects during the listing,
+    // the cache is no longer the one these sprints describe
+    let same_account = saved.as_ref().is_some_and(|current| {
+        current.site_url == config.site_url && current.account_id == config.account_id
+    });
+    if !same_account || sync_state::watched(&mut *tx).await? != watched_projects {
+        return Ok(());
+    }
+    let written = sprints::replace(&mut tx, &found, &sprint_of).await?;
+    tx.commit().await?;
+    drop(saved);
+    for key in written {
+        if !changed.contains(&key) {
+            changed.push(key);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -676,6 +775,7 @@ mod tests {
             )
             .mount(server)
             .await;
+        crate::sync::no_sprint_field().mount(server).await;
         let (state, events) = start_syncing_without_keychain(data_dir).await.unwrap();
         api::sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
@@ -887,6 +987,7 @@ mod tests {
 
         // Jira is back, and the app is started again
         server.reset().await;
+        crate::sync::no_sprint_field().mount(&server).await;
         mount_count(&server, "WEB", 3).await;
         mount_page(&server, "WEB", None, page(&first, Some("tok"))).await;
         mount_page(&server, "WEB", Some("tok"), page(&[issue(3, "WEB")], None)).await;
@@ -988,6 +1089,7 @@ mod tests {
         state.pool.close().await;
 
         server.reset().await;
+        crate::sync::no_sprint_field().mount(&server).await;
         mount_count(&server, "API", 2).await;
         mount_page(&server, "API", None, page(&[issue(3, "API")], Some("tok"))).await;
         mount_page(&server, "API", Some("tok"), page(&[issue(4, "API")], None)).await;
@@ -1185,6 +1287,199 @@ mod tests {
         assert_eq!(summary(&state, "WEB-1").await, "Renamed");
         assert_eq!(stored_keys(&state).await, ["API-5", "WEB-1", "WEB-2"]);
         assert!(last_sync_at(&state).await > before);
+    }
+
+    const SPRINT_FIELD: &str = "customfield_10020";
+
+    /// A site whose sprint field is `SPRINT_FIELD`.
+    fn sprint_field() -> Mock {
+        let fields = json!([
+            { "id": "summary", "name": "Summary", "schema": { "type": "string", "system": "summary" } },
+            { "id": "customfield_10001", "name": "Team", "schema": { "type": "team", "custom": "com.atlassian.teams:rm-teams-custom-field-team" } },
+            { "id": "issuekey", "name": "Key" },
+            { "id": SPRINT_FIELD, "name": "Sprint", "schema": { "type": "array", "items": "json", "custom": "com.pyxis.greenhopper.jira:gh-sprint" } },
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fields))
+    }
+
+    /// The issues of `projects`, a JQL list, that are in a running or a
+    /// planned sprint: each is its id and the sprints Jira has for it.
+    fn in_sprints(projects: &str, issues: &[(u32, Value)]) -> Mock {
+        let issues: Vec<Value> = issues
+            .iter()
+            .map(|(id, sprints)| json!({ "id": id.to_string(), "fields": { SPRINT_FIELD: sprints } }))
+            .collect();
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(body_json(json!({
+                "jql": format!(
+                    "project IN ({projects}) AND (sprint in openSprints() OR sprint in futureSprints())"
+                ),
+                "fields": [SPRINT_FIELD],
+                "maxResults": 100,
+            })))
+            .respond_with(page(&issues, None))
+    }
+
+    fn sprint(id: i64, state: &str) -> Value {
+        json!({ "id": id, "name": format!("Sprint {id}"), "state": state, "boardId": 1 })
+    }
+
+    /// The sprints the filter offers: the id, whether it runs, its projects.
+    async fn offered_sprints(state: &AppState) -> Vec<(i64, bool, String)> {
+        let options = api::filter_options(state).await.unwrap();
+        let sprints = options.sprints.into_iter();
+        sprints
+            .map(|sprint| (sprint.id, sprint.active, sprint.project_keys.join(" ")))
+            .collect()
+    }
+
+    async fn keys_in(state: &AppState, sprint: crate::models::SprintFilter) -> Vec<String> {
+        let filter = IssueFilter {
+            sprint: Some(sprint),
+            ..Default::default()
+        };
+        let mut keys: Vec<String> = api::list_issues(state, &filter)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.key.to_string())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn the_initial_sync_stores_the_running_and_the_planned_sprint_of_each_issue() {
+        use crate::models::SprintFilter;
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = watching(&server, data_dir.path(), &["WEB"]).await;
+        mount_count(&server, "WEB", 3).await;
+        let issues = [issue(1, "WEB"), issue(2, "WEB"), issue(3, "WEB")];
+        mount_page(&server, "WEB", None, page(&issues, None)).await;
+        sprint_field().mount(&server).await;
+        // WEB-1 was carried over from a sprint that is closed. Issue 9 is one
+        // the pages did not have
+        let listed = [
+            (1, json!([sprint(5, "closed"), sprint(7, "active")])),
+            (2, json!([sprint(8, "future")])),
+            (9, json!([sprint(8, "future")])),
+        ];
+        in_sprints("\"WEB\"", &listed).mount(&server).await;
+
+        api::initial_sync(&state).await.unwrap();
+
+        assert_eq!(
+            offered_sprints(&state).await,
+            [(7, true, "WEB".to_owned()), (8, false, "WEB".to_owned())]
+        );
+        assert_eq!(keys_in(&state, SprintFilter::Sprint(7)).await, ["WEB-1"]);
+        assert_eq!(keys_in(&state, SprintFilter::Sprint(8)).await, ["WEB-2"]);
+        assert_eq!(keys_in(&state, SprintFilter::Backlog).await, ["WEB-3"]);
+        let events = received(&mut events);
+        assert_eq!(
+            events[events.len() - 2..],
+            [
+                r#"IssuesUpdated([IssueKey("WEB-1"), IssueKey("WEB-2")])"#,
+                "InitialSyncComplete"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_cycle_follows_a_sprint_that_ends_and_the_next_one_that_starts() {
+        use crate::models::SprintFilter;
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let stored = [issue(1, "WEB"), issue(2, "WEB"), issue(3, "WEB")];
+        let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
+        // No issue changes: a sprint that starts or ends leaves `updated` alone
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        sprint_field().up_to_n_times(2).mount(&server).await;
+        let projects = "\"WEB\", \"API\"";
+        let planned = [
+            (1, json!([sprint(7, "active")])),
+            (2, json!([sprint(8, "future")])),
+        ];
+        in_sprints(projects, &planned)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1"), IssueKey("WEB-2")])"#,
+                "Completed",
+            ]
+        );
+        assert_eq!(
+            offered_sprints(&state).await,
+            [(7, true, "WEB".to_owned()), (8, false, "WEB".to_owned())]
+        );
+
+        // Sprint 7 was completed with WEB-1 done, and sprint 8 started
+        let started = [(2, json!([sprint(8, "active")]))];
+        in_sprints(projects, &started).mount(&server).await;
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1"), IssueKey("WEB-2")])"#,
+                "Completed",
+            ]
+        );
+        assert_eq!(offered_sprints(&state).await, [(8, true, "WEB".to_owned())]);
+        assert!(keys_in(&state, SprintFilter::Sprint(7)).await.is_empty());
+        assert_eq!(keys_in(&state, SprintFilter::Sprint(8)).await, ["WEB-2"]);
+
+        // The site no longer has the field: Jira Software was taken off it
+        state.sync_waker.send(()).unwrap();
+
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-2")])"#,
+                "Completed"
+            ]
+        );
+        assert!(offered_sprints(&state).await.is_empty());
+        let sprints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sprints")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(sprints, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_of_the_sprints_leaves_them_as_they_were() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        poll(JUST_SYNCED, page(&[], None)).mount(&server).await;
+        sprint_field().mount(&server).await;
+        let listed = [(1, json!([sprint(7, "active")]))];
+        in_sprints("\"WEB\", \"API\"", &listed)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        state.sync_waker.send(()).unwrap();
+        cycle(&mut events).await;
+
+        // Jira answers 404 to the listing now
+        state.sync_waker.send(()).unwrap();
+
+        let announced = cycle(&mut events).await;
+        assert!(announced[1].starts_with("Error("), "{announced:?}");
+        assert_eq!(offered_sprints(&state).await, [(7, true, "WEB".to_owned())]);
     }
 
     #[tokio::test]
@@ -1820,6 +2115,7 @@ mod tests {
             .mount(&server)
             .await;
         crate::sync::no_worklog_changes().mount(&server).await;
+        crate::sync::no_sprint_field().mount(&server).await;
         state.sync_waker.send(()).unwrap();
         cycle(&mut events).await;
 
@@ -2031,10 +2327,12 @@ mod tests {
 
         // Only a poll for those three hours is answered; any other gets a 404
         server.reset().await;
+        crate::sync::no_sprint_field().mount(&server).await;
         let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
         poll(182, page(&[renamed], None)).mount(&server).await;
         listing(ids(1..2)).mount(&server).await;
         crate::sync::no_worklog_changes().mount(&server).await;
+        crate::sync::no_sprint_field().mount(&server).await;
         let (state, mut events) = start_syncing_without_keychain(data_dir.path())
             .await
             .unwrap();

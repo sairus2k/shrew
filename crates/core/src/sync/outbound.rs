@@ -740,6 +740,7 @@ mod tests {
             .mount(server)
             .await;
         crate::sync::no_worklog_changes().mount(server).await;
+        crate::sync::no_sprint_field().mount(server).await;
         start_syncing_without_keychain(data_dir).await.unwrap()
     }
 
@@ -3209,6 +3210,7 @@ mod tests {
     async fn a_worklog_posted_to_tempo_is_not_stored_twice_when_the_poll_returns_it() {
         let (jira, tempo) = (MockServer::start().await, MockServer::start().await);
         mount_profile(&jira).await;
+        crate::sync::no_sprint_field().mount(&jira).await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;

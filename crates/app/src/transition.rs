@@ -465,6 +465,7 @@ mod tests {
     ) -> MockServer {
         let server = MockServer::builder().listener(listener).start().await;
         no_worklog_changes().mount(&server).await;
+        crate::harness::no_sprint_field().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),
@@ -989,6 +990,7 @@ mod tests {
         let mut web_1 = two_issues()[0].clone();
         web_1["fields"]["status"] = to("To Do", "new");
         no_worklog_changes().mount(server).await;
+        crate::harness::no_sprint_field().mount(server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({ "issues": two_issues() })),

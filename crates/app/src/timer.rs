@@ -345,6 +345,7 @@ mod tests {
     async fn jira() -> MockServer {
         let server = MockServer::start().await;
         no_worklog_changes().mount(&server).await;
+        crate::harness::no_sprint_field().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 json!({ "issues": [issue(1, "Fix login"), issue(2, "Broken checkout")] }),

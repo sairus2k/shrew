@@ -1108,6 +1108,7 @@ pub(crate) mod tests {
     async fn jira_with_web_1() -> MockServer {
         let server = MockServer::start().await;
         no_worklog_changes().mount(&server).await;
+        crate::harness::no_sprint_field().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1141,6 +1142,7 @@ pub(crate) mod tests {
         // 10:15 at UTC+2, 93 minutes
         tokio.block_on(async {
             server.reset().await;
+            crate::harness::no_sprint_field().mount(&server).await;
             Mock::given(path("/rest/api/3/search/jql"))
                 .respond_with(
                     ResponseTemplate::new(200)

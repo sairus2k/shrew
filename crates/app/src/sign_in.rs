@@ -220,6 +220,7 @@ pub(crate) mod tests {
                 .respond_with(myself)
                 .mount(&server)
                 .await;
+            crate::harness::no_sprint_field().mount(&server).await;
             server
         })
     }

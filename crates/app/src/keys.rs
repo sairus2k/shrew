@@ -14,6 +14,7 @@ actions!(
         FilterByProject,
         FilterByAssignee,
         FilterByStatus,
+        FilterBySprint,
         ChangeStatus,
         ChangeAssignee,
         WriteComment,
@@ -54,6 +55,8 @@ pub fn init(cx: &mut App) {
         // `a` and `s` change the open issue
         KeyBinding::new("shift-a", FilterByAssignee, Some(LIST)),
         KeyBinding::new("shift-s", FilterByStatus, Some(LIST)),
+        // `r` syncs
+        KeyBinding::new("shift-r", FilterBySprint, Some(LIST)),
         KeyBinding::new("s", ChangeStatus, Some(LIST)),
         KeyBinding::new("a", ChangeAssignee, Some(LIST)),
         KeyBinding::new("c", WriteComment, Some(LIST)),
@@ -71,7 +74,7 @@ pub fn init(cx: &mut App) {
 
 /// What the help view lists, in its order. The keys are read from the keymap,
 /// so the view cannot name a key that is not bound.
-fn listed() -> [(Box<dyn Action>, &'static str); 19] {
+fn listed() -> [(Box<dyn Action>, &'static str); 20] {
     [
         (Box::new(SelectNext), "Next issue"),
         (Box::new(SelectPrevious), "Previous issue"),
@@ -84,6 +87,7 @@ fn listed() -> [(Box<dyn Action>, &'static str); 19] {
         (Box::new(FilterByProject), "Filter by project"),
         (Box::new(FilterByAssignee), "Filter by assignee"),
         (Box::new(FilterByStatus), "Filter by status"),
+        (Box::new(FilterBySprint), "Filter by sprint"),
         (Box::new(ChangeStatus), "Change the status"),
         (Box::new(ChangeAssignee), "Change the assignee"),
         (Box::new(WriteComment), "Write a comment"),
@@ -238,6 +242,7 @@ mod tests {
         let jira = tokio.block_on(async {
             let server = MockServer::start().await;
             no_worklog_changes().mount(&server).await;
+            crate::harness::no_sprint_field().mount(&server).await;
             let answers = [
                 (
                     r"^/rest/api/3/issue/WEB-\d$",
@@ -422,8 +427,8 @@ mod tests {
         let sync_requests = cx.update(|cx| cx.global::<Core>().state.sync_requests());
         open_top(cx, &app);
         let every_key = [
-            "j", "k", "down", "up", "/", "p", "shift-a", "shift-s", "s", "a", "c", "w", "t",
-            "shift-t", "b", "r", "cmd-,", "shift-p", "?",
+            "j", "k", "down", "up", "/", "p", "shift-a", "shift-s", "shift-r", "s", "a", "c", "w",
+            "t", "shift-t", "b", "r", "cmd-,", "shift-p", "?",
         ];
         for (clicked, input) in [
             ("worklog-duration", "Time spent"),
@@ -436,7 +441,7 @@ mod tests {
                 // The keys that are characters were typed
                 assert_eq!(
                     window.find_by_label(input).value(),
-                    Some("jk/pASsacwtTbrP?")
+                    Some("jk/pASRsacwtTbrP?")
                 );
                 assert_eq!(opened(window).as_deref(), Some("WEB-3"));
                 assert!(menu(window).is_empty());
@@ -792,6 +797,7 @@ mod tests {
             "P: Filter by project",
             "⇧A: Filter by assignee",
             "⇧S: Filter by status",
+            "⇧R: Filter by sprint",
             "S: Change the status",
             "A: Change the assignee",
             "C: Write a comment",

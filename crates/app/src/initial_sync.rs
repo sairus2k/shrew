@@ -254,6 +254,7 @@ mod tests {
     fn the_sync_shows_progress_and_then_opens_the_app(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let server = tokio.block_on(MockServer::start());
+        tokio.block_on(crate::harness::no_sprint_field().mount(&server));
         // Mounted before the page that answers at once, so it wins: without
         // the delay the sync can finish before the test looks at its progress
         tokio.block_on(
@@ -296,6 +297,7 @@ mod tests {
     ) {
         let tokio = tokio_runtime();
         let server = tokio.block_on(MockServer::start());
+        tokio.block_on(crate::harness::no_sprint_field().mount(&server));
         tokio.block_on(mount_web(&server, false));
         let data_dir = watching_web(&server);
         let window = launch(cx, &tokio, data_dir.path());
@@ -311,6 +313,7 @@ mod tests {
 
         tokio.block_on(async {
             server.reset().await;
+            crate::harness::no_sprint_field().mount(&server).await;
             mount_web(&server, true).await;
         });
         let window = launch(cx, &tokio, data_dir.path());
@@ -323,6 +326,7 @@ mod tests {
     fn a_stopped_sync_can_be_started_again_without_a_restart(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let server = tokio.block_on(MockServer::start());
+        tokio.block_on(crate::harness::no_sprint_field().mount(&server));
         tokio.block_on(mount_web(&server, false));
         let data_dir = watching_web(&server);
         let window = launch(cx, &tokio, data_dir.path());
@@ -330,6 +334,7 @@ mod tests {
 
         tokio.block_on(async {
             server.reset().await;
+            crate::harness::no_sprint_field().mount(&server).await;
             mount_web(&server, true).await;
         });
         in_window(cx, window, |window, cx| window.click("retry-sync", cx));

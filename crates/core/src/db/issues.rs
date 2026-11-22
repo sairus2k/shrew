@@ -3,7 +3,7 @@ use crate::{
     db::worklogs,
     models::{
         AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
-        RejectedComment, StatusCategory, SyncStatus, User,
+        RejectedComment, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
     },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -415,9 +415,20 @@ fn assignee_binds(filter: &IssueFilter) -> (bool, Option<&str>) {
     }
 }
 
+// The same for `IssueFilter::sprint`: whether only the backlog passes, and the
+// id of the sprint that has to match
+fn sprint_binds(filter: &IssueFilter) -> (bool, Option<i64>) {
+    match filter.sprint {
+        None => (false, None),
+        Some(SprintFilter::Backlog) => (true, None),
+        Some(SprintFilter::Sprint(id)) => (false, Some(id)),
+    }
+}
+
 /// The cached issues that pass `filter`, the one Jira changed last first.
 pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Result<Vec<IssueRow>> {
     let (unassigned, assignee_id) = assignee_binds(filter);
+    let (backlog, sprint_id) = sprint_binds(filter);
     sqlx::query_as!(
         IssueRow,
         r#"
@@ -430,6 +441,8 @@ pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Resul
           AND (? IS NULL OR status = ?)
           AND (NOT ? OR assignee_id IS NULL)
           AND (? IS NULL OR assignee_id = ?)
+          AND (NOT ? OR (sprint_id IS NULL AND status_category <> 'done'))
+          AND (? IS NULL OR sprint_id = ?)
         -- Both columns come from idx_issues_updated, so nothing is sorted
         ORDER BY remote_updated_at DESC, rowid DESC
         "#,
@@ -439,7 +452,10 @@ pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Resul
         filter.status,
         unassigned,
         assignee_id,
-        assignee_id
+        assignee_id,
+        backlog,
+        sprint_id,
+        sprint_id
     )
     .fetch_all(pool)
     .await
@@ -458,6 +474,7 @@ pub(crate) async fn search(
         return Ok(Vec::new());
     };
     let (unassigned, assignee_id) = assignee_binds(filter);
+    let (backlog, sprint_id) = sprint_binds(filter);
 
     sqlx::query_as!(
         IssueRow,
@@ -473,6 +490,8 @@ pub(crate) async fn search(
           AND (? IS NULL OR i.status = ?)
           AND (NOT ? OR i.assignee_id IS NULL)
           AND (? IS NULL OR i.assignee_id = ?)
+          AND (NOT ? OR (i.sprint_id IS NULL AND i.status_category <> 'done'))
+          AND (? IS NULL OR i.sprint_id = ?)
         ORDER BY issues_fts.rank
         LIMIT ?
         "#,
@@ -484,6 +503,9 @@ pub(crate) async fn search(
         unassigned,
         assignee_id,
         assignee_id,
+        backlog,
+        sprint_id,
+        sprint_id,
         limit
     )
     .fetch_all(pool)
@@ -510,6 +532,27 @@ pub(crate) async fn filter_options(pool: &SqlitePool) -> sqlx::Result<FilterOpti
     )
     .fetch_all(pool)
     .await?;
+    // A sprint no cached issue is in is not one the list can be narrowed to
+    let in_sprints: Vec<(i64, String, bool, String)> = sqlx::query_as(
+        "SELECT s.id, s.name, s.state = 'active', i.project_key
+         FROM sprints s JOIN issues i ON i.sprint_id = s.id
+         GROUP BY s.id, i.project_key
+         ORDER BY s.state = 'active' DESC, s.id, i.project_key",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut sprints: Vec<Sprint> = Vec::new();
+    for (id, name, active, project_key) in in_sprints {
+        match sprints.last_mut() {
+            Some(sprint) if sprint.id == id => sprint.project_keys.push(project_key),
+            _ => sprints.push(Sprint {
+                id,
+                name,
+                active,
+                project_keys: vec![project_key],
+            }),
+        }
+    }
     Ok(FilterOptions {
         assignees: assignees
             .into_iter()
@@ -519,6 +562,7 @@ pub(crate) async fn filter_options(pool: &SqlitePool) -> sqlx::Result<FilterOpti
             })
             .collect(),
         statuses,
+        sprints,
     })
 }
 
@@ -538,6 +582,7 @@ fn match_expression(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::sprints::{self, SprintRecord};
 
     fn issue(id: &str, key: &str, updated_at: &str, summary: &str) -> IssueRecord {
         IssueRecord {
@@ -660,14 +705,121 @@ mod tests {
             project: Some("PROJ".to_owned()),
             assignee: of("5b10a"),
             status: Some("In Progress".to_owned()),
+            sprint: None,
         };
         assert_eq!(passing(&pool, filter).await, ["PROJ-1"]);
         let filter = IssueFilter {
             project: Some("OTHER".to_owned()),
             assignee: of("5b10a"),
             status: None,
+            sprint: None,
         };
         assert!(passing(&pool, filter).await.is_empty());
+    }
+
+    /// `seed_assigned` with PROJ-1 and PROJ-2 in the running sprint 7 and
+    /// OTHER-1 in the planned sprint 8. Sprint 9 has no issue.
+    async fn seed_in_sprints(pool: &SqlitePool) {
+        seed_assigned(pool).await;
+        let sprint = |id, name: &str, active| SprintRecord {
+            id,
+            name: name.to_owned(),
+            active,
+        };
+        let sprints = [
+            sprint(8, "Sprint 8", false),
+            sprint(7, "Sprint 7", true),
+            sprint(9, "Sprint 9", false),
+        ];
+        let sprint_of = [("id-0", 7), ("id-1", 7), ("id-3", 8)]
+            .map(|(id, sprint)| (id.to_owned(), sprint))
+            .into();
+        let mut conn = pool.acquire().await.unwrap();
+        sprints::replace(&mut conn, &sprints, &sprint_of)
+            .await
+            .unwrap();
+    }
+
+    fn in_sprint(sprint: SprintFilter) -> IssueFilter {
+        IssueFilter {
+            sprint: Some(sprint),
+            ..Default::default()
+        }
+    }
+
+    #[sqlx::test]
+    async fn the_sprint_narrows_the_list_and_the_search(pool: SqlitePool) {
+        seed_in_sprints(&pool).await;
+
+        let running = in_sprint(SprintFilter::Sprint(7));
+        assert_eq!(passing(&pool, running).await, ["PROJ-1", "PROJ-2"]);
+        let planned = in_sprint(SprintFilter::Sprint(8));
+        assert_eq!(passing(&pool, planned).await, ["OTHER-1"]);
+        let closed = in_sprint(SprintFilter::Sprint(1));
+        assert!(passing(&pool, closed).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn the_backlog_is_what_is_in_no_sprint_and_not_done(pool: SqlitePool) {
+        seed_in_sprints(&pool).await;
+        let done = IssueRecord {
+            status: "Done".to_owned(),
+            status_category: StatusCategory::Done,
+            ..issue("9", "PROJ-9", T1, "Login failed last year")
+        };
+        upsert(&pool, &done).await.unwrap();
+
+        let backlog = in_sprint(SprintFilter::Backlog);
+
+        assert_eq!(passing(&pool, backlog).await, ["PROJ-3"]);
+    }
+
+    #[sqlx::test]
+    async fn the_sprint_holds_together_with_the_other_filters(pool: SqlitePool) {
+        seed_in_sprints(&pool).await;
+
+        let filter = IssueFilter {
+            project: Some("PROJ".to_owned()),
+            assignee: of("5b10a"),
+            status: Some("Done".to_owned()),
+            sprint: Some(SprintFilter::Sprint(7)),
+        };
+        assert_eq!(passing(&pool, filter).await, ["PROJ-2"]);
+        let filter = IssueFilter {
+            project: Some("OTHER".to_owned()),
+            ..in_sprint(SprintFilter::Sprint(7))
+        };
+        assert!(passing(&pool, filter).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn the_sprints_offered_are_those_with_issues_the_running_one_first(pool: SqlitePool) {
+        seed_in_sprints(&pool).await;
+        // An issue of another project in the running sprint
+        sqlx::query("UPDATE issues SET sprint_id = 7 WHERE key = 'OTHER-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE issues SET sprint_id = 8 WHERE key = 'PROJ-3'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let options = filter_options(&pool).await.unwrap();
+
+        let sprint = |id, name: &str, active, projects: &[&str]| Sprint {
+            id,
+            name: name.to_owned(),
+            active,
+            project_keys: projects.iter().map(|key| key.to_string()).collect(),
+        };
+        assert_eq!(
+            options.sprints,
+            [
+                sprint(7, "Sprint 7", true, &["OTHER", "PROJ"]),
+                sprint(8, "Sprint 8", false, &["PROJ"]),
+            ]
+        );
     }
 
     #[sqlx::test]
@@ -993,6 +1145,11 @@ mod tests {
             .unwrap();
 
         sqlx::raw_sql(include_str!("../../migrations/0003_issues_rowid.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The search reads the sprint, which a database of this age did not have
+        sqlx::raw_sql(include_str!("../../migrations/0014_sprints.sql"))
             .execute(&pool)
             .await
             .unwrap();

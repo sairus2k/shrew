@@ -56,6 +56,26 @@ pub struct IssueFilter {
     pub assignee: Option<AssigneeFilter>,
     /// The name of a status. Projects that give a status the same name share it.
     pub status: Option<String>,
+    pub sprint: Option<SprintFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SprintFilter {
+    /// In no active or future sprint, and not done.
+    Backlog,
+    /// Jira's id of the sprint.
+    Sprint(i64),
+}
+
+/// A sprint that is running or planned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sprint {
+    pub id: i64,
+    pub name: String,
+    /// Running. A sprint that is not is planned.
+    pub active: bool,
+    /// The projects that have an issue in it.
+    pub project_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +92,8 @@ pub struct FilterOptions {
     pub assignees: Vec<User>,
     /// To do first, done last, by name inside a category.
     pub statuses: Vec<String>,
+    /// The active ones first. Empty for a site or for projects without sprints.
+    pub sprints: Vec<Sprint>,
 }
 
 /// One issue with everything the detail view shows.

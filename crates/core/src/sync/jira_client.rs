@@ -91,6 +91,20 @@ struct IssueId {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct Field {
+    id: String,
+    schema: Option<FieldSchema>,
+}
+
+#[derive(Deserialize)]
+struct FieldSchema {
+    custom: Option<String>,
+}
+
+// The type of the sprint field of Jira Software, whatever the field is named
+const SPRINT_FIELD_TYPE: &str = "com.pyxis.greenhopper.jira:gh-sprint";
+
 /// One page of `GET /worklog/updated`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +281,20 @@ impl JiraClient {
             body["nextPageToken"] = Value::String(token.to_owned());
         }
         self.http.post(self.url("/search/jql")).json(&body)
+    }
+
+    /// The id of the field that holds the sprints of an issue: a custom field,
+    /// so each site has its own. `None` for a site without sprints.
+    pub(crate) async fn sprint_field(&self) -> Result<Option<String>, JiraError> {
+        let fields: Vec<Field> = self.send(self.http.get(self.url("/field"))).await?;
+        let sprint = fields.into_iter().find(|field| {
+            let custom = field
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.custom.as_deref());
+            custom == Some(SPRINT_FIELD_TYPE)
+        });
+        Ok(sprint.map(|field| field.id))
     }
 
     /// An estimate, good for a progress bar only. Jira requires a bounded JQL.
@@ -551,6 +579,39 @@ mod tests {
             client.approximate_count("project = PROJ").await.unwrap(),
             2340
         );
+    }
+
+    #[tokio::test]
+    async fn the_sprint_field_is_found_by_its_type_and_a_site_without_it_has_none() {
+        let server = MockServer::start().await;
+        let fields = json!([
+            { "id": "summary", "name": "Summary", "schema": { "type": "string", "system": "summary" } },
+            { "id": "issuekey", "name": "Key" },
+            // Named by an admin: the name does not tell what the field is
+            { "id": "customfield_10020", "name": "Iteration", "schema": {
+                "type": "array", "items": "json",
+                "custom": "com.pyxis.greenhopper.jira:gh-sprint", "customId": 10020,
+            } },
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&fields))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/field"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(&fields.as_array().unwrap()[..2]),
+            )
+            .mount(&server)
+            .await;
+
+        let with_sprints = client(&server).sprint_field().await.unwrap();
+        let without = client(&server).sprint_field().await.unwrap();
+
+        assert_eq!(with_sprints.as_deref(), Some("customfield_10020"));
+        assert_eq!(without, None);
     }
 
     #[tokio::test]

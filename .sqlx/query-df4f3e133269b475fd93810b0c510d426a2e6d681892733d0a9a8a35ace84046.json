@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT i.id AS \"id!\", i.key AS \"key: IssueKey\", i.summary, i.status,\n               i.status_category AS \"status_category: StatusCategory\",\n               i.assignee_name, i.project_key,\n               i.sync_status AS \"sync_status: SyncStatus\"\n        FROM issues i\n        JOIN issues_fts ON i.rowid = issues_fts.rowid\n        WHERE issues_fts MATCH ?\n          AND (? IS NULL OR i.project_key = ?)\n          AND (? IS NULL OR i.status = ?)\n          AND (NOT ? OR i.assignee_id IS NULL)\n          AND (? IS NULL OR i.assignee_id = ?)\n        ORDER BY issues_fts.rank\n        LIMIT ?\n        ",
+  "query": "\n        SELECT i.id AS \"id!\", i.key AS \"key: IssueKey\", i.summary, i.status,\n               i.status_category AS \"status_category: StatusCategory\",\n               i.assignee_name, i.project_key,\n               i.sync_status AS \"sync_status: SyncStatus\"\n        FROM issues i\n        JOIN issues_fts ON i.rowid = issues_fts.rowid\n        WHERE issues_fts MATCH ?\n          AND (? IS NULL OR i.project_key = ?)\n          AND (? IS NULL OR i.status = ?)\n          AND (NOT ? OR i.assignee_id IS NULL)\n          AND (? IS NULL OR i.assignee_id = ?)\n          AND (NOT ? OR (i.sprint_id IS NULL AND i.status_category <> 'done'))\n          AND (? IS NULL OR i.sprint_id = ?)\n        ORDER BY issues_fts.rank\n        LIMIT ?\n        ",
   "describe": {
     "columns": [
       {
@@ -45,7 +45,7 @@
       }
     ],
     "parameters": {
-      "Right": 9
+      "Right": 12
     },
     "nullable": [
       false,
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "36ad2cd0e449d2d5f0594032be63d161a796ce4b0be89135a1dc7637b7f3438a"
+  "hash": "df4f3e133269b475fd93810b0c510d426a2e6d681892733d0a9a8a35ace84046"
 }

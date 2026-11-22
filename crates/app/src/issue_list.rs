@@ -1,15 +1,16 @@
 //! The main screen: the cached issues and the search over them.
 
 use crate::keys::{
-    self, FilterByAssignee, FilterByProject, FilterByStatus, FocusSearch, OpenSelected, SelectNext,
-    SelectPrevious,
+    self, FilterByAssignee, FilterByProject, FilterBySprint, FilterByStatus, FocusSearch,
+    OpenSelected, SelectNext, SelectPrevious,
 };
 use crate::runtime::{Core, spawn};
 use crate::theme::{status_dot, tabular_digits};
 use app_core::{
     SyncEvent, api,
     models::{
-        AssigneeFilter, FilterOptions, IssueFilter, IssueKey, IssueRow, StatusCategory, SyncStatus,
+        AssigneeFilter, FilterOptions, IssueFilter, IssueKey, IssueRow, SprintFilter,
+        StatusCategory, SyncStatus,
     },
 };
 use gpui_kit::component::{
@@ -39,12 +40,27 @@ impl PartialEq for Assignee {
     }
 }
 
+/// The sprint whose issues the list shows, under the name the filter has for it.
+#[derive(Clone)]
+struct InSprint {
+    label: String,
+    filter: SprintFilter,
+}
+
+// A sprint that has started is the same sprint under another label
+impl PartialEq for InSprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.filter == other.filter
+    }
+}
+
 /// What an item of a filter menu does. `None` takes the filter off.
 #[derive(Clone)]
 enum Pick {
     Project(Option<String>),
     Assignee(Option<Assignee>),
     Status(Option<String>),
+    Sprint(Option<InSprint>),
     /// Takes every filter off. The search text is not one of them.
     Clear,
 }
@@ -148,6 +164,7 @@ pub struct IssueList {
     project: Option<String>,
     assignee: Option<Assignee>,
     status: Option<String>,
+    sprint: Option<InSprint>,
     issues: Vec<IssueRow>,
     // The issue shown beside the list
     opened: Option<IssueKey>,
@@ -159,6 +176,7 @@ pub struct IssueList {
     filter_focus: FocusHandle,
     assignee_focus: FocusHandle,
     status_focus: FocusHandle,
+    sprint_focus: FocusHandle,
     scroll: UniformListScrollHandle,
     loading: Task<()>,
 }
@@ -204,6 +222,7 @@ impl IssueList {
             project: None,
             assignee: None,
             status: None,
+            sprint: None,
             issues: Vec::new(),
             opened: None,
             selected: None,
@@ -211,6 +230,7 @@ impl IssueList {
             filter_focus: cx.focus_handle(),
             assignee_focus: cx.focus_handle(),
             status_focus: cx.focus_handle(),
+            sprint_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             loading: Task::ready(()),
         };
@@ -260,10 +280,12 @@ impl IssueList {
             Pick::Project(project) => self.project = project,
             Pick::Assignee(assignee) => self.assignee = assignee,
             Pick::Status(status) => self.status = status,
+            Pick::Sprint(sprint) => self.sprint = sprint,
             Pick::Clear => {
                 self.project = None;
                 self.assignee = None;
                 self.status = None;
+                self.sprint = None;
             }
         }
         self.reload(cx);
@@ -340,7 +362,49 @@ impl IssueList {
             focus: self.status_focus.clone(),
             key: Box::new(FilterByStatus),
         });
+        filters.extend(self.sprint_filter());
         filters
+    }
+
+    /// The sprint filter: the running sprints, the planned ones and the
+    /// backlog. `None` when the issues of the chosen project, or of all of
+    /// them, are in no sprint: such a site or project does not work in sprints.
+    fn sprint_filter(&self) -> Option<Filter> {
+        let project = self.project.as_ref();
+        let sprints = self.options.sprints.iter();
+        let mut values: Vec<InSprint> = sprints
+            .filter(|sprint| project.is_none_or(|project| sprint.project_keys.contains(project)))
+            .map(|sprint| InSprint {
+                label: match sprint.active {
+                    true => sprint.name.clone(),
+                    false => format!("{} (future)", sprint.name),
+                },
+                filter: SprintFilter::Sprint(sprint.id),
+            })
+            .collect();
+        if values.is_empty() && self.sprint.is_none() {
+            return None;
+        }
+        values.push(InSprint {
+            label: "Backlog".to_owned(),
+            filter: SprintFilter::Backlog,
+        });
+        Some(Filter {
+            id: "sprint-filter",
+            clear_id: "sprint-filter-clear",
+            name: "Sprint",
+            unset: "Sprint",
+            value: self.sprint.as_ref().map(|chosen| chosen.label.clone()),
+            choices: choices(
+                "Any sprint",
+                values,
+                self.sprint.as_ref(),
+                |sprint| sprint.label.clone(),
+                Pick::Sprint,
+            ),
+            focus: self.sprint_focus.clone(),
+            key: Box::new(FilterBySprint),
+        })
     }
 
     /// The text the list is searched for. One character finds too much to be a search.
@@ -406,6 +470,7 @@ impl IssueList {
             project: self.project.clone(),
             assignee: self.assignee.as_ref().map(|chosen| chosen.filter.clone()),
             status: self.status.clone(),
+            sprint: self.sprint.as_ref().map(|chosen| chosen.filter.clone()),
         };
         let load = spawn(cx, move |state| async move {
             match query {
@@ -704,6 +769,7 @@ impl Render for IssueList {
         // `p` opens the menu the project is chosen in: its own, or the one of
         // all the filters
         let choosable = self.projects.len() > 1;
+        let in_sprints = filters.iter().any(|filter| filter.id == "sprint-filter");
         let bar = div().p_3().flex().items_center().gap_2().child(
             div().flex_1().min_w_0().child(
                 Input::new(&self.query)
@@ -776,6 +842,16 @@ impl Render for IssueList {
                         &this.status_focus
                     };
                     keys::open_menu(button, window, cx)
+                }))
+                .on_action(cx.listener(move |this, _: &FilterBySprint, window, cx| {
+                    let button = if narrow {
+                        &this.filter_focus
+                    } else {
+                        &this.sprint_focus
+                    };
+                    if in_sprints {
+                        keys::open_menu(button, window, cx)
+                    }
                 }))
                 .flex_1()
                 .min_h_0(),
@@ -1262,6 +1338,194 @@ pub(crate) mod tests {
             assert_eq!(label(window, "status-filter"), "Status");
             assert!(window.try_find("clear-filters").is_none());
         });
+    }
+
+    const DOCS: &str = "WEB-3: Write docs, To Do, Unassigned";
+    const ENDPOINT: &str = "API-101: Add endpoint, To Do, Unassigned";
+
+    /// WEB-1 in the running Sprint 7, WEB-2 in the planned Sprint 8, WEB-3
+    /// and API-101 in none.
+    const TWO_SPRINTS: &str = "
+        INSERT INTO sprints (id, name, state)
+            VALUES (8, 'Sprint 8', 'future'), (7, 'Sprint 7', 'active');
+        UPDATE issues SET sprint_id = 7 WHERE key = 'WEB-1';
+        UPDATE issues SET sprint_id = 8 WHERE key = 'WEB-2';";
+
+    /// The data dir of an app that watches WEB and API, with the sprints
+    /// `sprints` puts in its cache.
+    fn synced_with_sprints(tokio: &Runtime, sprints: &str) -> tempfile::TempDir {
+        let issues = [
+            issue(1, "Fix login"),
+            issue(2, "Fix logout"),
+            issue(3, "Write docs"),
+            api_issue(101, "Add endpoint"),
+        ];
+        let data_dir = synced_two_projects(tokio, &issues);
+        tokio.block_on(async {
+            let (state, _events) = app_core::start_without_keychain(data_dir.path())
+                .await
+                .unwrap();
+            state.execute(sprints).await.unwrap();
+        });
+        data_dir
+    }
+
+    #[gpui_kit::test]
+    fn the_sprint_filter_offers_the_running_sprint_the_planned_one_and_the_backlog(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_with_sprints(&tokio, TWO_SPRINTS);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[ENDPOINT, DOCS, LOGOUT, LOGIN]);
+        wait_until(cx, window, |window| {
+            window.try_find("sprint-filter").is_some()
+        });
+        wait_for_menu(
+            cx,
+            window,
+            "sprint-filter",
+            &["Any sprint", "Sprint 7", "Sprint 8 (future)", "Backlog"],
+        );
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "sprint-filter", "Sprint 7");
+        });
+        wait_for_rows(cx, window, &[LOGIN]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "sprint-filter"), "Sprint: Sprint 7");
+        });
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "sprint-filter", "Sprint 8 (future)");
+        });
+        wait_for_rows(cx, window, &[LOGOUT]);
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "sprint-filter", "Backlog");
+        });
+        wait_for_rows(cx, window, &[ENDPOINT, DOCS]);
+
+        // The cross takes the filter off
+        in_window(cx, window, |window, cx| {
+            window.click("sprint-filter-clear", cx)
+        });
+        wait_for_rows(cx, window, &[ENDPOINT, DOCS, LOGOUT, LOGIN]);
+    }
+
+    #[gpui_kit::test]
+    fn the_sprint_combines_with_the_other_filters_and_the_search(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_with_sprints(
+            &tokio,
+            "INSERT INTO sprints (id, name, state) VALUES (7, 'Sprint 7', 'active');
+             UPDATE issues SET sprint_id = 7 WHERE key IN ('WEB-1', 'WEB-2', 'API-101');
+             UPDATE issues SET status = 'In Progress', status_category = 'in_progress',
+                               assignee_id = '5b10a', assignee_name = 'Ada Lovelace'
+                 WHERE key IN ('WEB-2', 'WEB-3', 'API-101');",
+        );
+        let window = launch(cx, &tokio, data_dir.path());
+        const MY_LOGOUT: &str = "WEB-2: Fix logout, In Progress, Ada Lovelace";
+        const MY_ENDPOINT: &str = "API-101: Add endpoint, In Progress, Ada Lovelace";
+        const MY_DOCS: &str = "WEB-3: Write docs, In Progress, Ada Lovelace";
+        wait_for_rows(cx, window, &[MY_ENDPOINT, MY_DOCS, MY_LOGOUT, LOGIN]);
+        wait_until(cx, window, |window| {
+            window.try_find("sprint-filter").is_some()
+        });
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "sprint-filter", "Sprint 7");
+        });
+        wait_for_rows(cx, window, &[MY_ENDPOINT, MY_LOGOUT, LOGIN]);
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Me");
+            choose(window, cx, "status-filter", "In Progress");
+        });
+        wait_for_rows(cx, window, &[MY_ENDPOINT, MY_LOGOUT]);
+        in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
+        wait_for_rows(cx, window, &[MY_LOGOUT]);
+
+        // The search looks among the issues the filters let through
+        in_window(cx, window, |window, cx| {
+            choose_project(window, cx, "All projects");
+            choose(window, cx, "assignee-filter", "Any assignee");
+            choose(window, cx, "status-filter", "Any status");
+            window.click("search", cx);
+            window.input("fix", cx);
+        });
+        wait_until(cx, window, |window| {
+            let mut found = rows(window);
+            found.sort();
+            found == [LOGIN, MY_LOGOUT]
+        });
+
+        // Clear filters takes the sprint off with the others
+        in_window(cx, window, |window, cx| window.click("clear-filters", cx));
+        wait_until(cx, window, |window| {
+            label(window, "sprint-filter") == "Sprint"
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_sprint_filter_is_offered_only_where_there_are_sprints(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_with_sprints(&tokio, "");
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[ENDPOINT, DOCS, LOGOUT, LOGIN]);
+        wait_for_menu(cx, window, "status-filter", &["Any status", "To Do"]);
+
+        // A site without sprints: no button, and the key opens nothing
+        in_window(cx, window, |window, cx| {
+            assert!(window.try_find("sprint-filter").is_none());
+            window.press("shift-r", cx);
+            window.render_frame(cx);
+            assert!(window.find_all_by_role(Role::MenuItem).is_empty());
+        });
+
+        // A sync finds the sprints of WEB
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        tokio.block_on(state.execute(TWO_SPRINTS)).unwrap();
+        state.emit(SyncEvent::IssuesUpdated(vec!["WEB-1".into()]));
+        wait_until(cx, window, |window| {
+            window.try_find("sprint-filter").is_some()
+        });
+
+        // API has no issue in a sprint
+        in_window(cx, window, |window, cx| choose_project(window, cx, "API"));
+        wait_for_rows(cx, window, &[ENDPOINT]);
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("sprint-filter").is_none());
+        });
+        in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
+        wait_until(cx, window, |window| {
+            window.try_find("sprint-filter").is_some()
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_sprint_is_chosen_from_the_keyboard_and_beside_an_open_issue(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_with_sprints(&tokio, TWO_SPRINTS);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[ENDPOINT, DOCS, LOGOUT, LOGIN]);
+        wait_until(cx, window, |window| {
+            window.try_find("sprint-filter").is_some()
+        });
+
+        // The menu holds Any sprint, Sprint 7, Sprint 8 and Backlog
+        for key in ["shift-r", "down", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[LOGIN]);
+
+        // Beside an open issue the sprint is a submenu of the one button
+        in_window(cx, window, |window, cx| window.press("enter", cx));
+        wait_until(cx, window, |window| window.try_find("filters").is_some());
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "filters"), "Filters · 1");
+            choose_collapsed(window, cx, "Sprint: Sprint 7", "Backlog");
+        });
+        wait_until(cx, window, |window| rows(window).len() == 2);
     }
 
     #[gpui_kit::test]

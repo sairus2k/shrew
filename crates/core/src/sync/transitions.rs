@@ -768,6 +768,7 @@ mod tests {
             .mount(server)
             .await;
         crate::sync::no_worklog_changes().mount(server).await;
+        crate::sync::no_sprint_field().mount(server).await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_syncing_without_keychain(data_dir.path())
             .await

@@ -26,6 +26,15 @@ pub(crate) fn no_worklog_changes() -> Mock {
         ))
 }
 
+/// A site without sprints: every sync cycle asks for the sprint field. A mock
+/// of a test's own has a higher priority.
+pub(crate) fn no_sprint_field() -> Mock {
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(path("/rest/api/3/field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .with_priority(10)
+}
+
 pub(crate) fn tokio_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -176,6 +185,7 @@ pub(crate) fn launch_on_jira(cx: &mut TestAppContext, issues: &[Value]) -> TestA
             .mount(&server)
             .await;
         no_worklog_changes().mount(&server).await;
+        crate::harness::no_sprint_field().mount(&server).await;
         server
     });
     let data_dir = watching_web(&jira);

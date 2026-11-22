@@ -20,3 +20,18 @@ pub(crate) fn no_worklog_changes() -> wiremock::Mock {
             serde_json::json!({ "values": [], "until": 1_700_000_000_000_i64, "lastPage": true }),
         ))
 }
+
+/// A site without sprints: every sync cycle and every initial sync asks for
+/// the sprint field, so a test that runs one needs this unless it mounts its
+/// own, which has a higher priority.
+#[cfg(test)]
+pub(crate) fn no_sprint_field() -> wiremock::Mock {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/field"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .with_priority(10)
+}

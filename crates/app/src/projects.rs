@@ -493,6 +493,7 @@ mod tests {
         wait_until(cx, window, |window| window.try_find("sync-error").is_some());
 
         tokio.block_on(server.reset());
+        tokio.block_on(crate::harness::no_sprint_field().mount(&server));
         mount_api(
             &tokio,
             &server,
