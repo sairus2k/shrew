@@ -1,9 +1,12 @@
-//! The end of the status line that names the signed-in account and signs it out.
+//! The signed-in account and its sign-out: a row of the settings, and one line
+//! under the form that asks for a missing token.
 
 use crate::runtime::spawn;
 use app_core::api;
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
-    Sizable, WindowExt as _,
+    ActiveTheme, Sizable, WindowExt as _,
+    avatar::Avatar,
     button::{Button, ButtonVariants},
     notification::Notification,
 };
@@ -13,7 +16,12 @@ use gpui_kit::*;
 pub struct SignedOut;
 
 pub struct Account {
+    // A row of the settings, with the site, not the one line
+    in_settings: bool,
     email: Option<SharedString>,
+    // What Jira calls the user. The email stands in until the core has it
+    name: Option<SharedString>,
+    site: Option<SharedString>,
     signing_out: Option<Task<()>>,
     _load: Task<()>,
 }
@@ -21,18 +29,28 @@ pub struct Account {
 impl EventEmitter<SignedOut> for Account {}
 
 impl Account {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let account = spawn(cx, |state| async move { Ok(api::account(&state).await) });
+    pub fn new(in_settings: bool, cx: &mut Context<Self>) -> Self {
+        let account = spawn(cx, |state| async move {
+            Ok((api::account(&state).await, api::display_name(&state).await))
+        });
         let _load = cx.spawn(async move |this, cx| {
-            let email = account.await.ok().flatten().map(|account| account.email);
+            let (account, name) = account.await.unwrap_or_default();
             this.update(cx, |this, cx| {
-                this.email = email.map(SharedString::from);
+                this.name = name.map(SharedString::from);
+                if let Some(account) = account {
+                    this.email = Some(account.email.into());
+                    let site = account.site_url.trim_start_matches("https://");
+                    this.site = Some(site.to_owned().into());
+                }
                 cx.notify();
             })
             .ok();
         });
         Self {
+            in_settings,
             email: None,
+            name: None,
+            site: None,
             signing_out: None,
             _load,
         }
@@ -110,26 +128,55 @@ impl Account {
 impl Render for Account {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let email = self.email.clone().unwrap_or_default();
+        let account = div().id("account").test_support().aria_label(email.clone());
+        let sign_out = Button::new("sign-out")
+            .label("Sign out")
+            .loading(self.signing_out.is_some())
+            .on_click(cx.listener(|this, _, window, cx| this.ask(window, cx)));
+        if !self.in_settings {
+            return div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(account.child(email))
+                .child(sign_out.ghost().xsmall());
+        }
+        let name = self.name.clone().unwrap_or_else(|| email.clone());
+        let site = self.site.clone().unwrap_or_default();
+        let about = match &self.name {
+            Some(_) => format!("{email} · {site}").into(),
+            None => site,
+        };
         div()
-            .flex_none()
             .flex()
             .items_center()
-            .gap_2()
+            .gap_2p5()
+            .children(
+                self.email
+                    .is_some()
+                    .then(|| Avatar::new().name(name.clone()).small()),
+            )
             .child(
                 div()
-                    .id("account")
-                    .test_support()
-                    .aria_label(email.clone())
-                    .child(email),
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("account-name")
+                            .test_support()
+                            .aria_label(name.clone())
+                            .font_semibold()
+                            .child(name),
+                    )
+                    .child(
+                        account
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(about),
+                    ),
             )
-            .child(
-                Button::new("sign-out")
-                    .ghost()
-                    .xsmall()
-                    .label("Sign out")
-                    .loading(self.signing_out.is_some())
-                    .on_click(cx.listener(|this, _, window, cx| this.ask(window, cx))),
-            )
+            .child(sign_out.outline().small())
     }
 }
 
@@ -150,6 +197,13 @@ mod tests {
 
     fn wait_for(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) {
         wait_until(cx, window, |window| window.try_find(id).is_some());
+    }
+
+    /// The account is a section of the settings.
+    fn open_settings(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        wait_for(cx, window, "edit-settings");
+        in_window(cx, window, |window, cx| window.click("edit-settings", cx));
+        wait_for(cx, window, "sign-out");
     }
 
     fn credentials_are_saved(data_dir: &Path) -> bool {
@@ -197,6 +251,11 @@ mod tests {
         let tokio = tokio_runtime();
         let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
         let window = launch(cx, &tokio, data_dir.path());
+        in_window(cx, window, |window, _| {
+            // The status bar no longer names the account
+            assert!(window.try_find("sign-out").is_none());
+        });
+        open_settings(cx, window);
         wait_until(cx, window, |window| {
             window.find("account").label() == Some("ada@example.com")
         });
@@ -219,11 +278,38 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_account_is_shown_under_the_name_jira_has_for_it(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_settings(cx, window);
+        // A config written before the name was kept
+        wait_until(cx, window, |window| {
+            window.find("account-name").label() == Some("ada@example.com")
+        });
+
+        let file = data_dir.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        config["display_name"] = json!("Ada Lovelace");
+        std::fs::write(&file, config.to_string()).unwrap();
+        let window = launch(cx, &tokio, data_dir.path());
+        open_settings(cx, window);
+
+        wait_until(cx, window, |window| {
+            window.find("account-name").label() == Some("Ada Lovelace")
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("account").label(), Some("ada@example.com"));
+        });
+    }
+
+    #[gpui_kit::test]
     fn tab_and_enter_sign_out(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
         let window = launch(cx, &tokio, data_dir.path());
-        wait_for(cx, window, "sign-out");
+        open_settings(cx, window);
 
         tab_to(cx, window, "sign-out");
         in_window(cx, window, |window, cx| window.press("enter", cx));
@@ -237,7 +323,7 @@ mod tests {
         let tokio = tokio_runtime();
         let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
         let window = launch(cx, &tokio, data_dir.path());
-        wait_for(cx, window, "sign-out");
+        open_settings(cx, window);
         in_window(cx, window, |window, cx| window.click("sign-out", cx));
         wait_for(cx, window, "site-url");
 
@@ -265,7 +351,7 @@ mod tests {
         let tokio = tokio_runtime();
         let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
         let window = launch(cx, &tokio, data_dir.path());
-        wait_for(cx, window, "sign-out");
+        open_settings(cx, window);
         let state = cx.update(|cx| cx.global::<Core>().state.clone());
         let queue = "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)
                      VALUES ('transition', 'WEB-1', 'create', '{}')";
@@ -278,7 +364,7 @@ mod tests {
         cx.run_until_parked();
         in_window(cx, window, |window, cx| {
             assert!(!window.has_active_dialog(cx));
-            assert!(window.try_find("home").is_some());
+            assert!(window.try_find("settings").is_some());
         });
         assert!(credentials_are_saved(data_dir.path()));
 

@@ -1,5 +1,5 @@
 //! Which projects to keep locally: the second screen of a new install, and
-//! later a screen the user opens from the main window.
+//! later a section of the settings.
 
 use crate::runtime::spawn;
 use app_core::{
@@ -7,7 +7,7 @@ use app_core::{
     models::{Project, SetupStep},
 };
 use gpui_kit::component::{
-    ActiveTheme, Disableable,
+    ActiveTheme, Disableable, Sizable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
 };
@@ -17,23 +17,21 @@ use gpui_kit::*;
 /// step that follows: the download of new projects, or the app itself.
 pub struct ProjectsChosen(pub SetupStep);
 
-/// Emitted when the user leaves the screen without saving.
-pub struct ProjectsCancelled;
-
 pub struct ProjectPicker {
-    // Opened from the main window, not as a step of the setup
+    // A section of the settings, not a step of the setup
     editing: bool,
     // `None` until Jira has answered
     projects: Option<Vec<Project>>,
     // Project keys
     watched: Vec<String>,
+    // What the core has, to tell whether there is anything to save
+    saved: Vec<String>,
     error: Option<SharedString>,
     loading: Task<()>,
     saving: Option<Task<()>>,
 }
 
 impl EventEmitter<ProjectsChosen> for ProjectPicker {}
-impl EventEmitter<ProjectsCancelled> for ProjectPicker {}
 
 impl ProjectPicker {
     pub fn new(editing: bool, cx: &mut Context<Self>) -> Self {
@@ -41,6 +39,7 @@ impl ProjectPicker {
             editing,
             projects: None,
             watched: Vec::new(),
+            saved: Vec::new(),
             error: None,
             loading: Task::ready(()),
             saving: None,
@@ -50,25 +49,46 @@ impl ProjectPicker {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
-        let load = spawn(cx, |state| async move {
-            // Nothing is watched during the setup
+        // What Jira listed the last time is shown at once, and without a
+        // connection it is all there is. Nothing is kept or watched yet
+        // during the setup
+        let kept = spawn(cx, |state| async move {
             Ok((
-                api::projects(&state).await?,
+                api::cached_projects(&state).await?,
                 api::watched_projects(&state).await?,
             ))
         });
+        let listed = spawn(cx, |state| async move { api::projects(&state).await });
         self.error = None;
         self.loading = cx.spawn(async move |this, cx| {
-            let result = load.await;
-            this.update(cx, |this, cx| {
-                match result {
+            let kept = kept.await;
+            let known = this.update(cx, |this, cx| {
+                match kept {
                     Ok((projects, watched)) => {
-                        this.projects = Some(projects);
-                        this.watched = watched;
+                        if !projects.is_empty() {
+                            this.projects = Some(projects);
+                        }
+                        this.watched = watched.clone();
+                        this.saved = watched;
                     }
                     Err(error) => {
                         this.error = Some(format!("Could not load the projects: {error}").into())
                     }
+                }
+                cx.notify();
+                this.error.is_none()
+            });
+            if !known.unwrap_or(false) {
+                return;
+            }
+            let listed = listed.await;
+            this.update(cx, |this, cx| {
+                match listed {
+                    Ok(projects) => this.projects = Some(projects),
+                    Err(error) if this.projects.is_none() => {
+                        this.error = Some(format!("Could not load the projects: {error}").into())
+                    }
+                    Err(_) => {}
                 }
                 cx.notify();
             })
@@ -83,6 +103,75 @@ impl ProjectPicker {
             self.watched.push(key.to_owned());
         }
         cx.notify();
+    }
+
+    fn changed(&self) -> bool {
+        // A project taken out and put back moves to the end
+        let sorted = |keys: &[String]| {
+            let mut keys = keys.to_vec();
+            keys.sort();
+            keys
+        };
+        sorted(&self.watched) != sorted(&self.saved)
+    }
+
+    /// The checkboxes in two columns with Save under them, for the settings.
+    fn section(&self, error: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
+        let Some(projects) = &self.projects else {
+            let retry = error.is_some().then(|| {
+                div().flex().child(
+                    Button::new("retry-projects")
+                        .outline()
+                        .small()
+                        .label("Try again")
+                        .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+                )
+            });
+            let loading = error.is_none().then(|| {
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Loading projects…")
+            });
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(loading)
+                .children(error)
+                .children(retry);
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .grid()
+                    .grid_cols(2)
+                    .gap_x_4()
+                    .gap_y_1p5()
+                    .children(projects.iter().map(|project| self.checkbox(project, cx))),
+            )
+            .children(error)
+            .child(
+                div().flex().child(
+                    Button::new("watch-projects")
+                        .outline()
+                        .small()
+                        .label("Save")
+                        .disabled(self.watched.is_empty() || !self.changed())
+                        .loading(self.saving.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                ),
+            )
+    }
+
+    fn checkbox(&self, project: &Project, cx: &mut Context<Self>) -> Checkbox {
+        let key = project.key.clone();
+        Checkbox::new(SharedString::from(format!("project-{key}")))
+            .label(format!("{key} — {}", project.name))
+            .checked(self.watched.contains(&key))
+            .on_click(cx.listener(move |this, watch: &bool, _, cx| this.toggle(&key, *watch, cx)))
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -122,11 +211,11 @@ impl Render for ProjectPicker {
                 .text_color(cx.theme().danger)
                 .child(error)
         });
-        let cancel = self.editing.then(|| {
-            Button::new("cancel-projects")
-                .label("Cancel")
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(ProjectsCancelled)))
-        });
+        if self.editing {
+            return self
+                .section(error.map(IntoElement::into_any_element), cx)
+                .into_any_element();
+        }
         let form = div()
             .w(px(360.))
             .max_h_full()
@@ -158,43 +247,27 @@ impl Render for ProjectPicker {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .children(projects.iter().map(|project| {
-                            let key = project.key.clone();
-                            Checkbox::new(SharedString::from(format!("project-{key}")))
-                                .label(format!("{key} — {}", project.name))
-                                .checked(self.watched.contains(&key))
-                                .on_click(cx.listener(move |this, watch: &bool, _, cx| {
-                                    this.toggle(&key, *watch, cx)
-                                }))
-                        })),
+                        .children(projects.iter().map(|project| self.checkbox(project, cx))),
                 )
                 .children(error)
                 .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Button::new("watch-projects")
-                                .primary()
-                                .label(if self.editing { "Save" } else { "Start sync" })
-                                .disabled(self.watched.is_empty())
-                                .loading(self.saving.is_some())
-                                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                        )
-                        .children(cancel),
+                    div().flex().child(
+                        Button::new("watch-projects")
+                            .primary()
+                            .label("Start sync")
+                            .disabled(self.watched.is_empty())
+                            .loading(self.saving.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    ),
                 ),
             None if error.is_some() => form.children(error).child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("retry-projects")
-                            .label("Try again")
-                            .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
-                    )
-                    .children(cancel),
+                div().flex().child(
+                    Button::new("retry-projects")
+                        .label("Try again")
+                        .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+                ),
             ),
-            None => form.child("Loading projects…").children(cancel),
+            None => form.child("Loading projects…"),
         };
         div()
             .size_full()
@@ -202,6 +275,7 @@ impl Render for ProjectPicker {
             .items_center()
             .justify_center()
             .child(form)
+            .into_any_element()
     }
 }
 
@@ -326,11 +400,15 @@ mod tests {
         tokio.block_on(api::watched_projects(&state)).unwrap()
     }
 
+    /// The projects are a section of the settings.
     fn open_projects(cx: &mut TestAppContext, window: AnyWindowHandle) {
         wait_until(cx, window, |window| {
-            window.try_find("edit-projects").is_some()
+            window.try_find("edit-settings").is_some()
         });
-        in_window(cx, window, |window, cx| window.click("edit-projects", cx));
+        in_window(cx, window, |window, cx| {
+            assert!(window.try_find("edit-projects").is_none());
+            window.click("edit-settings", cx)
+        });
         wait_until(cx, window, |window| {
             window.try_find("project-WEB").is_some()
         });
@@ -382,16 +460,42 @@ mod tests {
         in_window(cx, window, |window, cx| window.click("project-API", cx));
         in_window(cx, window, |window, cx| {
             assert_eq!(window.find("project-API").checked(), Some(false));
-            window.click("cancel-projects", cx);
+            window.click("close-settings", cx);
         });
 
         wait_until(cx, window, |window| {
-            rows(window).len() == 2 && window.try_find("choose-projects").is_none()
+            rows(window).len() == 2 && window.try_find("settings").is_none()
         });
         assert_eq!(watched(cx, &tokio), ["WEB", "API"]);
         // The cache is untouched, and so is the choice after a restart
         let window = launch(cx, &tokio, data_dir.path());
         wait_until(cx, window, |window| rows(window).len() == 2);
+    }
+
+    #[gpui_kit::test]
+    fn the_settings_show_the_projects_jira_listed_before_when_it_does_not_answer(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = jira(&tokio, ResponseTemplate::new(200));
+        mount_projects(&tokio, &server);
+        let data_dir = synced_watching(&tokio, &server, &["WEB"]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_projects(cx, window);
+        in_window(cx, window, |window, cx| window.click("close-settings", cx));
+        wait_until(cx, window, |window| window.try_find("home").is_some());
+
+        // No project list any more: Jira answers 404
+        tokio.block_on(server.reset());
+        tokio.block_on(crate::harness::no_sprint_field().mount(&server));
+        open_projects(cx, window);
+        cx.run_until_parked();
+
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("project-API").label(), Some("API — Backend"));
+            assert_eq!(window.find("project-WEB").checked(), Some(true));
+            assert!(window.try_find("projects-error").is_none());
+        });
     }
 
     #[gpui_kit::test]
@@ -405,13 +509,15 @@ mod tests {
 
         in_window(cx, window, |window, cx| {
             window.click("project-WEB", cx);
+        });
+        in_window(cx, window, |window, cx| {
             assert_eq!(window.find("project-WEB").checked(), Some(false));
             window.click("watch-projects", cx);
         });
         cx.run_until_parked();
 
         in_window(cx, window, |window, _| {
-            assert!(window.try_find("choose-projects").is_some());
+            assert!(window.try_find("settings").is_some());
             assert!(window.try_find("home").is_none());
         });
         assert_eq!(watched(cx, &tokio), ["WEB"]);
@@ -443,8 +549,9 @@ mod tests {
         in_window(cx, window, |window, cx| {
             assert_eq!(window.find("project-API").checked(), Some(false));
             window.click("project-API", cx);
-            window.click("watch-projects", cx);
         });
+        // Save is pressed only when there is something to save
+        in_window(cx, window, |window, cx| window.click("watch-projects", cx));
 
         wait_until(cx, window, |window| {
             window.try_find("sync-progress-API").is_some()
@@ -489,10 +596,8 @@ mod tests {
         let data_dir = synced_watching(&tokio, &server, &["WEB"]);
         let window = launch(cx, &tokio, data_dir.path());
         open_projects(cx, window);
-        in_window(cx, window, |window, cx| {
-            window.click("project-API", cx);
-            window.click("watch-projects", cx);
-        });
+        in_window(cx, window, |window, cx| window.click("project-API", cx));
+        in_window(cx, window, |window, cx| window.click("watch-projects", cx));
         wait_until(cx, window, |window| window.try_find("sync-error").is_some());
 
         tokio.block_on(server.reset());
@@ -525,10 +630,8 @@ mod tests {
         wait_until(cx, window, |window| rows(window) == [API_LOGIN]);
         open_projects(cx, window);
 
-        in_window(cx, window, |window, cx| {
-            window.click("project-API", cx);
-            window.click("watch-projects", cx);
-        });
+        in_window(cx, window, |window, cx| window.click("project-API", cx));
+        in_window(cx, window, |window, cx| window.click("watch-projects", cx));
 
         wait_until(cx, window, |window| rows(window) == [WEB_LOGIN]);
         wait_for_watched(cx, window, &["WEB"]);

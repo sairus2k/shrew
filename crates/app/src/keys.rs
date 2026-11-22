@@ -24,7 +24,6 @@ actions!(
         OpenInJira,
         SyncNow,
         EditUserSettings,
-        EditProjects,
         ShowShortcuts,
         Back
     ]
@@ -66,7 +65,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("b", OpenInJira, Some(LIST)),
         KeyBinding::new("r", SyncNow, Some(LIST)),
         KeyBinding::new("cmd-,", EditUserSettings, Some(LIST)),
-        KeyBinding::new("shift-p", EditProjects, Some(LIST)),
         KeyBinding::new("?", ShowShortcuts, Some(LIST)),
         KeyBinding::new("escape", Back, Some(HOME)),
     ]);
@@ -74,7 +72,7 @@ pub fn init(cx: &mut App) {
 
 /// What the help view lists, in its order. The keys are read from the keymap,
 /// so the view cannot name a key that is not bound.
-fn listed() -> [(Box<dyn Action>, &'static str); 20] {
+fn listed() -> [(Box<dyn Action>, &'static str); 19] {
     [
         (Box::new(SelectNext), "Next issue"),
         (Box::new(SelectPrevious), "Previous issue"),
@@ -100,7 +98,6 @@ fn listed() -> [(Box<dyn Action>, &'static str); 20] {
         (Box::new(OpenInJira), "Open in Jira"),
         (Box::new(SyncNow), "Sync now"),
         (Box::new(EditUserSettings), "Settings"),
-        (Box::new(EditProjects), "Choose the projects"),
         (Box::new(ShowShortcuts), "Show this list"),
     ]
 }
@@ -428,7 +425,7 @@ mod tests {
         open_top(cx, &app);
         let every_key = [
             "j", "k", "down", "up", "/", "p", "shift-a", "shift-s", "shift-r", "s", "a", "c", "w",
-            "t", "shift-t", "b", "r", "cmd-,", "shift-p", "?",
+            "t", "shift-t", "b", "r", "cmd-,", "?",
         ];
         for (clicked, input) in [
             ("worklog-duration", "Time spent"),
@@ -441,7 +438,7 @@ mod tests {
                 // The keys that are characters were typed
                 assert_eq!(
                     window.find_by_label(input).value(),
-                    Some("jk/pASRsacwtTbrP?")
+                    Some("jk/pASRsacwtTbr?")
                 );
                 assert_eq!(opened(window).as_deref(), Some("WEB-3"));
                 assert!(menu(window).is_empty());
@@ -566,7 +563,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_settings_and_the_projects_open_with_a_key(cx: &mut TestAppContext) {
+    fn the_settings_open_with_a_key(cx: &mut TestAppContext) {
         let app = app(cx);
 
         press(cx, &app, &["cmd-,"]);
@@ -576,15 +573,7 @@ mod tests {
         tab_to(cx, app.window, "close-settings");
         press(cx, &app, &["enter"]);
 
-        wait_until(cx, app.window, |window| window.try_find("home").is_some());
-        press(cx, &app, &["shift-p"]);
-        in_window(cx, app.window, |window, _| {
-            assert!(window.try_find("choose-projects").is_some())
-        });
-        tab_to(cx, app.window, "cancel-projects");
-        press(cx, &app, &["space"]);
-
-        // The list has the keys again after either screen, and it is a new
+        // The list has the keys again after the settings, and it is a new
         // list, which the core fills a moment later
         wait_until(cx, app.window, |window| rows(window).len() == 3);
         press(cx, &app, &["j"]);
@@ -672,7 +661,6 @@ mod tests {
             ("Back", "⎋"),
             ("ChangeAssignee", "A"),
             ("ChangeStatus", "S"),
-            ("EditProjects", "⇧P"),
             ("EditUserSettings", "⌘,"),
             ("FilterByAssignee", "⇧A"),
             ("FocusSearch", "/"),
@@ -815,7 +803,6 @@ mod tests {
             "B: Open in Jira",
             "R: Sync now",
             "⌘,: Settings",
-            "⇧P: Choose the projects",
             "?: Show this list",
             "Tab, ⇧Tab: Move through the buttons and the fields",
             "Enter, Space: Press the focused button",

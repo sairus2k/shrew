@@ -1,27 +1,42 @@
-//! The settings: where logged time goes, Jira or Tempo, with the Tempo API
-//! token, and whether the controls show the keys of their shortcuts.
+//! The settings, one page: the account, the watched projects, where logged
+//! time goes, Jira or Tempo, with the Tempo API token, and whether the
+//! controls show the keys of their shortcuts.
 
+use crate::account::Account;
 use crate::keys::Hints;
+use crate::projects::ProjectPicker;
 use crate::runtime::spawn;
 use app_core::{
     api,
     models::{WorklogSettings, WorklogTarget},
 };
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable,
-    button::{Button, ButtonVariants},
+    ActiveTheme, Disableable, Sizable,
+    button::{Button, ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
 };
 use gpui_kit::*;
 
-/// Emitted when the user leaves the screen.
+/// Emitted when the user leaves the page.
 pub struct SettingsClosed;
 
 pub struct Settings {
+    account: Entity<Account>,
+    projects: Entity<ProjectPicker>,
     // `None` until the core has answered
     current: Option<WorklogSettings>,
     tempo_token: Entity<InputState>,
+    // The field for a new Tempo token is shown
+    replacing: bool,
+    // Tempo was chosen with no token saved: the token is asked for first,
+    // and saving it makes Tempo the target
+    choosing_tempo: bool,
+    // Takes the focus from the token field when the field goes away: GPUI
+    // Kit keeps a focused input alive, and Tab would start from a field
+    // that is not on the page
+    focus: FocusHandle,
     error: Option<SharedString>,
     saving: Option<Task<()>>,
     _load: Task<()>,
@@ -31,21 +46,35 @@ pub struct Settings {
 impl EventEmitter<SettingsClosed> for Settings {}
 
 impl Settings {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        account: Entity<Account>,
+        projects: Entity<ProjectPicker>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let tempo_token = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
                 .placeholder("Tempo API token")
         });
-        cx.subscribe(&tempo_token, |this, _, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.save_token(cx);
-            }
-        })
+        cx.subscribe_in(
+            &tempo_token,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.save_token(window, cx);
+                }
+            },
+        )
         .detach();
         let mut this = Self {
+            account,
+            projects,
             current: None,
             tempo_token,
+            replacing: false,
+            choosing_tempo: false,
+            focus: cx.focus_handle(),
             error: None,
             saving: None,
             _load: Task::ready(()),
@@ -82,7 +111,18 @@ impl Settings {
         })
     }
 
-    fn choose(&mut self, target: WorklogTarget, cx: &mut Context<Self>) {
+    fn choose(&mut self, target: WorklogTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let token_saved = self
+            .current
+            .is_some_and(|current| current.tempo_token_saved);
+        if target == WorklogTarget::Tempo && !token_saved {
+            self.choosing_tempo = true;
+            self.replace_token(window, cx);
+            return;
+        }
+        if self.replacing {
+            self.hide_token_field(window, cx);
+        }
         self.error = None;
         self.saving = Some(self.run(cx, move |state| async move {
             api::set_worklog_target(&state, target).await?;
@@ -91,15 +131,50 @@ impl Settings {
         cx.notify();
     }
 
-    fn save_token(&mut self, cx: &mut Context<Self>) {
+    fn replace_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replacing = true;
+        self.tempo_token
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn hide_token_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replacing = false;
+        self.choosing_tempo = false;
+        self.tempo_token
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn save_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving.is_some() {
             return;
         }
         let token = self.tempo_token.read(cx).value();
         self.error = None;
-        self.saving = Some(self.run(cx, move |state| async move {
+        let choosing_tempo = self.choosing_tempo;
+        let saved = spawn(cx, move |state| async move {
             api::save_tempo_token(&state, &token).await?;
+            if choosing_tempo {
+                api::set_worklog_target(&state, WorklogTarget::Tempo).await?;
+            }
             api::worklog_settings(&state).await
+        });
+        self.saving = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = saved.await;
+            this.update_in(cx, |this, window, cx| {
+                this.saving = None;
+                match result {
+                    Ok(current) => {
+                        this.current = Some(current);
+                        this.hide_token_field(window, cx);
+                    }
+                    Err(error) => this.error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
         }));
         cx.notify();
     }
@@ -122,100 +197,129 @@ impl Settings {
         });
         cx.notify();
     }
-}
 
-impl Render for Settings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn time_tracking(&self, cx: &mut Context<Self>) -> Div {
         let target = self.current.map(|current| current.target);
         let token_saved = self
             .current
             .is_some_and(|current| current.tempo_token_saved);
         let busy = self.saving.is_some();
+        let muted = cx.theme().muted_foreground;
         let choice = |id: &'static str, label: &'static str, this: WorklogTarget| {
-            Button::new(id)
+            let button = Button::new(id)
+                .small()
                 .label(label)
-                .selected(target == Some(this))
                 .disabled(busy || self.current.is_none())
-                .on_click(cx.listener(move |this_view, _, _, cx| this_view.choose(this, cx)))
+                .on_click(
+                    cx.listener(move |this_view, _, window, cx| this_view.choose(this, window, cx)),
+                );
+            if target == Some(this) {
+                button.primary()
+            } else {
+                button.outline()
+            }
         };
-        let form = div()
-            .w(px(360.))
+        let targets = div()
+            .id("worklog-target")
+            .test_support()
+            .aria_label(match target {
+                Some(WorklogTarget::Tempo) => "Tempo",
+                Some(WorklogTarget::Jira) => "Jira",
+                None => "",
+            })
             .flex()
-            .flex_col()
-            .gap_3()
-            .child(div().text_xl().child("Time tracking"))
             .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Logged time goes to one place. Tempo copies its worklogs into Jira, \
-                         so sending to both would log the time twice.",
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
+                ButtonGroup::new("worklog-targets")
                     .child(choice("target-jira", "Jira", WorklogTarget::Jira))
                     .child(choice("target-tempo", "Tempo", WorklogTarget::Tempo)),
-            )
-            .child(
-                div()
-                    .id("worklog-target")
-                    .test_support()
-                    .aria_label(match target {
-                        Some(WorklogTarget::Tempo) => "Tempo",
-                        Some(WorklogTarget::Jira) => "Jira",
-                        None => "",
-                    })
-                    .text_sm()
-                    .child(match target {
-                        Some(WorklogTarget::Tempo) => "Time is logged to Tempo",
-                        Some(WorklogTarget::Jira) => "Time is logged to Jira",
-                        None => "",
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child("Tempo API token")
-                    .child(
-                        Input::new(&self.tempo_token)
-                            .id("tempo-token")
-                            .aria_label("Tempo API token"),
-                    )
-                    .child(
-                        div()
-                            .id("tempo-token-state")
-                            .test_support()
-                            .aria_label(if token_saved { "saved" } else { "not saved" })
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if token_saved {
-                                "A token is saved in the Keychain"
-                            } else {
-                                "Create one in Tempo under Settings, API integration"
-                            }),
-                    )
-                    .child(
-                        div().flex().child(
+            );
+        let token_state = div()
+            .id("tempo-token-state")
+            .test_support()
+            .aria_label(if token_saved { "saved" } else { "not saved" })
+            .flex_1()
+            .min_w_0()
+            .text_xs()
+            .text_color(muted)
+            .child(if token_saved {
+                "The Tempo API token is saved in the Keychain"
+            } else {
+                "No Tempo API token is saved"
+            });
+        let token = if self.replacing {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(token_state)
+                .child(
+                    Input::new(&self.tempo_token)
+                        .id("tempo-token")
+                        .aria_label("Tempo API token"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Create one in Tempo under Settings, API integration"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
                             Button::new("save-tempo-token")
+                                .primary()
+                                .small()
                                 .label("Save token")
                                 .loading(busy)
-                                .on_click(cx.listener(|this, _, _, cx| this.save_token(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.save_token(window, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("cancel-tempo-token")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.error = None;
+                                    this.hide_token_field(window, cx)
+                                })),
                         ),
-                    ),
-            )
-            .child(div().mt_3().text_xl().child("Keyboard shortcuts"))
-            .child(
-                Checkbox::new("shortcut-hints")
-                    .label("Show the key of a shortcut in its button or field")
-                    .checked(cx.global::<Hints>().0)
-                    .on_click(cx.listener(|this, shown: &bool, _, cx| this.show_hints(*shown, cx))),
-            )
+                )
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_2p5()
+                .child(token_state)
+                .child(
+                    Button::new("replace-tempo-token")
+                        .outline()
+                        .small()
+                        // There is nothing to replace yet
+                        .label(if token_saved {
+                            "Replace token"
+                        } else {
+                            "Add token"
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.replace_token(window, cx)),
+                        ),
+                )
+        };
+        // The token is Tempo's alone, so it is not shown while time goes to Jira
+        let token = (target == Some(WorklogTarget::Tempo) || self.replacing).then_some(token);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(targets)
+            .child(div().text_xs().text_color(muted).child(
+                "Tempo copies its worklogs into Jira, so sending to both would log the time twice.",
+            ))
+            .children(token)
             .children(self.error.clone().map(|error| {
                 div()
                     .id("settings-error")
@@ -225,20 +329,111 @@ impl Render for Settings {
                     .text_color(cx.theme().danger)
                     .child(error)
             }))
-            .child(
-                div().flex().child(
-                    Button::new("close-settings")
-                        .primary()
-                        .label("Done")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsClosed))),
+    }
+}
+
+/// A section of the page: its name and what it is on the left, its controls
+/// on the right, a hairline under it.
+fn section(name: &'static str, about: &'static str, controls: impl IntoElement, cx: &App) -> Div {
+    div()
+        .flex()
+        .gap_6()
+        .py_4()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .w(px(150.))
+                .flex_none()
+                .child(div().font_semibold().child(name))
+                .child(
+                    div()
+                        .mt_0p5()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(about),
                 ),
-            );
-        div()
-            .size_full()
+        )
+        .child(div().flex_1().min_w_0().child(controls))
+}
+
+impl Render for Settings {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let header = div()
+            .flex_none()
+            .px_5()
+            .py_3()
             .flex()
             .items_center()
-            .justify_center()
-            .child(form)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(16.))
+                    .font_semibold()
+                    .child("Settings"),
+            )
+            .child(
+                Button::new("close-settings")
+                    .primary()
+                    .small()
+                    .label("Done")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsClosed))),
+            );
+        let hints = Checkbox::new("shortcut-hints")
+            .label("Show the key of a shortcut in its button or field")
+            .checked(cx.global::<Hints>().0)
+            .on_click(cx.listener(|this, shown: &bool, _, cx| this.show_hints(*shown, cx)));
+        let sections = div()
+            .w(px(620.))
+            .max_w_full()
+            .mx_auto()
+            .px_5()
+            .py_1()
+            .child(section(
+                "Account",
+                "The Jira site you are signed in to",
+                self.account.clone(),
+                cx,
+            ))
+            .child(section(
+                "Projects",
+                "All their issues are downloaded, so that you can search them",
+                self.projects.clone(),
+                cx,
+            ))
+            .child(section(
+                "Time tracking",
+                "Logged time goes to one place",
+                self.time_tracking(cx),
+                cx,
+            ))
+            .child(
+                section(
+                    "Keyboard shortcuts",
+                    "They are listed under ? in the status bar",
+                    hints,
+                    cx,
+                )
+                .border_b_0(),
+            );
+        div()
+            .id("settings")
+            .test_support()
+            .track_focus(&self.focus)
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(
+                div()
+                    .id("settings-sections")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(sections),
+            )
     }
 }
 
@@ -266,21 +461,21 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn tempo_cannot_be_chosen_until_its_token_is_saved(cx: &mut TestAppContext) {
+    fn choosing_tempo_asks_for_its_token_first_and_the_token_shows_only_for_tempo(
+        cx: &mut TestAppContext,
+    ) {
         let app = launch_on_jira(cx, &[]);
         open(cx, &app);
+        in_window(cx, app.window, |window, cx| {
+            // Time goes to Jira: nothing of the Tempo token is on the page
+            assert!(window.try_find("tempo-token-state").is_none());
+            assert!(window.try_find("replace-tempo-token").is_none());
+            assert!(window.try_find("tempo-token").is_none());
+            window.click("target-tempo", cx);
+        });
 
         in_window(cx, app.window, |window, cx| {
-            window.click("target-tempo", cx)
-        });
-        wait_until(cx, app.window, |window| {
-            window.try_find("settings-error").is_some()
-        });
-        in_window(cx, app.window, |window, cx| {
-            assert_eq!(
-                window.find("settings-error").label(),
-                Some("Save the Tempo API token first")
-            );
+            assert!(window.try_find("settings-error").is_none());
             assert_eq!(window.find("worklog-target").label(), Some("Jira"));
             assert_eq!(window.find("tempo-token-state").label(), Some("not saved"));
             window.click("tempo-token", cx);
@@ -288,18 +483,52 @@ mod tests {
             window.click("save-tempo-token", cx);
         });
         wait_until(cx, app.window, |window| {
-            window.find("tempo-token-state").label() == Some("saved")
+            window.find("worklog-target").label() == Some("Tempo")
+        });
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(window.find("tempo-token-state").label(), Some("saved"));
+            // The field is not there until it is asked for
+            assert!(window.try_find("tempo-token").is_none());
+            assert!(window.try_find("replace-tempo-token").is_some());
         });
 
+        in_window(cx, app.window, |window, cx| window.click("target-jira", cx));
+        wait_until(cx, app.window, |window| {
+            window.find("worklog-target").label() == Some("Jira")
+        });
         in_window(cx, app.window, |window, cx| {
-            window.click("target-tempo", cx)
+            assert!(window.try_find("tempo-token-state").is_none());
+            // The token is saved now, so Tempo is chosen at once
+            window.click("target-tempo", cx);
         });
         wait_until(cx, app.window, |window| {
             window.find("worklog-target").label() == Some("Tempo")
         });
-        in_window(cx, app.window, |window, cx| window.click("target-jira", cx));
-        wait_until(cx, app.window, |window| {
-            window.find("worklog-target").label() == Some("Jira")
+        in_window(cx, app.window, |window, cx| {
+            window.click("replace-tempo-token", cx)
+        });
+        in_window(cx, app.window, |window, _| {
+            assert!(window.try_find("tempo-token").is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_a_new_tempo_token_hides_its_field_and_saves_nothing(cx: &mut TestAppContext) {
+        let app = launch_on_jira(cx, &[]);
+        open(cx, &app);
+        in_window(cx, app.window, |window, cx| {
+            window.click("target-tempo", cx)
+        });
+        in_window(cx, app.window, |window, cx| {
+            window.click("tempo-token", cx);
+            window.input("tempo-secret", cx);
+            window.click("cancel-tempo-token", cx);
+        });
+
+        in_window(cx, app.window, |window, _| {
+            assert!(window.try_find("tempo-token").is_none());
+            assert!(window.try_find("tempo-token-state").is_none());
+            assert_eq!(window.find("worklog-target").label(), Some("Jira"));
         });
     }
 

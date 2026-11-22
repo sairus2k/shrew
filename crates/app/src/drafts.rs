@@ -153,23 +153,18 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn the_text_is_back_after_the_settings_and_the_project_picker(cx: &mut TestAppContext) {
+    fn the_text_is_back_after_the_settings(cx: &mut TestAppContext) {
         let (_tokio, _dir, window) = two_issues(cx);
         open(cx, window, "WEB-1");
         write_everything(cx, window);
 
-        for (open_button, close_button) in [
-            ("edit-settings", "close-settings"),
-            ("edit-projects", "cancel-projects"),
-        ] {
-            in_window(cx, window, |window, cx| window.click(open_button, cx));
-            wait_until(cx, window, |window| window.try_find("home").is_none());
-            in_window(cx, window, |window, cx| window.click(close_button, cx));
-            open(cx, window, "WEB-1");
-            in_window(cx, window, |window, _| {
-                assert_eq!(typed(window), kept_text());
-            });
-        }
+        in_window(cx, window, |window, cx| window.click("edit-settings", cx));
+        wait_until(cx, window, |window| window.try_find("home").is_none());
+        in_window(cx, window, |window, cx| window.click("close-settings", cx));
+        open(cx, window, "WEB-1");
+        in_window(cx, window, |window, _| {
+            assert_eq!(typed(window), kept_text());
+        });
     }
 
     #[gpui_kit::test]
@@ -212,6 +207,8 @@ mod tests {
         let key = "WEB-1".into();
         assert!(!cx.update(|cx| Drafts::get(cx, &key)).comment.is_empty());
 
+        in_window(cx, window, |window, cx| window.click("edit-settings", cx));
+        wait_until(cx, window, |window| window.try_find("sign-out").is_some());
         in_window(cx, window, |window, cx| window.click("sign-out", cx));
         wait_until(cx, window, |window| window.try_find("site-url").is_some());
 

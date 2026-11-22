@@ -7,6 +7,7 @@ use std::path::Path;
 
 pub(crate) mod assignable;
 pub(crate) mod issues;
+pub(crate) mod projects;
 pub(crate) mod sprints;
 pub(crate) mod sync_queue;
 pub(crate) mod sync_state;

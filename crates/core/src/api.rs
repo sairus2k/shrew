@@ -25,6 +25,15 @@ pub async fn account(state: &AppState) -> Option<Account> {
     })
 }
 
+/// The name Jira shows the signed-in user under. `None` for a config written
+/// before the name was kept, until a sync cycle asks for it.
+pub async fn display_name(state: &AppState) -> Option<String> {
+    let config = state.config.read().await;
+    config
+        .as_ref()
+        .and_then(|config| config.display_name.clone())
+}
+
 /// Why `sign_in` refused: the database holds changes that Jira has not
 /// received and that the account signing in did not make. `sign_in_discarding`
 /// deletes them.
@@ -275,19 +284,36 @@ pub async fn setup_step(state: &AppState) -> anyhow::Result<SetupStep> {
     })
 }
 
-/// The projects the account can see, ordered by name.
+/// The projects the account can see, ordered by name, asked from Jira. The
+/// answer is kept for `cached_projects`.
 pub async fn projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
     let config = state.config.read().await.clone().context("Sign in first")?;
     let projects = JiraClient::new(&config.site_url, &config.email, &config.api_token)
         .projects()
         .await?;
-    Ok(projects
+    let projects: Vec<_> = projects
         .into_iter()
         .map(|project| Project {
             key: project.key,
             name: project.name,
         })
-        .collect())
+        .collect();
+    // A sign-out while Jira answered has emptied the cache, and the answer
+    // belongs to the account that left
+    let asked_by = Some(config.account_id);
+    let config = state.config.read().await;
+    if config.as_ref().map(|config| &config.account_id) == asked_by.as_ref() {
+        let mut tx = db::begin(&state.pool).await?;
+        db::projects::replace(&mut tx, &projects).await?;
+        tx.commit().await?;
+    }
+    Ok(projects)
+}
+
+/// The projects Jira listed the last time `projects` asked, without asking
+/// again. Empty until the first answer.
+pub async fn cached_projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
+    Ok(db::projects::all(&state.pool).await?)
 }
 
 /// Saves the projects whose issues the app keeps locally. After the initial
@@ -857,6 +883,44 @@ mod tests {
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(setup_step(&state).await.unwrap(), SetupStep::InitialSync);
         assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
+    }
+
+    #[tokio::test]
+    async fn the_projects_jira_listed_last_are_kept_until_it_lists_them_again_or_a_sign_out() {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        assert!(cached_projects(&state).await.unwrap().is_empty());
+        let listed = Mock::given(path("/rest/api/3/project/search"))
+            .respond_with(project_list())
+            .mount_as_scoped(&server)
+            .await;
+
+        let accessible = projects(&state).await.unwrap();
+
+        assert_eq!(accessible.len(), 2);
+        assert_eq!(cached_projects(&state).await.unwrap(), accessible);
+        // Jira does not answer: what it listed before is still there
+        drop(listed);
+        assert!(projects(&state).await.is_err());
+        assert_eq!(cached_projects(&state).await.unwrap(), accessible);
+
+        Mock::given(path("/rest/api/3/project/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "isLast": true,
+                "values": [{ "id": "10000", "key": "WEB", "name": "Website" }],
+            })))
+            .mount(&server)
+            .await;
+        let accessible = projects(&state).await.unwrap();
+        assert_eq!(accessible.len(), 1);
+        assert_eq!(cached_projects(&state).await.unwrap(), accessible);
+
+        sign_out(&state).await.unwrap();
+        assert!(cached_projects(&state).await.unwrap().is_empty());
     }
 
     #[tokio::test]
