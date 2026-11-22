@@ -1853,8 +1853,27 @@ pub(crate) mod tests {
     fn with_one_watched_project_there_is_nothing_to_choose(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let data_dir = synced(&tokio, &three_issues());
-        let window = launch(cx, &tokio, data_dir.path());
-        wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
+        cx.update(gpui_kit::init);
+        init_core(cx, &tokio, data_dir.path());
+        // The core answers from the tokio runtime, outside GPUI's scheduler
+        cx.executor().allow_parking();
+        let (window, list) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| IssueList::new(window, cx))
+            })
+            .unwrap()
+        });
+        // Nothing on screen tells that the projects are read, and before
+        // that the button is missing whatever their number
+        let started = Instant::now();
+        while list.read_with(cx, |list, _| list.projects != ["WEB"]) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the projects were not read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
 
         in_window(cx, window, |window, _| {
             assert!(window.try_find("project-filter").is_none());
