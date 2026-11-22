@@ -104,6 +104,13 @@ fn menu_items(
     view: &Entity<IssueList>,
     window: &mut Window,
 ) -> PopupMenu {
+    // A scrollable menu draws a scrollbar, so only one that has more items
+    // than the window has room for under the row of the search is scrollable
+    let room = window.viewport_size().height - px(96.);
+    let item = rems(1.75).to_pixels(window.rem_size());
+    if item * (choices.len() + 1) as f32 > room {
+        menu = menu.scrollable(true).max_h(room);
+    }
     for choice in choices {
         let pick = choice.pick.clone();
         menu = menu.item(
@@ -579,7 +586,6 @@ impl IssueList {
             .children(keys::hint(key.as_ref(), cx));
         let clear = choices[0].pick.clone();
         let menu = move |menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            let menu = menu.scrollable(true).max_h(px(320.));
             menu_items(menu, &choices, &view, window)
         };
         if value.is_none() {
@@ -602,8 +608,8 @@ impl IssueList {
             .into_any_element()
     }
 
-    /// Every filter in the menu of one button, for a list too narrow for
-    /// their own buttons.
+    /// One button for a list too narrow for the buttons of the filters. Its
+    /// menu has a submenu for each filter.
     fn filters_button(&self, filters: Vec<Filter>, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let set = filters
@@ -621,13 +627,19 @@ impl IssueList {
             .dropdown_caret(true)
             // The key of every filter opens this menu; one of them fits
             .children(keys::hint(filters[0].key.as_ref(), cx));
-        let menu = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            menu = menu.scrollable(true).max_h(px(420.));
+        let menu = move |mut menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            // One menu with the values of every filter would not fit the window
             for filter in &filters {
-                menu = menu.label(filter.name);
-                menu = menu_items(menu, &filter.choices, &view, window).separator();
+                let label = match &filter.value {
+                    Some(value) => format!("{}: {value}", filter.name),
+                    None => filter.name.to_owned(),
+                };
+                let (choices, view) = (filter.choices.clone(), view.clone());
+                menu = menu.submenu(label, window, cx, move |menu, window, _| {
+                    menu_items(menu, &choices, &view, window)
+                });
             }
-            menu.item(
+            menu.separator().item(
                 PopupMenuItem::new("Clear filters")
                     .disabled(set == 0)
                     .on_click(
@@ -1073,6 +1085,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// Opens the menu all the filters collapse into, enters the submenu
+    /// `filter` and clicks its item `name`.
+    fn choose_collapsed(window: &mut Window, cx: &mut gpui_kit::App, filter: &str, name: &str) {
+        window.click("filters", cx);
+        window.render_frame(cx);
+        for label in [filter, name] {
+            let items = window.find_all_by_role(Role::MenuItem);
+            let labels: Vec<_> = items.iter().map(|item| item.label()).collect();
+            let item = items.iter().find(|item| item.label() == Some(label));
+            let item = item.unwrap_or_else(|| panic!("no item {label} among {labels:?}"));
+            let middle = item.bounds().center();
+            window.pointer_down(middle, MouseButton::Left, cx);
+            window.pointer_up(middle, MouseButton::Left, cx);
+            window.render_frame(cx);
+        }
+    }
+
     fn label(window: &Window, id: &'static str) -> String {
         window.find(id).label().unwrap().to_owned()
     }
@@ -1303,7 +1332,7 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn beside_an_open_issue_the_filters_are_in_one_menu(cx: &mut TestAppContext) {
+    fn beside_an_open_issue_the_filters_are_the_submenus_of_one_button(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let data_dir = synced_two_projects(&tokio, &team_work());
         let window = launch(cx, &tokio, data_dir.path());
@@ -1322,7 +1351,7 @@ pub(crate) mod tests {
 
         in_window(cx, window, |window, cx| window.click("issue-WEB-3", cx));
 
-        // The filter set in the wide list is counted
+        // The filter set in the wide list is counted, and its submenu names it
         in_window(cx, window, |window, cx| {
             for gone in [
                 "project-filter",
@@ -1337,31 +1366,23 @@ pub(crate) mod tests {
                 menu_of(window, cx, "filters"),
                 [
                     "Project",
-                    "All projects",
-                    "WEB",
-                    "API",
                     "Assignee",
-                    "Any assignee",
-                    "Me",
-                    "Unassigned",
-                    "Grace Hopper",
-                    "Status",
-                    "Any status",
-                    "To Do",
-                    "In Progress",
-                    "Clear filters",
+                    "Status: In Progress",
+                    "Clear filters"
                 ]
             );
         });
-        in_window(cx, window, |window, cx| choose(window, cx, "filters", "Me"));
+        in_window(cx, window, |window, cx| {
+            choose_collapsed(window, cx, "Assignee", "Me")
+        });
         wait_for_rows(cx, window, &[API_MINE, MINE]);
         in_window(cx, window, |window, cx| {
             assert_eq!(label(window, "filters"), "Filters · 2");
-            choose(window, cx, "filters", "Any status");
+            choose_collapsed(window, cx, "Status: In Progress", "Any status");
         });
         // The menu that has just closed opens again in the next frame
         in_window(cx, window, |window, cx| {
-            choose(window, cx, "filters", "WEB")
+            choose_collapsed(window, cx, "Project", "WEB")
         });
         wait_for_rows(cx, window, &[MINE]);
         in_window(cx, window, |window, cx| {
