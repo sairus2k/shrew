@@ -72,6 +72,17 @@ async fn open(
     tokio::fs::create_dir_all(data_dir).await?;
     let pool = db::init(data_dir).await?;
     let config = auth::load(data_dir, tokens.clone(), tempo_tokens.clone()).await;
+    // A database filled by a build that did not record whose data it holds
+    if let Some(config) = &config
+        && db::owner(&pool).await?.is_none()
+    {
+        let owner = models::Account {
+            site_url: config.site_url.clone(),
+            email: config.email.clone(),
+            account_id: config.account_id.clone(),
+        };
+        db::set_owner(&pool, &owner).await?;
+    }
     let (events, events_rx) = mpsc::unbounded_channel();
     let (sync_waker, wake_rx) = watch::channel(());
     let state = AppState {
@@ -133,7 +144,7 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(applied, 11);
+        assert_eq!(applied, 12);
         state.pool.close().await;
     }
 }

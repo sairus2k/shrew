@@ -55,6 +55,12 @@ const APP_ID: &str = "dev.shrew.app";
 
 enum Screen {
     SignIn(Entity<SignIn>),
+    // The account is known and the Keychain did not give its token. The account
+    // view is the way out for a user who cannot get a token for it any more.
+    EnterToken {
+        new_token: Entity<NewToken>,
+        account: Entity<Account>,
+    },
     ChooseProjects(Entity<ProjectPicker>),
     InitialSync(Entity<InitialSync>),
     Settings(Entity<Settings>),
@@ -160,7 +166,7 @@ impl Root {
         if new_token.is_some() {
             return;
         }
-        let banner = cx.new(|cx| NewToken::new(window, cx));
+        let banner = cx.new(|cx| NewToken::new(new_token::REJECTED, window, cx));
         cx.subscribe_in(&banner, window, |this, _, _: &TokenRenewed, window, cx| {
             if let Screen::Home { new_token, .. } = &mut this.screen {
                 *new_token = None;
@@ -190,6 +196,19 @@ impl Root {
                 .detach();
                 Screen::SignIn(sign_in)
             }
+            SetupStep::EnterToken => {
+                let new_token = cx.new(|cx| NewToken::new(new_token::MISSING, window, cx));
+                cx.subscribe_in(
+                    &new_token,
+                    window,
+                    |this, _, renewed: &TokenRenewed, window, cx| this.show(renewed.0, window, cx),
+                )
+                .detach();
+                Screen::EnterToken {
+                    new_token,
+                    account: Self::account(window, cx),
+                }
+            }
             SetupStep::ChooseProjects => Screen::ChooseProjects(Self::picker(false, window, cx)),
             SetupStep::InitialSync => {
                 let sync = cx.new(InitialSync::new);
@@ -202,14 +221,7 @@ impl Root {
             SetupStep::Ready => {
                 let list = cx.new(|cx| IssueList::new(window, cx));
                 cx.subscribe_in(&list, window, Self::open_issue).detach();
-                let account = cx.new(Account::new);
-                cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
-                    // The next account starts with its own sync errors
-                    this.notified_error = None;
-                    tray::forget(cx);
-                    this.show(SetupStep::SignIn, window, cx)
-                })
-                .detach();
+                let account = Self::account(window, cx);
                 let timer = cx.new(ActiveTimer::new);
                 cx.subscribe_in(
                     &timer,
@@ -240,6 +252,18 @@ impl Root {
                 }
             }
         }
+    }
+
+    fn account(window: &mut Window, cx: &mut Context<Self>) -> Entity<Account> {
+        let account = cx.new(Account::new);
+        cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
+            // The next account starts with its own sync errors
+            this.notified_error = None;
+            tray::forget(cx);
+            this.show(SetupStep::SignIn, window, cx)
+        })
+        .detach();
+        account
     }
 
     fn picker(editing: bool, window: &mut Window, cx: &mut Context<Self>) -> Entity<ProjectPicker> {
@@ -382,6 +406,15 @@ impl Render for Root {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = match &self.screen {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
+            Screen::EnterToken { new_token, account } => div()
+                .id("enter-token")
+                .test_support()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(new_token.clone())
+                .child(div().px_4().py_2().flex().child(account.clone()))
+                .into_any_element(),
             Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
             Screen::InitialSync(sync) => sync.clone().into_any_element(),
             Screen::Settings(settings) => settings.clone().into_any_element(),

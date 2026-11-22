@@ -1,7 +1,8 @@
-//! The banner that asks for a new API token after Jira rejected the saved one.
+//! The banner that asks for an API token: after Jira rejected the saved one, or
+//! when the Keychain did not give it at the start.
 
 use crate::runtime::spawn;
-use app_core::api;
+use app_core::{api, models::SetupStep};
 use gpui_kit::component::{
     ActiveTheme,
     button::{Button, ButtonVariants},
@@ -9,10 +10,19 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
-/// Emitted once Jira has accepted the new token and the core has saved it.
-pub struct TokenRenewed;
+/// Emitted once Jira has accepted the new token and the core has saved it,
+/// with the setup step the account is at.
+pub struct TokenRenewed(pub SetupStep);
+
+pub const REJECTED: &str = "Jira no longer accepts the API token, so sync is paused. \
+     Create a new token at id.atlassian.com/manage-profile/security/api-tokens";
+pub const MISSING: &str = "The API token of this account could not be read from the Keychain. \
+     Nothing you did is lost: enter the token again to go on, or create a new one at \
+     id.atlassian.com/manage-profile/security/api-tokens";
 
 pub struct NewToken {
+    // Why the token is asked for: `REJECTED` or `MISSING`
+    reason: &'static str,
     api_token: Entity<InputState>,
     error: Option<SharedString>,
     checking: Option<Task<()>>,
@@ -21,7 +31,7 @@ pub struct NewToken {
 impl EventEmitter<TokenRenewed> for NewToken {}
 
 impl NewToken {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(reason: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let api_token = cx.new(|cx| {
             InputState::new(window, cx)
                 .masked(true)
@@ -34,6 +44,7 @@ impl NewToken {
         })
         .detach();
         Self {
+            reason,
             api_token,
             error: None,
             checking: None,
@@ -46,7 +57,8 @@ impl NewToken {
         }
         let api_token = self.api_token.read(cx).value();
         let check = spawn(cx, move |state| async move {
-            api::renew_token(&state, &api_token).await
+            api::renew_token(&state, &api_token).await?;
+            Ok(api::setup_step(&state).await)
         });
         self.error = None;
         self.checking = Some(cx.spawn(async move |this, cx| {
@@ -54,7 +66,7 @@ impl NewToken {
             this.update(cx, |this, cx| {
                 this.checking = None;
                 match result {
-                    Ok(()) => cx.emit(TokenRenewed),
+                    Ok(step) => cx.emit(TokenRenewed(step)),
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
                 cx.notify();
@@ -78,10 +90,7 @@ impl Render for NewToken {
             .gap_2()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(
-                "Jira no longer accepts the API token, so sync is paused. \
-                 Create a new token at id.atlassian.com/manage-profile/security/api-tokens",
-            )
+            .child(self.reason)
             .child(
                 div()
                     .flex()
@@ -118,7 +127,7 @@ impl Render for NewToken {
 mod tests {
     use crate::{
         harness::{in_window, launch, tokio_runtime, wait_until},
-        issue_list::tests::synced,
+        issue_list::tests::{issue, rows, synced, synced_on},
         runtime::Core,
         sign_in::tests::jira,
     };
@@ -201,6 +210,42 @@ mod tests {
                 Some("Jira rejected the API token")
             );
             assert!(window.try_find("new-api-token").is_some());
+        });
+        assert_eq!(saved_token(data_dir.path()), "secret-token");
+    }
+
+    #[gpui_kit::test]
+    fn a_token_the_keychain_does_not_give_is_asked_for_and_the_app_goes_on(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = jira(
+            &tokio,
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "accountId": "5b10a", "displayName": "Ada" })),
+        );
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        std::fs::remove_file(data_dir.path().join("api-token")).unwrap();
+
+        let window = launch(cx, &tokio, data_dir.path());
+
+        wait_until(cx, window, |window| {
+            window.find("account").label() == Some("ada@example.com")
+        });
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("enter-token").is_some());
+            assert!(window.try_find("site-url").is_none());
+            assert!(window.try_find("home").is_none());
+        });
+
+        save(cx, window, "secret-token");
+
+        wait_until(cx, window, |window| window.try_find("home").is_some());
+        wait_until(cx, window, |window| {
+            rows(window) == ["WEB-1: Fix login, To Do, Unassigned"]
+        });
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("enter-token").is_none());
         });
         assert_eq!(saved_token(data_dir.path()), "secret-token");
     }

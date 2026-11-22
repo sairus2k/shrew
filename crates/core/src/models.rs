@@ -202,6 +202,8 @@ pub struct WorklogSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupStep {
     SignIn,
+    /// The account is known and its token is not: `api::renew_token` saves one.
+    EnterToken,
     ChooseProjects,
     InitialSync,
     Ready,

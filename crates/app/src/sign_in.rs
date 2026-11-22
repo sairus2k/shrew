@@ -3,7 +3,7 @@
 use crate::runtime::spawn;
 use app_core::api;
 use gpui_kit::component::{
-    ActiveTheme, Sizable,
+    ActiveTheme, Sizable, WindowExt as _,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
 };
@@ -29,9 +29,9 @@ impl SignIn {
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("you@example.com"));
         let api_token = cx.new(|cx| InputState::new(window, cx).masked(true));
         for input in [&site_url, &email, &api_token] {
-            cx.subscribe(input, |this, _, event: &InputEvent, cx| {
+            cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
-                    this.submit(cx);
+                    this.submit(false, window, cx);
                 }
             })
             .detach();
@@ -45,7 +45,8 @@ impl SignIn {
         }
     }
 
-    fn submit(&mut self, cx: &mut Context<Self>) {
+    /// `discard_unsent` is set only by the answer to `confirm`.
+    fn submit(&mut self, discard_unsent: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.checking.is_some() {
             return;
         }
@@ -53,22 +54,73 @@ impl SignIn {
         let email = self.email.read(cx).value();
         let api_token = self.api_token.read(cx).value();
         let check = spawn(cx, move |state| async move {
-            api::sign_in(&state, &site_url, &email, &api_token).await
+            if discard_unsent {
+                api::sign_in_discarding(&state, &site_url, &email, &api_token).await
+            } else {
+                api::sign_in(&state, &site_url, &email, &api_token).await
+            }
         });
         self.error = None;
-        self.checking = Some(cx.spawn(async move |this, cx| {
+        self.checking = Some(cx.spawn_in(window, async move |this, cx| {
             let result = check.await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.checking = None;
                 match result {
                     Ok(_) => cx.emit(SignedIn),
-                    Err(error) => this.error = Some(error.to_string().into()),
+                    Err(error) => match error.downcast_ref() {
+                        Some(unsent) => this.confirm(unsent, window, cx),
+                        None => this.error = Some(error.to_string().into()),
+                    },
                 }
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// The database holds changes of another account that Jira has not
+    /// received. They are deleted only when the user says so.
+    fn confirm(
+        &mut self,
+        unsent: &api::UnsentChanges,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let description = unsent_message(unsent);
+        let this = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            alert
+                .title("Delete unsent changes?")
+                .description(description.clone())
+                .ok_text("Sign in and delete")
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.submit(true, window, cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+}
+
+fn unsent_message(unsent: &api::UnsentChanges) -> String {
+    let (changes, have) = if unsent.count == 1 {
+        ("1 change".to_owned(), "has")
+    } else {
+        (format!("{} changes", unsent.count), "have")
+    };
+    match &unsent.owner {
+        Some(owner) => format!(
+            "{changes} made as {} on {} {have} not been sent to Jira yet. \
+             Sign in to that account to keep them: signing in to this one deletes them.",
+            owner.email, owner.site_url
+        ),
+        None => format!(
+            "{changes} made in this app {have} not been sent to Jira yet, and the app \
+             cannot tell which account made them. Signing in deletes them."
+        ),
     }
 }
 
@@ -132,7 +184,7 @@ impl Render for SignIn {
                     .primary()
                     .label("Sign in")
                     .loading(self.checking.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.submit(false, window, cx))),
             );
         div()
             .size_full()
@@ -145,7 +197,12 @@ impl Render for SignIn {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
+    use crate::{
+        harness::{in_window, launch, tokio_runtime, wait_until},
+        issue_list::tests::{issue, synced_on},
+        runtime::Core,
+    };
+    use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext};
     use wiremock::{
@@ -284,5 +341,114 @@ pub(crate) mod tests {
         in_window(cx, window, |window, _| {
             assert!(window.try_find("sign-in").is_some());
         });
+    }
+
+    /// A data dir whose config was lost, with one change of ada@example.com
+    /// on `site_url` that Jira has not received.
+    fn config_lost_with_an_unsent_change(
+        tokio: &tokio::runtime::Runtime,
+        site_url: &str,
+    ) -> tempfile::TempDir {
+        let data_dir = synced_on(tokio, site_url, &[issue(1, "Fix login")]);
+        tokio.block_on(async {
+            let (state, _events) = app_core::start_without_keychain(data_dir.path())
+                .await
+                .unwrap();
+            let queue = "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)
+                         VALUES ('transition', 'WEB-1', 'create', '{}')";
+            state.execute(queue).await.unwrap();
+        });
+        std::fs::write(data_dir.path().join("config.json"), "").unwrap();
+        data_dir
+    }
+
+    fn unsent_changes(cx: &mut TestAppContext, tokio: &tokio::runtime::Runtime) -> i64 {
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        tokio
+            .block_on(app_core::api::unsent_changes(&state))
+            .unwrap()
+    }
+
+    #[test]
+    fn the_question_counts_the_unsent_changes_and_names_the_account_that_keeps_them() {
+        let mut unsent = app_core::api::UnsentChanges {
+            count: 1,
+            owner: Some(app_core::models::Account {
+                site_url: "https://acme.atlassian.net".to_owned(),
+                email: "ada@example.com".to_owned(),
+                account_id: "5b10a".to_owned(),
+            }),
+        };
+        assert_eq!(
+            super::unsent_message(&unsent),
+            "1 change made as ada@example.com on https://acme.atlassian.net has not been sent \
+             to Jira yet. Sign in to that account to keep them: signing in to this one deletes \
+             them."
+        );
+
+        unsent.count = 3;
+        unsent.owner = None;
+        assert_eq!(
+            super::unsent_message(&unsent),
+            "3 changes made in this app have not been sent to Jira yet, and the app cannot \
+             tell which account made them. Signing in deletes them."
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_account_of_the_unsent_changes_signs_in_and_keeps_them(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = jira(
+            &tokio,
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "accountId": "5b10a", "displayName": "Ada" })),
+        );
+        let data_dir = config_lost_with_an_unsent_change(&tokio, &server.uri());
+        let window = launch(cx, &tokio, data_dir.path());
+
+        fill_in_and_submit(cx, window, &server.uri());
+
+        wait_until(cx, window, |window| {
+            window.try_find("choose-projects").is_some()
+        });
+        in_window(cx, window, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+        assert_eq!(unsent_changes(cx, &tokio), 1);
+    }
+
+    #[gpui_kit::test]
+    fn another_account_is_told_about_the_unsent_changes_and_deletes_them_only_on_ok(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let data_dir = config_lost_with_an_unsent_change(&tokio, "https://acme.atlassian.net");
+        let server = jira(
+            &tokio,
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "accountId": "7c20b", "displayName": "Grace" })),
+        );
+        let window = launch(cx, &tokio, data_dir.path());
+
+        fill_in_and_submit(cx, window, &server.uri());
+
+        wait_until(cx, window, |window| window.try_find("cancel").is_some());
+        in_window(cx, window, |window, cx| window.click("cancel", cx));
+        cx.run_until_parked();
+        in_window(cx, window, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert!(window.try_find("sign-in").is_some());
+            assert!(window.try_find("sign-in-error").is_none());
+        });
+        assert_eq!(unsent_changes(cx, &tokio), 1);
+
+        in_window(cx, window, |window, cx| window.click("sign-in", cx));
+        wait_until(cx, window, |window| window.try_find("ok").is_some());
+        in_window(cx, window, |window, cx| window.click("ok", cx));
+
+        wait_until(cx, window, |window| {
+            window.try_find("choose-projects").is_some()
+        });
+        assert_eq!(unsent_changes(cx, &tokio), 0);
     }
 }

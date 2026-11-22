@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 
 const CONFIG_FILE: &str = "config.json";
+const NEW_CONFIG_FILE: &str = "config.json.new";
 const KEYCHAIN_SERVICE: &str = "dev.shrew.app";
 const KEYCHAIN_ACCOUNT: &str = "jira-api-token";
 const TEMPO_KEYCHAIN_ACCOUNT: &str = "tempo-api-token";
@@ -117,9 +118,11 @@ impl TokenStore for TokenFile {
     }
 }
 
-/// The saved credentials, or `None` when the user has to sign in.
-// An unreadable config or a Keychain that refuses access is not fatal: signing
-// in again writes both anew.
+/// The saved account, or `None` when the user has to sign in. `api_token` is
+/// empty when the store does not give the token.
+// A missing token and a Keychain that refuses access read the same. Neither
+// makes the account unknown: its cache and its unsent changes are still on
+// disk, and the user is asked for the token alone.
 pub(crate) async fn load(
     data_dir: &Path,
     tokens: Arc<dyn TokenStore>,
@@ -130,8 +133,10 @@ pub(crate) async fn load(
     let config: Config = serde_json::from_slice(&json).ok()?;
     let api_token = tokio::task::spawn_blocking(move || tokens.load())
         .await
-        .ok()?
-        .ok()??;
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .unwrap_or_default();
     // A Tempo token that cannot be read is the same as none: Tempo then
     // cannot be the target, and the user saves the token again
     let tempo_api_token = tokio::task::spawn_blocking(move || tempo_tokens.load())
@@ -172,12 +177,23 @@ pub(crate) async fn remove(
 }
 
 /// Writes the config file only: the token store is not touched.
+// Through a second file and a rename: a crash or a power loss at any moment
+// leaves the complete old config or the complete new one, never a part
 pub(crate) async fn save_config(data_dir: &Path, config: &Config) -> anyhow::Result<()> {
-    tokio::fs::write(
-        data_dir.join(CONFIG_FILE),
-        serde_json::to_vec_pretty(config)?,
-    )
-    .await?;
+    let json = serde_json::to_vec_pretty(config)?;
+    let data_dir = data_dir.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let new_file = data_dir.join(NEW_CONFIG_FILE);
+        let mut file = std::fs::File::create(&new_file)?;
+        file.write_all(&json)?;
+        // The content has to be on the disk before the name points at it
+        file.sync_all()?;
+        std::fs::rename(&new_file, data_dir.join(CONFIG_FILE))?;
+        // The rename is a change of the directory
+        std::fs::File::open(&data_dir)?.sync_all()
+    })
+    .await??;
     Ok(())
 }
 
@@ -200,6 +216,56 @@ mod tests {
         assert_eq!(keychain.load().unwrap(), None);
         // There is nothing left to delete
         keychain.delete().unwrap();
+    }
+
+    fn account_config() -> Config {
+        serde_json::from_value(serde_json::json!({
+            "site_url": "https://acme.atlassian.net",
+            "email": "ada@example.com",
+            "account_id": "5b10a",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_config_write_that_stopped_halfway_leaves_the_config_written_before() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(TokenFile(data_dir.path().join("api-token")));
+        let tempo_tokens = Arc::new(TokenFile(data_dir.path().join("tempo-token")));
+        let mut config = account_config();
+        config.api_token = "secret".to_owned();
+        save(data_dir.path(), tokens.clone(), &config)
+            .await
+            .unwrap();
+        // The new content is written beside the config and takes its name
+        // only when it is complete: a crash before that leaves this
+        let new_file = data_dir.path().join(NEW_CONFIG_FILE);
+        assert!(!new_file.exists());
+        std::fs::write(&new_file, r#"{ "site_url": "https://ac"#).unwrap();
+
+        let loaded = load(data_dir.path(), tokens.clone(), tempo_tokens.clone()).await;
+        assert_eq!(loaded.as_ref(), Some(&config));
+
+        // The next write is not stopped by what the crash left
+        config.last_sync_at = Some(7);
+        save_config(data_dir.path(), &config).await.unwrap();
+        let loaded = load(data_dir.path(), tokens, tempo_tokens).await;
+        assert_eq!(loaded, Some(config));
+        assert!(!new_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_config_without_its_token_still_names_the_account() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(TokenFile(data_dir.path().join("api-token")));
+        let tempo_tokens = Arc::new(TokenFile(data_dir.path().join("tempo-token")));
+        save_config(data_dir.path(), &account_config())
+            .await
+            .unwrap();
+
+        let loaded = load(data_dir.path(), tokens, tempo_tokens).await;
+
+        assert_eq!(loaded, Some(account_config()));
     }
 
     #[tokio::test]

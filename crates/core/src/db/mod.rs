@@ -1,3 +1,4 @@
+use crate::models::Account;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
@@ -38,8 +39,35 @@ pub(crate) async fn clear(pool: &SqlitePool) -> sqlx::Result<()> {
          DELETE FROM assignable_users;
          DELETE FROM worklogs;
          DELETE FROM running_timer;
+         DELETE FROM cache_owner;
          COMMIT;",
     )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The account whose data the database holds. `None` for an empty database,
+/// and for one that was last used by a build that did not record it.
+pub(crate) async fn owner(pool: &SqlitePool) -> sqlx::Result<Option<Account>> {
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT site_url, account_id, email FROM cache_owner")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(site_url, account_id, email)| Account {
+        site_url,
+        email,
+        account_id,
+    }))
+}
+
+pub(crate) async fn set_owner(pool: &SqlitePool, owner: &Account) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO cache_owner (id, site_url, account_id, email) VALUES (1, ?, ?, ?)",
+    )
+    .bind(&owner.site_url)
+    .bind(&owner.account_id)
+    .bind(&owner.email)
     .execute(pool)
     .await?;
     Ok(())

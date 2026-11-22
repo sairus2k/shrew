@@ -25,13 +25,59 @@ pub async fn account(state: &AppState) -> Option<Account> {
     })
 }
 
+/// Why `sign_in` refused: the database holds changes that Jira has not
+/// received and that the account signing in did not make. `sign_in_discarding`
+/// deletes them.
+#[derive(Debug)]
+pub struct UnsentChanges {
+    pub count: i64,
+    /// Who made them: signing in to this account keeps them. `None` when the
+    /// database does not say.
+    pub owner: Option<Account>,
+}
+
+impl std::fmt::Display for UnsentChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Unsent changes of another account: {}", self.count)
+    }
+}
+
+impl std::error::Error for UnsentChanges {}
+
 /// Checks the credentials with Jira and saves them only if Jira accepts them.
-/// The error says what went wrong in words meant for the user.
+/// The error says what went wrong in words meant for the user, or is an
+/// `UnsentChanges`.
+///
+/// The account whose data the database holds keeps all of it, unsent changes
+/// included: that is the sign-in after a config file was lost. Any other
+/// account starts from an empty database.
 pub async fn sign_in(
     state: &AppState,
     site_url: &str,
     email: &str,
     api_token: &str,
+) -> anyhow::Result<Account> {
+    sign_in_as(state, site_url, email, api_token, false).await
+}
+
+/// `sign_in` that deletes the unsent changes of another account instead of
+/// refusing. Call it only after the user was shown the `UnsentChanges` and
+/// confirmed.
+pub async fn sign_in_discarding(
+    state: &AppState,
+    site_url: &str,
+    email: &str,
+    api_token: &str,
+) -> anyhow::Result<Account> {
+    sign_in_as(state, site_url, email, api_token, true).await
+}
+
+async fn sign_in_as(
+    state: &AppState,
+    site_url: &str,
+    email: &str,
+    api_token: &str,
+    discard_unsent: bool,
 ) -> anyhow::Result<Account> {
     let (site_url, email, api_token) = (site_url.trim(), email.trim(), api_token.trim());
     if site_url.is_empty() || email.is_empty() || api_token.is_empty() {
@@ -67,11 +113,29 @@ pub async fn sign_in(
         worklog_target: Default::default(),
         tempo_api_token: String::new(),
     };
-    // What a sign-out that failed halfway, or a config deleted by hand, left behind
-    db::clear(&state.pool).await?;
+    let account = Account {
+        site_url: config.site_url.clone(),
+        email: config.email.clone(),
+        account_id: config.account_id.clone(),
+    };
+    let owner = db::owner(&state.pool).await?;
+    // The email is not compared: an Atlassian account can change it
+    let own_data = owner.as_ref().is_some_and(|owner| {
+        owner.site_url == account.site_url && owner.account_id == account.account_id
+    });
+    if !own_data {
+        // After a sign-out the database is empty. It is not after one that
+        // failed halfway, or when the config file was lost or deleted by hand.
+        let count = db::sync_queue::unsent(&state.pool).await?;
+        if count > 0 && !discard_unsent {
+            return Err(UnsentChanges { count, owner }.into());
+        }
+        db::clear(&state.pool).await?;
+    }
     auth::save(&state.data_dir, state.tokens.clone(), &config).await?;
+    db::set_owner(&state.pool, &account).await?;
     *state.config.write().await = Some(config);
-    Ok(account(state).await.expect("the config was just set"))
+    Ok(account)
 }
 
 /// How many local changes Jira has not received yet. A sign-out discards them.
@@ -96,8 +160,9 @@ pub async fn sign_out(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replaces the API token after `SyncEvent::TokenRejected`. The token is
-/// checked with Jira and saved only if Jira accepts it; the sync then resumes.
+/// Replaces the API token after `SyncEvent::TokenRejected`, or saves one at
+/// `SetupStep::EnterToken`. The token is checked with Jira and saved only if
+/// Jira accepts it; the sync then resumes.
 /// The error says what went wrong in words meant for the user.
 pub async fn renew_token(state: &AppState, api_token: &str) -> anyhow::Result<()> {
     let api_token = api_token.trim();
@@ -187,6 +252,7 @@ pub async fn last_sync_at(state: &AppState) -> Option<i64> {
 pub async fn setup_step(state: &AppState) -> SetupStep {
     match &*state.config.read().await {
         None => SetupStep::SignIn,
+        Some(config) if config.api_token.is_empty() => SetupStep::EnterToken,
         Some(config) if config.watched_projects.is_empty() => SetupStep::ChooseProjects,
         Some(config) if config.last_sync_at.is_none() || !config.pending_projects.is_empty() => {
             SetupStep::InitialSync
@@ -1332,80 +1398,202 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signing_in_starts_from_an_empty_cache() {
+    async fn another_account_starts_from_an_empty_cache_when_the_config_was_lost() {
         // The user deleted the config by hand, as they had to before sign-out existed
         let (data_dir, state) = core_with(todo_issue()).await;
         std::fs::remove_file(data_dir.path().join("config.json")).unwrap();
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(list_issues(&state, None).await.unwrap().len(), 1);
-        let server = jira(myself()).await;
+        let server = jira(myself_grace()).await;
 
-        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+        sign_in(&state, &server.uri(), "grace@example.com", "her-token")
             .await
             .unwrap();
 
         assert!(list_issues(&state, None).await.unwrap().is_empty());
     }
 
-    // The three tests below record weaknesses found in SHR-92 as the code
-    // behaves today. The task that fixes one turns its assertions around.
+    fn myself_grace() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "accountId": "7c20b", "displayName": "Grace" }))
+    }
 
-    /// A signed-in core with one status change that Jira has not received.
-    async fn core_with_an_unsent_change() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
-        let (data_dir, state) = core_with(todo_issue()).await;
+    /// A signed-in core with one status change that Jira has not received and
+    /// a running timer, and the Jira it is signed in to.
+    async fn core_with_an_unsent_change()
+    -> (MockServer, tempfile::TempDir, std::sync::Arc<AppState>) {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        let record = inbound::issue_record(&todo_issue()).unwrap();
+        db::issues::upsert(&state.pool, &record).await.unwrap();
         transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
             .await
             .unwrap();
-        (data_dir, state)
+        start_timer(&state, &timer_on_web_1()).await.unwrap();
+        (server, data_dir, state)
     }
 
-    /// The restart finds nobody signed in and the change still queued; the
-    /// sign-in that follows, of the same account, deletes it.
-    async fn the_next_sign_in_deletes_the_unsent_change(data_dir: &std::path::Path) {
+    fn timer_on_web_1() -> RunningTimer {
+        RunningTimer {
+            issue_key: "WEB-1".into(),
+            started_at: 1_700_000_000,
+        }
+    }
+
+    /// The issue with its unsent status, the outbox entry and the timer.
+    async fn nothing_is_lost(state: &AppState) {
+        let issues = list_issues(state, None).await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].status, "In Progress");
+        assert_eq!(unsent_changes(state).await.unwrap(), 1);
+        assert_eq!(running_timer(state).await.unwrap(), Some(timer_on_web_1()));
+    }
+
+    /// Runs the outbox against `server`, which must get the status change.
+    async fn the_unsent_change_is_delivered(state: &AppState, server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/WEB-1/transitions"))
+            .and(basic_auth("ada@example.com", "secret-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+        let config = state.config.read().await.clone().unwrap();
+        crate::sync::outbound::process_queue(state, &config, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(unsent_changes(state).await.unwrap(), 0);
+        server.verify().await;
+    }
+
+    /// The restart finds nobody signed in and nothing lost; the sign-in of
+    /// the same account that follows keeps it all and the change is delivered.
+    async fn the_next_sign_in_of_the_account_keeps_everything(
+        server: &MockServer,
+        data_dir: &std::path::Path,
+    ) {
         let (state, _events) = start_without_keychain(data_dir).await.unwrap();
         assert_eq!(setup_step(&state).await, SetupStep::SignIn);
-        assert_eq!(unsent_changes(&state).await.unwrap(), 1);
-        let server = jira(myself()).await;
+        nothing_is_lost(&state).await;
 
         sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
 
-        assert_eq!(unsent_changes(&state).await.unwrap(), 0);
-        assert_eq!(queued(&state).await, []);
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        nothing_is_lost(&state).await;
+        the_unsent_change_is_delivered(&state, server).await;
         state.pool.close().await;
     }
 
     #[tokio::test]
-    async fn a_config_file_cut_short_costs_the_unsent_changes_at_the_next_sign_in() {
+    async fn a_config_file_cut_short_keeps_the_unsent_changes_for_the_next_sign_in_of_the_account()
+    {
         let config_file = |data_dir: &tempfile::TempDir| data_dir.path().join("config.json");
 
-        // `save_config` truncates the file before it writes: a crash in
-        // between leaves it empty
-        let (data_dir, state) = core_with_an_unsent_change().await;
+        // What a build that truncated the file before writing it could leave
+        let (server, data_dir, state) = core_with_an_unsent_change().await;
         state.pool.close().await;
         std::fs::write(config_file(&data_dir), "").unwrap();
-        the_next_sign_in_deletes_the_unsent_change(data_dir.path()).await;
+        the_next_sign_in_of_the_account_keeps_everything(&server, data_dir.path()).await;
 
-        // A power loss can keep only the first blocks of the new content
-        let (data_dir, state) = core_with_an_unsent_change().await;
+        let (server, data_dir, state) = core_with_an_unsent_change().await;
         state.pool.close().await;
         let written = std::fs::read(config_file(&data_dir)).unwrap();
         std::fs::write(config_file(&data_dir), &written[..written.len() / 2]).unwrap();
-        the_next_sign_in_deletes_the_unsent_change(data_dir.path()).await;
+        the_next_sign_in_of_the_account_keeps_everything(&server, data_dir.path()).await;
     }
 
     #[tokio::test]
-    async fn a_token_the_store_does_not_give_costs_the_unsent_changes_at_the_next_sign_in() {
-        let (data_dir, state) = core_with_an_unsent_change().await;
+    async fn a_database_of_a_build_that_did_not_record_its_owner_gets_it_at_the_next_start() {
+        let (server, data_dir, state) = core_with_an_unsent_change().await;
+        sqlx::raw_sql("DELETE FROM cache_owner")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.pool.close().await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        state.pool.close().await;
+
+        std::fs::write(data_dir.path().join("config.json"), "").unwrap();
+        the_next_sign_in_of_the_account_keeps_everything(&server, data_dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_token_the_store_does_not_give_is_asked_for_and_nothing_else_is_lost() {
+        let (server, data_dir, state) = core_with_an_unsent_change().await;
         state.pool.close().await;
         // The config is intact. A Keychain that refuses access reads the same
         // to `auth::load` as one without the item.
         state.tokens.delete().unwrap();
 
-        the_next_sign_in_deletes_the_unsent_change(data_dir.path()).await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(setup_step(&state).await, SetupStep::EnterToken);
+        assert_eq!(
+            account(&state).await.map(|account| account.email),
+            Some("ada@example.com".to_owned())
+        );
+        nothing_is_lost(&state).await;
+
+        renew_token(&state, "secret-token").await.unwrap();
+
+        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(
+            state.tokens.load().unwrap().as_deref(),
+            Some("secret-token")
+        );
+        nothing_is_lost(&state).await;
+        the_unsent_change_is_delivered(&state, &server).await;
     }
+
+    #[tokio::test]
+    async fn another_account_is_refused_while_changes_are_unsent_and_deletes_them_only_when_told_to()
+     {
+        let (ada, data_dir, state) = core_with_an_unsent_change().await;
+        state.pool.close().await;
+        std::fs::write(data_dir.path().join("config.json"), "").unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        let server = jira(myself_grace()).await;
+
+        let error = sign_in(&state, &server.uri(), "grace@example.com", "her-token")
+            .await
+            .unwrap_err();
+
+        let unsent: &UnsentChanges = error.downcast_ref().expect("the reason is typed");
+        assert_eq!(unsent.count, 1);
+        assert_eq!(
+            unsent.owner,
+            Some(Account {
+                site_url: ada.uri(),
+                email: "ada@example.com".to_owned(),
+                account_id: "5b10a".to_owned(),
+            })
+        );
+        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(
+            state.tokens.load().unwrap().as_deref(),
+            Some("secret-token")
+        );
+        nothing_is_lost(&state).await;
+
+        let signed_in = sign_in_discarding(&state, &server.uri(), "grace@example.com", "her-token")
+            .await
+            .unwrap();
+
+        assert_eq!(signed_in.account_id, "7c20b");
+        assert!(list_issues(&state, None).await.unwrap().is_empty());
+        assert_eq!(unsent_changes(&state).await.unwrap(), 0);
+        assert_eq!(running_timer(&state).await.unwrap(), None);
+        assert_eq!(db::owner(&state.pool).await.unwrap(), Some(signed_in));
+    }
+
+    // The test below records a weakness found in SHR-92 as the code behaves
+    // today. SHR-98 fixes it and turns its assertions around.
 
     #[tokio::test]
     async fn a_project_list_saved_without_its_cache_change_leaves_the_issues_of_a_removed_project()

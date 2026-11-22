@@ -141,6 +141,11 @@ async fn cycle(
         return Ok(());
     };
 
+    // The token store did not give the token. Jira would answer 401 to the
+    // request, so none is made until `api::renew_token` saves one.
+    if config.api_token.is_empty() {
+        *rejected_token = Some(String::new());
+    }
     if rejected_token.as_ref() == Some(&config.api_token) {
         return Ok(());
     }
