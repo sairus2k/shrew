@@ -1,4 +1,4 @@
-//! The settings, one page: the account, the watched projects, where logged
+//! The settings, one dialog over the home screen: the account, the watched projects, where logged
 //! time goes, Jira or Tempo, with the Tempo API token, the theme, and whether
 //! the controls show the keys of their shortcuts.
 
@@ -19,9 +19,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 
-/// Emitted when the user leaves the page.
-pub struct SettingsClosed;
-
 pub struct Settings {
     account: Entity<Account>,
     projects: Entity<ProjectPicker>,
@@ -35,7 +32,7 @@ pub struct Settings {
     choosing_tempo: bool,
     // Takes the focus from the token field when the field goes away: GPUI
     // Kit keeps a focused input alive, and Tab would start from a field
-    // that is not on the page
+    // that is not in the dialog
     focus: FocusHandle,
     error: Option<SharedString>,
     saving: Option<Task<()>>,
@@ -43,8 +40,6 @@ pub struct Settings {
     _hints: Task<()>,
     _theme: Task<()>,
 }
-
-impl EventEmitter<SettingsClosed> for Settings {}
 
 impl Settings {
     pub fn new(
@@ -190,7 +185,11 @@ impl Settings {
             let result = saved.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => cx.set_global(Hints(shown)),
+                    Ok(()) => {
+                        cx.set_global(Hints(shown));
+                        // The home screen under the dialog shows the hints too
+                        cx.refresh_windows();
+                    }
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
                 cx.notify();
@@ -383,7 +382,7 @@ impl Settings {
     }
 }
 
-/// A section of the page: its name and what it is on the left, its controls
+/// A section of the settings: its name and what it is on the left, its controls
 /// on the right, a hairline under it.
 fn section(name: &'static str, about: &'static str, controls: impl IntoElement, cx: &App) -> Div {
     div()
@@ -410,38 +409,14 @@ fn section(name: &'static str, about: &'static str, controls: impl IntoElement, 
 
 impl Render for Settings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = div()
-            .flex_none()
-            .px_5()
-            .py_3()
-            .flex()
-            .items_center()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(px(16.))
-                    .font_semibold()
-                    .child("Settings"),
-            )
-            .child(
-                Button::new("close-settings")
-                    .primary()
-                    .small()
-                    .label("Done")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsClosed))),
-            );
         let hints = Checkbox::new("shortcut-hints")
             .label("Show the key of a shortcut in its button or field")
             .checked(cx.global::<Hints>().0)
             .on_click(cx.listener(|this, shown: &bool, _, cx| this.show_hints(*shown, cx)));
-        let sections = div()
-            .w(px(620.))
-            .max_w_full()
-            .mx_auto()
-            .px_5()
-            .py_1()
+        div()
+            .id("settings")
+            .test_support()
+            .track_focus(&self.focus)
             .child(section(
                 "Account",
                 "The Jira site you are signed in to",
@@ -474,22 +449,6 @@ impl Render for Settings {
                     cx,
                 )
                 .border_b_0(),
-            );
-        div()
-            .id("settings")
-            .test_support()
-            .track_focus(&self.focus)
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(
-                div()
-                    .id("settings-sections")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(sections),
             )
     }
 }
@@ -497,15 +456,18 @@ impl Render for Settings {
 #[cfg(test)]
 mod tests {
     use crate::{
-        harness::{in_window, launch, launch_on_jira, tokio_runtime, wait_until},
-        issue_list::tests::synced_on,
+        harness::{close_settings, in_window, launch, launch_on_jira, tokio_runtime, wait_until},
+        issue_list::tests::{issue, rows, synced_on},
         runtime::Core,
     };
     use app_core::{SyncEvent, models::ThemeChoice};
     use gpui_kit::component::ActiveTheme as _;
     use gpui_kit::component::WindowExt as _;
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{TestAppContext, WindowAppearance};
+    use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt};
+    use gpui_kit::{
+        App, MouseButton, Role, ScrollDelta, TestAppContext, Window, WindowAppearance, point, px,
+        size,
+    };
 
     fn open(cx: &mut TestAppContext, app: &crate::harness::TestApp) {
         wait_until(cx, app.window, |window| {
@@ -519,6 +481,186 @@ mod tests {
         });
     }
 
+    /// The home screen with a search, its two results and WEB-1 open.
+    fn home_in_use(cx: &mut TestAppContext) -> crate::harness::TestApp {
+        let issues = [
+            issue(1, "Fix login"),
+            issue(2, "Fix logout"),
+            issue(3, "Broken checkout"),
+        ];
+        let app = launch_on_jira(cx, &issues);
+        wait_until(cx, app.window, |window| rows(window).len() == 3);
+        in_window(cx, app.window, |window, cx| {
+            window.click("search", cx);
+            window.input("Fix", cx);
+        });
+        wait_until(cx, app.window, |window| rows(window).len() == 2);
+        in_window(cx, app.window, |window, cx| window.click("issue-WEB-1", cx));
+        wait_until(cx, app.window, |window| {
+            window.try_find("issue-detail").is_some()
+        });
+        app
+    }
+
+    /// What of the home screen the user would miss: the search, the rows
+    /// with the selected one, and the open issue.
+    fn home_state(window: &Window) -> (String, Vec<String>, Option<String>) {
+        let search = window.find_by_label("Search issues");
+        let rows = window
+            .find_all_by_role(Role::ListItem)
+            .iter()
+            .map(|row| format!("{:?} selected: {:?}", row.label(), row.selected()))
+            .collect();
+        let detail = window.find("issue-detail").label().map(str::to_owned);
+        (search.value().unwrap_or_default().to_owned(), rows, detail)
+    }
+
+    fn the_home_screen_is_as_it_was_after_the_settings_are_closed_by(
+        cx: &mut TestAppContext,
+        close: impl FnOnce(&mut Window, &mut App),
+    ) {
+        let app = home_in_use(cx);
+        let before = in_window(cx, app.window, |window, _| home_state(window));
+        assert_eq!(before.0, "Fix");
+        assert_eq!(before.2.as_deref(), Some("WEB-1"));
+
+        open(cx, &app);
+        in_window(cx, app.window, |window, cx| {
+            // The settings are over the home screen, not in its place
+            assert!(window.has_active_dialog(cx));
+            assert_eq!(home_state(window), before);
+            close(window, cx);
+        });
+
+        wait_until(cx, app.window, |window| {
+            window.try_find("settings").is_none()
+        });
+        in_window(cx, app.window, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert_eq!(home_state(window), before);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn escape_closes_the_settings_and_the_home_screen_is_as_it_was(cx: &mut TestAppContext) {
+        the_home_screen_is_as_it_was_after_the_settings_are_closed_by(cx, |window, cx| {
+            window.press("escape", cx)
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_close_button_closes_the_settings_and_the_home_screen_is_as_it_was(
+        cx: &mut TestAppContext,
+    ) {
+        the_home_screen_is_as_it_was_after_the_settings_are_closed_by(cx, |window, cx| {
+            window.click("close", cx)
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_click_beside_the_settings_closes_them_and_the_home_screen_is_as_it_was(
+        cx: &mut TestAppContext,
+    ) {
+        the_home_screen_is_as_it_was_after_the_settings_are_closed_by(cx, |window, cx| {
+            let beside = point(px(20.), px(300.));
+            assert!(!window.find("settings").bounds().contains(&beside));
+            window.pointer_down(beside, MouseButton::Left, cx);
+            window.pointer_up(beside, MouseButton::Left, cx);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_list_is_scrolled_as_it_was_after_the_settings(cx: &mut TestAppContext) {
+        let issues: Vec<_> = (1..=60).map(|number| issue(number, "Fix login")).collect();
+        let app = launch_on_jira(cx, &issues);
+        wait_until(cx, app.window, |window| !rows(window).is_empty());
+        let tops = |window: &mut Window| -> Vec<_> {
+            let rows = window.find_all_by_role(Role::ListItem);
+            rows.iter()
+                .map(|row| (row.label().map(str::to_owned), row.bounds().top()))
+                .collect()
+        };
+        let unscrolled = in_window(cx, app.window, |window, _| tops(window));
+        in_window(cx, app.window, |window, cx| {
+            // Over a row, whichever is first
+            let first = ["issue-WEB-60", "issue-WEB-1"]
+                .into_iter()
+                .find(|id| window.try_find(*id).is_some())
+                .unwrap();
+            window.scroll(first, ScrollDelta::Pixels(point(px(0.), px(-700.))), cx)
+        });
+        let scrolled = in_window(cx, app.window, |window, _| tops(window));
+        assert_ne!(scrolled, unscrolled);
+
+        open(cx, &app);
+        close_settings(cx, app.window);
+
+        let after = in_window(cx, app.window, |window, _| tops(window));
+        assert_eq!(after, scrolled);
+    }
+
+    #[gpui_kit::test]
+    fn the_keys_of_the_home_screen_do_nothing_while_the_settings_are_open(cx: &mut TestAppContext) {
+        let app = home_in_use(cx);
+        let before = in_window(cx, app.window, |window, _| home_state(window));
+        in_window(cx, app.window, |window, cx| window.press("cmd-,", cx));
+        wait_until(cx, app.window, |window| {
+            window.try_find("settings").is_some()
+        });
+
+        // Next issue, search, comment, status, timer, the shortcuts, the settings again
+        for key in ["j", "k", "/", "c", "s", "t", "?", "cmd-,", "enter"] {
+            in_window(cx, app.window, |window, cx| window.press(key, cx));
+            cx.run_until_parked();
+        }
+
+        in_window(cx, app.window, |window, _| {
+            assert!(window.try_find("settings").is_some());
+            assert_eq!(window.find_all("dialog").len(), 1);
+            assert_eq!(home_state(window), before);
+            assert!(window.try_find("stop-timer").is_none());
+            assert_eq!(window.find_by_label("New comment").focused(), Some(false));
+        });
+        // Escape closes the settings and leaves the issue open
+        in_window(cx, app.window, |window, cx| window.press("escape", cx));
+        wait_until(cx, app.window, |window| {
+            window.try_find("settings").is_none()
+        });
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(home_state(window), before);
+        });
+        // And the list has the keys again
+        in_window(cx, app.window, |window, cx| window.press("t", cx));
+        wait_until(cx, app.window, |window| {
+            window.try_find("stop-timer").is_some()
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_settings_scroll_in_a_window_lower_than_they_are(cx: &mut TestAppContext) {
+        let app = launch_on_jira(cx, &[]);
+        cx.simulate_window_resize(app.window, size(px(800.), px(320.)));
+        open(cx, &app);
+        let last = "shortcut-hints";
+        let top = |window: &mut Window| window.find(last).bounds().top();
+        let surface = in_window(cx, app.window, |window, _| window.find("surface").bounds());
+        // The dialog is not higher than the window, and its last control is cut off
+        assert!(surface.top() >= px(0.) && surface.bottom() <= px(320.));
+        let before = in_window(cx, app.window, |window, _| top(window));
+        assert!(before > surface.bottom());
+
+        in_window(cx, app.window, |window, cx| {
+            window.scroll(
+                "settings",
+                ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+                cx,
+            )
+        });
+
+        let after = in_window(cx, app.window, |window, _| top(window));
+        assert!(after < surface.bottom(), "{after} {surface:?}");
+    }
+
     #[gpui_kit::test]
     fn choosing_tempo_asks_for_its_token_first_and_the_token_shows_only_for_tempo(
         cx: &mut TestAppContext,
@@ -526,7 +668,7 @@ mod tests {
         let app = launch_on_jira(cx, &[]);
         open(cx, &app);
         in_window(cx, app.window, |window, cx| {
-            // Time goes to Jira: nothing of the Tempo token is on the page
+            // Time goes to Jira: nothing of the Tempo token is shown
             assert!(window.try_find("tempo-token-state").is_none());
             assert!(window.try_find("replace-tempo-token").is_none());
             assert!(window.try_find("tempo-token").is_none());

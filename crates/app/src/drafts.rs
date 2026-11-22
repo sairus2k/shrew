@@ -60,7 +60,7 @@ impl Drafts {
 #[cfg(test)]
 mod tests {
     use super::Drafts;
-    use crate::harness::{in_window, launch, tokio_runtime, wait_until};
+    use crate::harness::{close_settings, in_window, launch, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, synced};
     use gpui_kit::test::{TestQueryExt as _, TestWindowExt};
     use gpui_kit::{AnyWindowHandle, App, TestAppContext, Window};
@@ -159,9 +159,8 @@ mod tests {
         write_everything(cx, window);
 
         in_window(cx, window, |window, cx| window.click("edit-settings", cx));
-        wait_until(cx, window, |window| window.try_find("home").is_none());
-        in_window(cx, window, |window, cx| window.click("close-settings", cx));
-        open(cx, window, "WEB-1");
+        wait_until(cx, window, |window| window.try_find("settings").is_some());
+        close_settings(cx, window);
         in_window(cx, window, |window, _| {
             assert_eq!(typed(window), kept_text());
         });

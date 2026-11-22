@@ -126,7 +126,7 @@ impl Render for NewToken {
 #[cfg(test)]
 mod tests {
     use crate::{
-        harness::{in_window, launch, tokio_runtime, wait_until},
+        harness::{close_settings, in_window, launch, tokio_runtime, wait_until},
         issue_list::tests::{issue, rows, synced, synced_on},
         runtime::Core,
         sign_in::tests::jira,
@@ -190,6 +190,72 @@ mod tests {
         assert_eq!(saved_token(data_dir.path()), "new-token");
         in_window(cx, window, |window, _| {
             assert!(window.try_find("home").is_some());
+        });
+    }
+
+    fn open_settings(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        in_window(cx, window, |window, cx| window.click("edit-settings", cx));
+        wait_until(cx, window, |window| {
+            window.try_find("replace-token").is_some()
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_banner_is_still_there_after_the_settings(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = jira(&tokio, ResponseTemplate::new(401));
+        let (_data_dir, window) = rejected(cx, &tokio, &server);
+
+        open_settings(cx, window);
+        close_settings(cx, window);
+
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("new-token").is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_token_rejected_while_the_settings_are_open_is_asked_for(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[]);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            window.try_find("edit-settings").is_some()
+        });
+        open_settings(cx, window);
+
+        cx.update(|cx| cx.global::<Core>().state.emit(SyncEvent::TokenRejected));
+        cx.run_until_parked();
+        close_settings(cx, window);
+
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("new-token").is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_token_replaced_in_the_settings_closes_the_banner(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = jira(
+            &tokio,
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "accountId": "5b10a", "displayName": "Ada" })),
+        );
+        let (data_dir, window) = rejected(cx, &tokio, &server);
+        open_settings(cx, window);
+
+        in_window(cx, window, |window, cx| window.click("replace-token", cx));
+        in_window(cx, window, |window, cx| {
+            window.click("new-jira-token", cx);
+            window.input("new-token", cx);
+            window.click("save-jira-token", cx);
+        });
+
+        wait_until(cx, window, |window| window.try_find("new-token").is_none());
+        assert_eq!(saved_token(data_dir.path()), "new-token");
+        close_settings(cx, window);
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("new-token").is_none());
         });
     }
 

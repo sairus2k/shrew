@@ -28,18 +28,22 @@ pub struct Account {
     api_token: Entity<InputState>,
     // The field for a new API token is shown
     replacing: bool,
-    // Jira accepted a new token since the page was opened
+    // Jira accepted a new token since the settings were opened
     replaced: bool,
     token_error: Option<SharedString>,
     saving_token: Option<Task<()>>,
     // Takes the focus from the token field when the field goes away: GPUI
     // Kit keeps a focused input alive, and Tab would start from a field
-    // that is not on the page
+    // that is not shown
     focus: FocusHandle,
     _load: Task<()>,
 }
 
+/// Emitted once Jira has accepted a new API token and the core has saved it.
+pub struct TokenReplaced;
+
 impl EventEmitter<SignedOut> for Account {}
+impl EventEmitter<TokenReplaced> for Account {}
 
 impl Account {
     pub fn new(in_settings: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -122,6 +126,7 @@ impl Account {
                 match result {
                     Ok(()) => {
                         this.replaced = true;
+                        cx.emit(TokenReplaced);
                         this.hide_token_field(window, cx);
                     }
                     Err(error) => this.token_error = Some(error.to_string().into()),
@@ -476,6 +481,11 @@ mod tests {
         in_window(cx, window, |window, cx| window.press("enter", cx));
 
         wait_for(cx, window, "site-url");
+        // The settings went with the account
+        wait_until(cx, window, |window| window.try_find("settings").is_none());
+        in_window(cx, window, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
         assert!(!credentials_are_saved(data_dir.path()));
     }
 
@@ -522,9 +532,9 @@ mod tests {
         wait_until(cx, window, |window| window.try_find("cancel").is_some());
         in_window(cx, window, |window, cx| window.click("cancel", cx));
 
-        cx.run_until_parked();
-        in_window(cx, window, |window, cx| {
-            assert!(!window.has_active_dialog(cx));
+        // The question leaves, the settings under it stay
+        wait_until(cx, window, |window| window.try_find("cancel").is_none());
+        in_window(cx, window, |window, _| {
             assert!(window.try_find("settings").is_some());
         });
         assert!(credentials_are_saved(data_dir.path()));
@@ -584,6 +594,26 @@ mod tests {
             assert_eq!(window.find("api-token-state").label(), Some("saved"));
         });
         assert_eq!(saved_token(data_dir.path()), "secret-token");
+    }
+
+    #[gpui_kit::test]
+    fn confirming_a_sign_out_with_unsent_changes_closes_the_settings_too(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[issue(1, "Fix login")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_settings(cx, window);
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        let queue = "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)
+                     VALUES ('transition', 'WEB-1', 'create', '{}')";
+        tokio.block_on(state.execute(queue)).unwrap();
+
+        in_window(cx, window, |window, cx| window.click("sign-out", cx));
+        wait_until(cx, window, |window| window.try_find("ok").is_some());
+        in_window(cx, window, |window, cx| window.click("ok", cx));
+
+        wait_for(cx, window, "site-url");
+        wait_until(cx, window, |window| window.try_find("dialog").is_none());
+        assert!(!credentials_are_saved(data_dir.path()));
     }
 
     #[gpui_kit::test]

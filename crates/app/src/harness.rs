@@ -143,6 +143,13 @@ pub(crate) fn tab_to(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'sta
     panic!("Tab did not reach {id}");
 }
 
+/// Closes the settings with Escape and waits until their dialog has left.
+#[track_caller]
+pub(crate) fn close_settings(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    in_window(cx, window, |window, cx| window.press("escape", cx));
+    wait_until(cx, window, |window| window.try_find("settings").is_none());
+}
+
 /// A data dir of an app that is signed in to `server` and watches WEB, but
 /// has not synced yet.
 pub(crate) fn watching_web(server: &MockServer) -> tempfile::TempDir {

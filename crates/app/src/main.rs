@@ -1,4 +1,4 @@
-use account::{Account, SignedOut};
+use account::{Account, SignedOut, TokenReplaced};
 use app_core::{
     SyncEvent,
     models::{IssueKey, SetupStep},
@@ -21,7 +21,7 @@ use keys::{
 use new_token::{NewToken, TokenRenewed};
 use projects::{ProjectPicker, ProjectsChosen};
 use runtime::{Core, SyncBridge};
-use settings::{Settings, SettingsClosed};
+use settings::Settings;
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
 use timer::{ActiveTimer, TimerIssueClicked, TimerStatus, TimerWriteFailed};
@@ -64,7 +64,6 @@ enum Screen {
     },
     ChooseProjects(Entity<ProjectPicker>),
     InitialSync(Entity<InitialSync>),
-    Settings(Entity<Settings>),
     Home {
         list: Entity<IssueList>,
         // The issue the user opened from the list
@@ -267,7 +266,16 @@ impl Root {
             cx.set_global(keys::Hints(true));
             theme::choose(Default::default(), cx);
             drafts::Drafts::clear(cx);
+            window.close_all_dialogs(cx);
             this.show(SetupStep::SignIn, window, cx)
+        })
+        .detach();
+        cx.subscribe(&account, |this, _, _: &TokenReplaced, cx| {
+            // The banner of a rejected token asks for what Jira now has
+            if let Screen::Home { new_token, .. } = &mut this.screen {
+                *new_token = None;
+                cx.notify();
+            }
         })
         .detach();
         account
@@ -278,31 +286,43 @@ impl Root {
         cx.subscribe_in(
             &picker,
             window,
-            |this, _, chosen: &ProjectsChosen, window, cx| this.show(chosen.0, window, cx),
+            |this, _, chosen: &ProjectsChosen, window, cx| {
+                // The settings, when the projects were saved from them
+                window.close_all_dialogs(cx);
+                this.show(chosen.0, window, cx)
+            },
         )
         .detach();
         picker
     }
 
+    /// Opens the settings in a dialog over the home screen.
     fn edit_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.screen, Screen::Home { .. }) {
+        if !matches!(self.screen, Screen::Home { .. }) || window.has_active_dialog(cx) {
             return;
         }
         let account = Self::account(true, window, cx);
         let projects = Self::picker(true, window, cx);
         let settings = cx.new(|cx| Settings::new(account, projects, window, cx));
-        cx.subscribe_in(
-            &settings,
-            window,
-            |this, _, _: &SettingsClosed, window, cx| {
-                this.tempo_rejection_shown = false;
-                this.show(SetupStep::Ready, window, cx)
-            },
-        )
-        .detach();
-        self.screen = Screen::Settings(settings);
-        self.rest_focus(window, cx);
-        cx.notify();
+        let root = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let root = root.clone();
+            dialog
+                .title("Settings")
+                .w(px(640.))
+                // Enter confirms a dialog, which closes it, and the dialog
+                // takes the key before the focused button gets it. Here
+                // there is nothing to confirm: the key goes on to the button
+                .on_ok(|_, _, cx| {
+                    cx.propagate();
+                    false
+                })
+                .on_close(move |_, _, cx| {
+                    root.update(cx, |root, _| root.tempo_rejection_shown = false)
+                        .ok();
+                })
+                .child(settings.clone())
+        });
     }
 
     /// Escape leads back to the list from wherever the focus is, and from the
@@ -439,7 +459,6 @@ impl Render for Root {
                 .into_any_element(),
             Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
             Screen::InitialSync(sync) => sync.clone().into_any_element(),
-            Screen::Settings(settings) => settings.clone().into_any_element(),
             Screen::Home {
                 list,
                 detail,

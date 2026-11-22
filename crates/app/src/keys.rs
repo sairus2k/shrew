@@ -207,7 +207,7 @@ pub fn open_menu(button: &FocusHandle, window: &mut Window, cx: &mut App) {
 mod tests {
     use super::{ChangeStatus, LIST};
     use crate::harness::{
-        in_window, launch, no_worklog_changes, tab_to, tokio_runtime, wait_until,
+        close_settings, in_window, launch, no_worklog_changes, tokio_runtime, wait_until,
     };
     use crate::issue_list::tests::{issue, rows, synced_on};
     use crate::runtime::Core;
@@ -570,12 +570,9 @@ mod tests {
         in_window(cx, app.window, |window, _| {
             assert!(window.try_find("worklog-target").is_some())
         });
-        tab_to(cx, app.window, "close-settings");
-        press(cx, &app, &["enter"]);
+        close_settings(cx, app.window);
 
-        // The list has the keys again after the settings, and it is a new
-        // list, which the core fills a moment later
-        wait_until(cx, app.window, |window| rows(window).len() == 3);
+        // The list has the keys again after the settings
         press(cx, &app, &["j"]);
         in_window(cx, app.window, |window, _| {
             assert_eq!(selected(window).as_deref(), Some("WEB-3"))
@@ -708,10 +705,11 @@ mod tests {
         wait_until(cx, app.window, |window| {
             window.find("shortcut-hints").checked() == Some(false)
         });
-        in_window(cx, app.window, |window, cx| {
-            window.click("close-settings", cx)
+        // The home screen under the settings has lost them already
+        in_window(cx, app.window, |window, _| {
+            assert!(hints(window).is_empty())
         });
-        wait_until(cx, app.window, |window| window.try_find("home").is_some());
+        close_settings(cx, app.window);
 
         // The core has it, and the next start reads it from there
         assert!(!app._tokio.block_on(app_core::api::shortcut_hints(&state)));
@@ -739,13 +737,10 @@ mod tests {
         wait_until(cx, app.window, |window| {
             window.find("shortcut-hints").checked() == Some(true)
         });
-        in_window(cx, app.window, |window, cx| {
-            window.click("close-settings", cx)
-        });
-        wait_until(cx, app.window, |window| window.try_find("home").is_some());
         in_window(cx, app.window, |window, _| {
             assert!(!hints(window).is_empty())
         });
+        close_settings(cx, app.window);
     }
 
     #[gpui_kit::test]

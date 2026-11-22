@@ -282,7 +282,7 @@ impl Render for ProjectPicker {
 #[cfg(test)]
 mod tests {
     use crate::{
-        harness::{in_window, launch, tokio_runtime, wait_until},
+        harness::{close_settings, in_window, launch, tokio_runtime, wait_until},
         issue_list::tests::{
             api_issue, choose_project, issue, rows, synced_on, wait_for_project_filter,
             wait_for_watched, watch,
@@ -291,6 +291,7 @@ mod tests {
         sign_in::tests::{fill_in_and_submit, jira},
     };
     use app_core::{api, models::SetupStep};
+    use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext};
     use serde_json::json;
@@ -326,6 +327,11 @@ mod tests {
 
         wait_until(cx, window, |window| {
             window.try_find("project-WEB").is_some()
+        });
+        // The first choice is a screen of its own, not the dialog of the settings
+        in_window(cx, window, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert!(window.try_find("settings").is_none());
         });
         in_window(cx, window, |window, cx| {
             assert_eq!(window.find("project-API").label(), Some("API — Backend"));
@@ -458,14 +464,12 @@ mod tests {
             assert_eq!(window.find("project-WEB").checked(), Some(true));
         });
         in_window(cx, window, |window, cx| window.click("project-API", cx));
-        in_window(cx, window, |window, cx| {
+        in_window(cx, window, |window, _| {
             assert_eq!(window.find("project-API").checked(), Some(false));
-            window.click("close-settings", cx);
         });
+        close_settings(cx, window);
 
-        wait_until(cx, window, |window| {
-            rows(window).len() == 2 && window.try_find("settings").is_none()
-        });
+        wait_until(cx, window, |window| rows(window).len() == 2);
         assert_eq!(watched(cx, &tokio), ["WEB", "API"]);
         // The cache is untouched, and so is the choice after a restart
         let window = launch(cx, &tokio, data_dir.path());
@@ -482,8 +486,7 @@ mod tests {
         let data_dir = synced_watching(&tokio, &server, &["WEB"]);
         let window = launch(cx, &tokio, data_dir.path());
         open_projects(cx, window);
-        in_window(cx, window, |window, cx| window.click("close-settings", cx));
-        wait_until(cx, window, |window| window.try_find("home").is_some());
+        close_settings(cx, window);
 
         // No project list any more: Jira answers 404
         tokio.block_on(server.reset());
@@ -518,7 +521,6 @@ mod tests {
 
         in_window(cx, window, |window, _| {
             assert!(window.try_find("settings").is_some());
-            assert!(window.try_find("home").is_none());
         });
         assert_eq!(watched(cx, &tokio), ["WEB"]);
     }
@@ -556,7 +558,9 @@ mod tests {
         wait_until(cx, window, |window| {
             window.try_find("sync-progress-API").is_some()
         });
-        in_window(cx, window, |window, _| {
+        in_window(cx, window, |window, cx| {
+            // The download has the window to itself
+            assert!(!window.has_active_dialog(cx));
             assert_eq!(
                 window.find("sync-progress-API").label(),
                 Some("API: 0 / ~1 issues")
@@ -635,6 +639,7 @@ mod tests {
 
         wait_until(cx, window, |window| rows(window) == [WEB_LOGIN]);
         wait_for_watched(cx, window, &["WEB"]);
+        wait_until(cx, window, |window| window.try_find("settings").is_none());
         in_window(cx, window, |window, cx| {
             assert!(window.try_find("project-filter").is_none());
             window.click("search", cx);
