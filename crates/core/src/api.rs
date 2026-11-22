@@ -1348,6 +1348,85 @@ mod tests {
         assert!(list_issues(&state, None).await.unwrap().is_empty());
     }
 
+    // The three tests below record weaknesses found in SHR-92 as the code
+    // behaves today. The task that fixes one turns its assertions around.
+
+    /// A signed-in core with one status change that Jira has not received.
+    async fn core_with_an_unsent_change() -> (tempfile::TempDir, std::sync::Arc<AppState>) {
+        let (data_dir, state) = core_with(todo_issue()).await;
+        transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        (data_dir, state)
+    }
+
+    /// The restart finds nobody signed in and the change still queued; the
+    /// sign-in that follows, of the same account, deletes it.
+    async fn the_next_sign_in_deletes_the_unsent_change(data_dir: &std::path::Path) {
+        let (state, _events) = start_without_keychain(data_dir).await.unwrap();
+        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(unsent_changes(&state).await.unwrap(), 1);
+        let server = jira(myself()).await;
+
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+
+        assert_eq!(unsent_changes(&state).await.unwrap(), 0);
+        assert_eq!(queued(&state).await, []);
+        state.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_config_file_cut_short_costs_the_unsent_changes_at_the_next_sign_in() {
+        let config_file = |data_dir: &tempfile::TempDir| data_dir.path().join("config.json");
+
+        // `save_config` truncates the file before it writes: a crash in
+        // between leaves it empty
+        let (data_dir, state) = core_with_an_unsent_change().await;
+        state.pool.close().await;
+        std::fs::write(config_file(&data_dir), "").unwrap();
+        the_next_sign_in_deletes_the_unsent_change(data_dir.path()).await;
+
+        // A power loss can keep only the first blocks of the new content
+        let (data_dir, state) = core_with_an_unsent_change().await;
+        state.pool.close().await;
+        let written = std::fs::read(config_file(&data_dir)).unwrap();
+        std::fs::write(config_file(&data_dir), &written[..written.len() / 2]).unwrap();
+        the_next_sign_in_deletes_the_unsent_change(data_dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_token_the_store_does_not_give_costs_the_unsent_changes_at_the_next_sign_in() {
+        let (data_dir, state) = core_with_an_unsent_change().await;
+        state.pool.close().await;
+        // The config is intact. A Keychain that refuses access reads the same
+        // to `auth::load` as one without the item.
+        state.tokens.delete().unwrap();
+
+        the_next_sign_in_deletes_the_unsent_change(data_dir.path()).await;
+    }
+
+    #[tokio::test]
+    async fn a_project_list_saved_without_its_cache_change_leaves_the_issues_of_a_removed_project()
+    {
+        let (data_dir, state) = core_with(todo_issue()).await;
+        watch_projects(&state, &["WEB".to_owned()]).await.unwrap();
+        // Stands in for a crash between the two writes of `watch_projects`:
+        // the config file is written, the transaction on the cache never runs
+        state.pool.close().await;
+
+        watch_projects(&state, &["OPS".to_owned()])
+            .await
+            .unwrap_err();
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(watched_projects(&state).await, ["OPS"]);
+        let listed = list_issues(&state, None).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "WEB-1".into());
+    }
+
     #[tokio::test]
     async fn rejected_credentials_are_explained_and_not_saved() {
         let server = jira(ResponseTemplate::new(401)).await;
