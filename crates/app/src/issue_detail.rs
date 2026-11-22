@@ -1,7 +1,7 @@
 //! The pane beside the list: one issue with its description and comments.
 
 use crate::assignee::AssigneeButton;
-use crate::comment::CommentForm;
+use crate::comment::{CommentForm, ReplyTarget};
 use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
 use crate::keys;
@@ -91,6 +91,13 @@ impl DetailPane {
         offset.y += if above > px(0.) { above } else { -below };
         self.scroll.set_offset(offset);
         cx.notify();
+    }
+
+    /// Makes the comment form write an answer to `target` and goes to it.
+    fn reply_to(&mut self, target: ReplyTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_form
+            .update(cx, |form, cx| form.reply_to(target, cx));
+        self.write_comment(window, cx);
     }
 
     pub fn log_time(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -225,7 +232,12 @@ fn when(time: String, cx: &App) -> impl IntoElement {
         .child(time)
 }
 
-fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
+fn comment(
+    index: usize,
+    comment: &Comment,
+    pane: WeakEntity<DetailPane>,
+    cx: &App,
+) -> impl IntoElement {
     let state = if comment.pending {
         Some("Pending")
     } else if comment.rejected.is_some() {
@@ -234,18 +246,49 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
         None
     };
     let time = minute(&comment.created);
-    let label = match state {
+    let mut label = match state {
         Some(state) => format!("{}, {}", comment.author_name, state.to_lowercase()),
         None => format!("{}, {time}", comment.author_name),
     };
+    let answers = comment.reply_to.as_ref().map(|reply_to| {
+        match &reply_to.author_name {
+            Some(author) => format!("reply to {author}"),
+            // The comment it answers is not among those shown
+            None => "reply".to_owned(),
+        }
+    });
+    if let Some(answers) = &answers {
+        label = format!("{label}, {answers}");
+    }
     let heading = heading(format!("comment-{index}"), label, &comment.author_name);
     let heading = match state {
         Some(state) => heading.child(badge(state, cx)),
         None => heading.child(when(time, cx)),
     };
+    let heading = heading.children(answers.map(|answers| when(answers, cx)));
+    // Only a comment Jira has can be answered
+    let reply = comment.id.clone().map(|comment_id| {
+        let target = ReplyTarget {
+            comment_id,
+            author_name: comment.author_name.clone(),
+        };
+        div().flex().child(
+            Button::new(SharedString::from(format!("reply-comment-{index}")))
+                .ghost()
+                .xsmall()
+                .label("Reply")
+                .on_click(move |_, window, cx| {
+                    pane.update(cx, |pane, cx| pane.reply_to(target.clone(), window, cx))
+                        .ok();
+                }),
+        )
+    });
+    // Jira has one level of replies, and so has the indent
+    let in_thread = matches!(&comment.reply_to, Some(reply_to) if reply_to.author_name.is_some());
     let lines = div()
         .child(heading)
         .child(markdown(("comment-body", index), &comment.body_md))
+        .children(reply)
         .children(comment.rejected.as_ref().map(|rejected| {
             refused(
                 index,
@@ -254,7 +297,8 @@ fn comment(index: usize, comment: &Comment, cx: &App) -> impl IntoElement {
                 cx,
             )
         }));
-    entry(&comment.author_name, lines)
+    let indent = if in_thread { px(32.) } else { px(0.) };
+    div().pl(indent).child(entry(&comment.author_name, lines))
 }
 
 fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
@@ -410,7 +454,7 @@ fn body(
     comment_form: Entity<CommentForm>,
     comment_bounds: Rc<Cell<Bounds<Pixels>>>,
     worklog_form: Entity<WorklogForm>,
-    cx: &App,
+    cx: &Context<DetailPane>,
 ) -> impl IntoElement {
     let muted = cx.theme().muted_foreground;
     let or_none = |value: &Option<String>| value.clone().unwrap_or_else(|| "None".to_owned());
@@ -527,7 +571,7 @@ fn body(
                 .comments
                 .iter()
                 .enumerate()
-                .map(|(index, each)| comment(index, each, cx)),
+                .map(|(index, each)| comment(index, each, cx.weak_entity(), cx)),
         )
         .child(
             div()

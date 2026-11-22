@@ -3,12 +3,13 @@ use crate::{
     db::worklogs,
     models::{
         AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
-        RejectedComment, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
+        RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
     },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 
 /// The moment Jira last changed an issue.
 // Jira sends `updated` with the UTC offset of the requesting user's time zone,
@@ -207,30 +208,106 @@ pub(crate) async fn get_detail(
             .as_u64()
             .map_or(comments.len(), |total| total as usize)
             + pending.len(),
-        comments: comments
-            .iter()
-            .map(|comment| Comment {
-                author_name: name(&comment["author"]["displayName"]).unwrap_or_default(),
-                created: name(&comment["created"]).unwrap_or_default(),
-                body_md: adf::to_markdown(comment.get("body"), &url),
-                pending: false,
-                rejected: None,
-            })
-            .chain(pending)
-            .collect(),
+        comments: threaded(
+            comments
+                .iter()
+                .map(|comment| {
+                    let listed = Comment {
+                        id: name(&comment["id"]),
+                        reply_to: None,
+                        author_name: name(&comment["author"]["displayName"]).unwrap_or_default(),
+                        created: name(&comment["created"]).unwrap_or_default(),
+                        body_md: adf::to_markdown(comment.get("body"), &url),
+                        pending: false,
+                        rejected: None,
+                    };
+                    (listed, parent_id(comment))
+                })
+                .chain(pending)
+                .collect(),
+        ),
         worklogs,
         key: row.key,
         url,
     }))
 }
 
+/// The id of the comment that `comment`, as the cache holds it, answers.
+/// `inbound::mark_replies` writes it as a string, and Jira sends a number with
+/// the comment it has just created.
+fn parent_id(comment: &Value) -> Option<String> {
+    match &comment["parentId"] {
+        Value::String(id) => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+/// Puts every reply after the comment it answers and the replies before it,
+/// and says whom it answers. `comments` are in the order of the issue, each
+/// with the id of the comment it answers. Jira has one level of replies, so a
+/// reply whose parent is not listed stays where it is.
+fn threaded(comments: Vec<(Comment, Option<String>)>) -> Vec<Comment> {
+    let authors: HashMap<String, String> = comments
+        .iter()
+        .filter(|(_, parent)| parent.is_none())
+        .filter_map(|(comment, _)| Some((comment.id.clone()?, comment.author_name.clone())))
+        .collect();
+    let mut top = Vec::new();
+    let mut replies: HashMap<String, Vec<Comment>> = HashMap::new();
+    for (mut comment, parent) in comments {
+        let Some(parent) = parent else {
+            top.push(comment);
+            continue;
+        };
+        let author_name = authors.get(&parent).cloned();
+        let listed = author_name.is_some();
+        comment.reply_to = Some(ReplyTo { author_name });
+        if listed {
+            replies.entry(parent).or_default().push(comment);
+        } else {
+            top.push(comment);
+        }
+    }
+    let mut threaded = Vec::new();
+    for comment in top {
+        let answers = comment.id.as_ref().and_then(|id| replies.remove(id));
+        threaded.push(comment);
+        threaded.extend(answers.into_iter().flatten());
+    }
+    threaded
+}
+
+/// The id of the comment a reply to `comment_id` has to name: Jira takes
+/// replies to the first comment of a thread only, so for a reply it is the
+/// comment that one answers.
+pub(crate) async fn top_of_thread(
+    pool: &SqlitePool,
+    key: &IssueKey,
+    comment_id: &str,
+) -> sqlx::Result<String> {
+    let raw: Option<String> = sqlx::query_scalar("SELECT raw_json FROM issues WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    let raw: Value = serde_json::from_str(&raw.unwrap_or_default()).unwrap_or_default();
+    let parent = raw["fields"]["comment"]["comments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|comment| comment["id"] == comment_id)
+        .and_then(parent_id);
+    Ok(parent.unwrap_or_else(|| comment_id.to_owned()))
+}
+
 /// The comments of the issue that are not in Jira: those that wait in the
-/// outbox and those Jira refused, oldest first.
+/// outbox and those Jira refused, oldest first, each with the id of the
+/// comment it answers.
 async fn pending_comments(
     pool: &SqlitePool,
     key: &IssueKey,
     issue_url: &str,
-) -> sqlx::Result<Vec<Comment>> {
+) -> sqlx::Result<Vec<(Comment, Option<String>)>> {
     let entries: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, payload, status, error_msg FROM sync_queue
          WHERE issue_key = ? AND entity_type = 'comment'
@@ -246,7 +323,9 @@ async fn pending_comments(
             let payload: Value = serde_json::from_str(&payload).unwrap_or_default();
             let text = payload["text"].as_str().unwrap_or_default();
             let failed = status == "failed";
-            Comment {
+            let comment = Comment {
+                id: None,
+                reply_to: None,
                 author_name: "You".to_owned(),
                 created: String::new(),
                 body_md: adf::to_markdown(Some(&adf::from_plain_text(text)), issue_url),
@@ -255,7 +334,8 @@ async fn pending_comments(
                     entry_id,
                     reason: error.unwrap_or_default(),
                 }),
-            }
+            };
+            (comment, payload["parent_id"].as_str().map(str::to_owned))
         })
         .collect())
 }

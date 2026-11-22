@@ -125,6 +125,11 @@ pub struct IssueDetail {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
+    /// The id Jira gave it, which `api::reply_to_comment` takes. `None` for a
+    /// comment Jira does not have.
+    pub id: Option<String>,
+    /// Set for a reply. It is listed after the comment it answers.
+    pub reply_to: Option<ReplyTo>,
     pub author_name: String,
     /// As Jira sent it, in the time zone of the account: `2026-03-29T01:30:00.000+0100`.
     pub created: String,
@@ -135,6 +140,13 @@ pub struct Comment {
     pub pending: bool,
     /// Set for a comment Jira refused. It stays until the user retries or discards it.
     pub rejected: Option<RejectedComment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplyTo {
+    /// Who wrote the comment answered. `None` when it is not among the
+    /// comments of the issue: it was deleted, or Jira sent a part of the thread.
+    pub author_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

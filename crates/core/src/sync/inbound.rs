@@ -139,6 +139,34 @@ fn readable_record(state: &AppState, issue: &Value) -> Option<IssueRecord> {
     }
 }
 
+/// Writes into each comment of `issues` that is a reply the `parentId` of the
+/// comment it answers, as the comments of one issue have it. Jira is asked
+/// once for all of them, and not at all when no issue has a comment.
+pub(crate) async fn mark_replies(client: &JiraClient, issues: &mut [Value]) -> anyhow::Result<()> {
+    const COMMENTS: &str = "/fields/comment/comments";
+    let ids: Vec<i64> = issues
+        .iter()
+        .filter_map(|issue| issue.pointer(COMMENTS)?.as_array())
+        .flatten()
+        .filter_map(|comment| comment["id"].as_str()?.parse().ok())
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let parents = client.comment_parents(&ids).await?;
+    let comments = issues
+        .iter_mut()
+        .filter_map(|issue| issue.pointer_mut(COMMENTS)?.as_array_mut())
+        .flatten();
+    for comment in comments {
+        let parent = comment["id"].as_str().and_then(|id| parents.get(id));
+        if let Some(parent) = parent {
+            comment["parentId"] = Value::String(parent.clone());
+        }
+    }
+    Ok(())
+}
+
 /// `key` is the key of a status category in Jira.
 pub(crate) fn status_category(key: &str) -> StatusCategory {
     match key {
@@ -181,9 +209,10 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
         report(synced);
         let mut page_token = None;
         loop {
-            let page = client
+            let mut page = client
                 .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
                 .await?;
+            mark_replies(&client, &mut page.issues).await?;
             let records: Vec<IssueRecord> = page
                 .issues
                 .iter()
@@ -258,9 +287,10 @@ pub(crate) async fn poll_updated_issues(
 
     let mut page_token = None;
     loop {
-        let page = client
+        let mut page = client
             .search_page(&jql, ISSUE_FIELDS, page_token.as_deref())
             .await?;
+        mark_replies(&client, &mut page.issues).await?;
         let records: Vec<IssueRecord> = page
             .issues
             .iter()
@@ -1287,6 +1317,112 @@ mod tests {
         assert_eq!(summary(&state, "WEB-1").await, "Renamed");
         assert_eq!(stored_keys(&state).await, ["API-5", "WEB-1", "WEB-2"]);
         assert!(last_sync_at(&state).await > before);
+    }
+
+    /// `issue` with comments that have these ids.
+    fn commented(mut issue: Value, ids: &[u32]) -> Value {
+        let comments: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "id": id.to_string(), "author": { "displayName": "Ada" } }))
+            .collect();
+        issue["fields"]["comment"] = json!({ "total": ids.len(), "comments": comments });
+        issue
+    }
+
+    /// Jira asked which of the comments with `ids` are replies: `parents` has
+    /// the parent of each, or null.
+    fn comment_parents(ids: &[u32], parents: Value) -> Mock {
+        let values: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "id": id.to_string(), "parentId": parents[id.to_string()] }))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/comment/list"))
+            .and(body_json(json!({ "ids": ids })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "values": values })))
+    }
+
+    /// The comments of `key` in the cache: the id of each and of its parent.
+    async fn parents(state: &AppState, key: &str) -> Vec<(String, Value)> {
+        let raw: String = sqlx::query_scalar("SELECT raw_json FROM issues WHERE key = ?")
+            .bind(key)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let raw: Value = serde_json::from_str(&raw).unwrap();
+        raw["fields"]["comment"]["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|comment| {
+                let id = comment["id"].as_str().unwrap().to_owned();
+                (id, comment["parentId"].clone())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_replies_among_the_comments_of_a_page_get_their_parents_in_one_request() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = watching(&server, data_dir.path(), &["WEB"]).await;
+        mount_count(&server, "WEB", 3).await;
+        let issues = [
+            commented(issue(1, "WEB"), &[100, 101]),
+            issue(2, "WEB"),
+            commented(issue(3, "WEB"), &[102]),
+        ];
+        mount_page(&server, "WEB", None, page(&issues, None)).await;
+        comment_parents(&[100, 101, 102], json!({ "101": 100 }))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        api::initial_sync(&state).await.unwrap();
+
+        let first = [
+            ("100".to_owned(), Value::Null),
+            ("101".to_owned(), json!("100")),
+        ];
+        assert_eq!(parents(&state, "WEB-1").await, first);
+        assert_eq!(
+            parents(&state, "WEB-3").await,
+            [("102".to_owned(), Value::Null)]
+        );
+        received(&mut events);
+
+        // A reply written in Jira comes with the next poll
+        crate::sync::no_worklog_changes().mount(&server).await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .and(body_json(json!({
+                "jql": "project IN (\"WEB\")",
+                "fields": ["id"],
+                "maxResults": 5000,
+            })))
+            .respond_with(ids(1..10))
+            .mount(&server)
+            .await;
+        let replied = changed(commented(issue(3, "WEB"), &[102, 103]), LATER, "Replied");
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(page(&[replied], None))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        comment_parents(&[102, 103], json!({ "103": 102 }))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        state.sync_waker.send(()).unwrap();
+        cycle(&mut events).await;
+
+        assert_eq!(
+            parents(&state, "WEB-3").await,
+            [
+                ("102".to_owned(), Value::Null),
+                ("103".to_owned(), json!("102"))
+            ]
+        );
     }
 
     const SPRINT_FIELD: &str = "customfield_10020";

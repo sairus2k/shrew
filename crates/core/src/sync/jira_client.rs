@@ -2,7 +2,11 @@ use crate::models::IssueKey;
 use reqwest::{RequestBuilder, Response, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    time::Duration,
+};
 
 const PAGE_SIZE: u32 = 100;
 // Jira serves pages this large only when no field but the id is asked for
@@ -362,6 +366,40 @@ impl JiraClient {
     ) -> Result<Value, JiraError> {
         let url = self.url(&format!("/issue/{key}/comment"));
         self.send(self.http.post(url).json(body)).await
+    }
+
+    /// Which of the comments with these ids are replies: the id of each one
+    /// with the id of the comment it answers. The search and the issue itself
+    /// come without that; only this call and the comments of one issue have it.
+    pub(crate) async fn comment_parents(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<String, String>, JiraError> {
+        #[derive(Deserialize)]
+        struct Page {
+            values: Vec<Listed>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Listed {
+            id: String,
+            parent_id: Option<i64>,
+        }
+        let mut parents = HashMap::new();
+        // Jira takes at most a thousand ids and answers with all of them in one page
+        for ids in ids.chunks(1000) {
+            let request = self
+                .http
+                .post(self.url("/comment/list"))
+                .json(&json!({ "ids": ids }));
+            let page: Page = self.send(request).await?;
+            parents.extend(page.values.into_iter().filter_map(|comment| {
+                comment
+                    .parent_id
+                    .map(|parent| (comment.id, parent.to_string()))
+            }));
+        }
+        Ok(parents)
     }
 
     /// `body` is the request body of Jira's worklog call. Returns the worklog

@@ -1,18 +1,29 @@
-//! The input under the comments of an issue.
+//! The input under the comments of an issue, for a new comment or an answer
+//! to one of them.
 
 use crate::keys;
 use crate::runtime::spawn;
 use app_core::{api, models::IssueKey};
 use gpui_kit::component::{
-    Disableable, Sizable, WindowExt as _,
+    ActiveTheme, Disableable, Sizable, WindowExt as _,
     button::{Button, ButtonVariants},
     input::{InputEvent, Textarea, TextareaState},
     notification::Notification,
 };
 use gpui_kit::*;
 
+/// The comment an answer is written to.
+#[derive(Clone)]
+pub struct ReplyTarget {
+    /// `Comment::id`.
+    pub comment_id: String,
+    pub author_name: String,
+}
+
 pub struct CommentForm {
     key: IssueKey,
+    // Kept until the answer is queued or the user drops it
+    reply_to: Option<ReplyTarget>,
     input: Entity<TextareaState>,
     // The text stays in the input until the core has queued it, so a failed
     // write loses nothing; the flag keeps a second click from queueing it twice
@@ -35,6 +46,7 @@ impl CommentForm {
         });
         Self {
             key,
+            reply_to: None,
             input,
             sending: false,
             _typing,
@@ -45,6 +57,12 @@ impl CommentForm {
         self.input.update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// What is written from now on answers `target`.
+    pub fn reply_to(&mut self, target: ReplyTarget, cx: &mut Context<Self>) {
+        self.reply_to = Some(target);
+        cx.notify();
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
         if self.sending || text.trim().is_empty() {
@@ -53,8 +71,14 @@ impl CommentForm {
         self.sending = true;
         cx.notify();
         let key = self.key.clone();
+        let reply_to = self.reply_to.clone();
         let write = spawn(cx, move |state| async move {
-            api::add_comment(&state, &key, &text).await
+            match reply_to {
+                Some(target) => {
+                    api::reply_to_comment(&state, &key, &target.comment_id, &text).await
+                }
+                None => api::add_comment(&state, &key, &text).await,
+            }
         });
         cx.spawn_in(window, async move |this, cx| {
             let saved = write.await;
@@ -62,9 +86,11 @@ impl CommentForm {
                 this.sending = false;
                 match saved {
                     // The core announces the issue and the model reloads it, pending comment included
-                    Ok(()) => this
-                        .input
-                        .update(cx, |input, cx| input.set_value("", window, cx)),
+                    Ok(()) => {
+                        this.reply_to = None;
+                        this.input
+                            .update(cx, |input, cx| input.set_value("", window, cx))
+                    }
                     Err(error) => window.push_notification(
                         Notification::error(format!("Could not save the comment: {error}")),
                         cx,
@@ -81,11 +107,38 @@ impl CommentForm {
 impl Render for CommentForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = self.input.read(cx).value().trim().is_empty();
+        let replying = self.reply_to.as_ref().map(|target| {
+            let label = format!("Replying to {}", target.author_name);
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("replying-to")
+                        .test_support()
+                        .aria_label(label.clone())
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    Button::new("cancel-reply")
+                        .ghost()
+                        .xsmall()
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reply_to = None;
+                            cx.notify();
+                        })),
+                )
+        });
         div()
             .flex()
             .flex_col()
             .items_start()
             .gap_2()
+            .children(replying)
             .child(
                 div()
                     .id("comment-input")
@@ -105,7 +158,11 @@ impl Render for CommentForm {
                 Button::new("submit-comment")
                     .primary()
                     .small()
-                    .label("Add comment")
+                    .label(if self.reply_to.is_some() {
+                        "Reply"
+                    } else {
+                        "Add comment"
+                    })
                     .disabled(empty || self.sending)
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
             )
@@ -162,11 +219,19 @@ mod tests {
         let server = MockServer::builder().listener(listener).start().await;
         no_worklog_changes().mount(&server).await;
         crate::harness::no_sprint_field().mount(&server).await;
+        no_replies().mount(&server).await;
         Mock::given(path("/rest/api/3/search/jql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": issues })))
             .mount(&server)
             .await;
         server
+    }
+
+    /// Jira asked which comments of a search page are replies: none is.
+    fn no_replies() -> Mock {
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/comment/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "values": [] })))
     }
 
     async fn accept_comments(server: &MockServer) {
@@ -306,6 +371,7 @@ mod tests {
         tokio.block_on(async {
             no_worklog_changes().mount(&server).await;
             crate::harness::no_sprint_field().mount(&server).await;
+            no_replies().mount(&server).await;
             Mock::given(path("/rest/api/3/search/jql"))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_json(json!({ "issues": [commented()] })),
@@ -321,6 +387,164 @@ mod tests {
             assert_eq!(headings(window), ["Ada Lovelace, 2026-03-30 10:00"]);
             assert_eq!(window.find("detail-comments").label(), Some("Comments"));
         });
+    }
+
+    /// WEB-1 with a comment of Ada, an answer of Grace to it and a comment of Grace.
+    fn discussed() -> Value {
+        let mut answer = jira_comment();
+        answer["id"] = json!("10101");
+        answer["author"]["displayName"] = json!("Grace Hopper");
+        answer["parentId"] = json!("10100");
+        let mut other = jira_comment();
+        other["id"] = json!("10102");
+        other["author"]["displayName"] = json!("Grace Hopper");
+        let mut discussed = issue(1, "Fix login");
+        discussed["fields"]["comment"] =
+            json!({ "total": 3, "comments": [jira_comment(), other, answer] });
+        discussed
+    }
+
+    const ADA: &str = "Ada Lovelace, 2026-03-30 10:00";
+    const GRACE: &str = "Grace Hopper, 2026-03-30 10:00";
+    const GRACE_TO_ADA: &str = "Grace Hopper, 2026-03-30 10:00, reply to Ada Lovelace";
+
+    #[gpui_kit::test]
+    fn a_reply_is_shown_under_its_comment_and_sent_into_the_thread_of_that_one(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([discussed()])));
+        // Jira answers with the reply as it stored it
+        let mut stored = jira_comment();
+        stored["id"] = json!("10103");
+        stored["parentId"] = json!(10100);
+        tokio.block_on(
+            Mock::given(method("POST"))
+                .and(path("/rest/api/3/issue/WEB-1/comment"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(stored))
+                .mount(&server),
+        );
+        let data_dir = synced_on(&tokio, &server.uri(), &[discussed()]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+
+        in_window(cx, window, |window, cx| {
+            // A reply made in Jira follows the comment it answers
+            assert_eq!(headings(window), [ADA, GRACE_TO_ADA, GRACE]);
+            assert!(window.try_find("replying-to").is_none());
+            assert_eq!(window.find("submit-comment").label(), Some("Add comment"));
+
+            // An answer to a reply joins the thread of Ada's comment
+            window.click("reply-comment-1", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("replying-to").label(),
+                Some("Replying to Grace Hopper")
+            );
+            assert_eq!(window.find("submit-comment").label(), Some("Reply"));
+            // The cursor is in the input
+            window.input("Which build?", cx);
+            window.render_frame(cx);
+            window.click("submit-comment", cx);
+        });
+
+        let pending = "You, pending, reply to Ada Lovelace";
+        wait_until(cx, window, |window| {
+            headings(window) == [ADA, GRACE_TO_ADA, pending, GRACE]
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(painted(window, ("comment-body", 2usize)), "Which build?");
+            // What Jira does not have cannot be answered
+            assert!(window.try_find("reply-comment-2").is_none());
+            // The next comment is not a reply
+            assert!(window.try_find("replying-to").is_none());
+            assert_eq!(window.find("submit-comment").label(), Some("Add comment"));
+        });
+
+        tokio.block_on(core(cx).sync_once()).unwrap();
+
+        let sent = "Ada Lovelace, 2026-03-30 10:00, reply to Ada Lovelace";
+        wait_until(cx, window, |window| {
+            headings(window) == [ADA, GRACE_TO_ADA, sent, GRACE]
+        });
+        let posts = posts(&tokio, &server);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["parentId"], "10100");
+        assert_eq!(
+            posts[0]["body"]["content"][0]["content"][0]["text"],
+            "Which build?"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_reply_that_is_cancelled_is_sent_as_a_comment_of_its_own(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([discussed()])));
+        tokio.block_on(accept_comments(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &[discussed()]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+
+        in_window(cx, window, |window, cx| {
+            window.click("reply-comment-0", cx);
+            window.render_frame(cx);
+            window.input("Seen on staging", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("replying-to").label(),
+                Some("Replying to Ada Lovelace")
+            );
+            window.click("cancel-reply", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("replying-to").is_none());
+            // The text stays
+            assert!(can_submit(window));
+            window.click("submit-comment", cx);
+        });
+
+        wait_until(cx, window, |window| {
+            headings(window) == [ADA, GRACE_TO_ADA, GRACE, "You, pending"]
+        });
+        tokio.block_on(core(cx).sync_once()).unwrap();
+        let posts = posts(&tokio, &server);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].get("parentId"), None);
+    }
+
+    #[gpui_kit::test]
+    fn a_reply_jira_refuses_stays_in_its_thread_and_can_be_retried(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port(), json!([discussed()])));
+        tokio.block_on(refuse_one_comment(&server));
+        let data_dir = synced_on(&tokio, &server.uri(), &[discussed()]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open_web_1(cx, window);
+
+        in_window(cx, window, |window, cx| {
+            window.click("reply-comment-0", cx);
+            window.render_frame(cx);
+            window.input("Which build?", cx);
+            window.render_frame(cx);
+            window.click("submit-comment", cx);
+        });
+        let pending = "You, pending, reply to Ada Lovelace";
+        wait_until(cx, window, |window| {
+            headings(window) == [ADA, GRACE_TO_ADA, pending, GRACE]
+        });
+        tokio.block_on(core(cx).sync_once()).unwrap();
+        let refused = "You, not sent, reply to Ada Lovelace";
+        wait_until(cx, window, |window| {
+            headings(window) == [ADA, GRACE_TO_ADA, refused, GRACE]
+        });
+
+        in_window(cx, window, |window, cx| window.click("retry-comment-2", cx));
+        wait_until(cx, window, |window| {
+            headings(window) == [ADA, GRACE_TO_ADA, pending, GRACE]
+        });
+        tokio.block_on(core(cx).sync_once()).unwrap();
+        let posts = posts(&tokio, &server);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1]["parentId"], "10100");
     }
 
     #[gpui_kit::test]

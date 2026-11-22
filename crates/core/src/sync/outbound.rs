@@ -197,7 +197,8 @@ async fn roll_back(
     entity_type: &str,
     refused: bool,
 ) -> anyhow::Result<Vec<SyncEvent>> {
-    let issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
+    let mut issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
+    inbound::mark_replies(client, std::slice::from_mut(&mut issue)).await?;
     let record = inbound::issue_record(&issue)?;
     let mut tx = crate::db::begin(&state.pool).await?;
     // An issue the cache does not have belongs to a project that is no longer
@@ -286,7 +287,10 @@ async fn deliver(
             let text = payload["text"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("a comment entry without text"))?;
-            let body = json!({ "body": adf::from_plain_text(text) });
+            let mut body = json!({ "body": adf::from_plain_text(text) });
+            if let Some(parent) = payload["parent_id"].as_str() {
+                body["parentId"] = parent.into();
+            }
             Ok(Delivered::Comment(
                 client.add_comment(&entry.issue_key, &body).await?,
             ))
@@ -1132,6 +1136,67 @@ mod tests {
         .unwrap();
         assert!(issues::upsert(&state.pool, &polled).await.unwrap());
         assert_eq!(comments(&state).await, [confirmed]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_sent_with_its_parent_and_stays_in_the_thread_once_jira_has_it() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        let mut second = created_comment();
+        second["id"] = json!("10101");
+        let discussed = json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+                "comment": { "total": 2, "comments": [created_comment(), second] },
+            },
+        });
+        let record = inbound::issue_record(&discussed).unwrap();
+        issues::upsert(&state.pool, &record).await.unwrap();
+        // Jira sends the parent of the comment it has created as a number
+        let mut created = created_comment();
+        created["id"] = json!("10102");
+        created["parentId"] = json!(10100);
+        comment_call("WEB-1")
+            .respond_with(ResponseTemplate::new(201).set_body_json(created))
+            .mount(&server)
+            .await;
+        api::reply_to_comment(&state, &"WEB-1".into(), "10100", "Which build?")
+            .await
+            .unwrap();
+
+        process_queue(&state, &config(&server.uri()), &mut Vec::new())
+            .await
+            .unwrap();
+
+        let sent = requests(&server).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1["parentId"], "10100");
+        assert_eq!(
+            sent[0].1["body"]["content"][0]["content"][0]["text"],
+            "Which build?"
+        );
+        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let thread: Vec<(Option<String>, bool)> = detail
+            .unwrap()
+            .unwrap()
+            .comments
+            .into_iter()
+            .map(|comment| (comment.id, comment.reply_to.is_some()))
+            .collect();
+        assert_eq!(
+            thread,
+            [
+                (Some("10100".to_owned()), false),
+                (Some("10102".to_owned()), true),
+                (Some("10101".to_owned()), false),
+            ]
+        );
     }
 
     #[tokio::test]

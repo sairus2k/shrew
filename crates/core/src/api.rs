@@ -443,6 +443,27 @@ pub async fn assign_issue(
 /// at once, and Jira gets it from the outbox. The text is trimmed; a comment
 /// without any is refused, and so is a comment on an issue the cache does not have.
 pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow::Result<()> {
+    queue_comment(state, key, text, None).await
+}
+
+/// `add_comment` for an answer to the comment with the id `comment_id`
+/// (`Comment::id`). Jira has one level of replies: an answer to a reply joins
+/// the thread of the comment that reply answers.
+pub async fn reply_to_comment(
+    state: &AppState,
+    key: &IssueKey,
+    comment_id: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    queue_comment(state, key, text, Some(comment_id)).await
+}
+
+async fn queue_comment(
+    state: &AppState,
+    key: &IssueKey,
+    text: &str,
+    reply_to: Option<&str>,
+) -> anyhow::Result<()> {
     let text = text.trim();
     if text.is_empty() {
         bail!("a comment cannot be empty");
@@ -452,7 +473,12 @@ pub async fn add_comment(state: &AppState, key: &IssueKey, text: &str) -> anyhow
     if db::issues::get(&state.pool, key).await?.is_none() {
         bail!("issue {key} not found");
     }
-    let payload = json!({ "text": text });
+    let mut payload = json!({ "text": text });
+    if let Some(comment_id) = reply_to {
+        payload["parent_id"] = db::issues::top_of_thread(&state.pool, key, comment_id)
+            .await?
+            .into();
+    }
     db::sync_queue::enqueue(&state.pool, "comment", key, &payload.to_string()).await?;
 
     state
@@ -918,6 +944,8 @@ mod tests {
         let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
 
         let comment = |author: &str, created: &str, body: &str| Comment {
+            id: None,
+            reply_to: None,
             author_name: author.to_owned(),
             created: created.to_owned(),
             body_md: body.to_owned(),
@@ -1299,6 +1327,8 @@ mod tests {
         assert_eq!(
             issue.comments,
             [Comment {
+                id: None,
+                reply_to: None,
                 author_name: "You".to_owned(),
                 created: String::new(),
                 body_md: "Seen on staging\\\nand \\*prod\\*".to_owned(),
@@ -1316,6 +1346,117 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&queued[0].1).unwrap(),
             json!({ "text": "Seen on staging\nand *prod*" })
         );
+    }
+
+    /// WEB-1 with a comment of Grace, one of Ada, an answer of Ada to Grace
+    /// and an answer to a comment the issue does not have.
+    fn discussed_issue() -> serde_json::Value {
+        let comment = |id: &str, author: &str, text: &str| {
+            json!({
+                "id": id,
+                "author": { "displayName": author },
+                "created": "2026-03-28T09:15:00.000+0100",
+                "body": paragraph(text),
+            })
+        };
+        let mut answer = comment("10102", "Ada Lovelace", "Which build?");
+        answer["parentId"] = json!("10100");
+        let mut orphan = comment("10103", "Grace Hopper", "Agreed");
+        orphan["parentId"] = json!("10050");
+        let mut issue = todo_issue();
+        issue["fields"]["comment"] = json!({ "total": 4, "comments": [
+            comment("10100", "Grace Hopper", "Seen on staging"),
+            comment("10101", "Ada Lovelace", "Cannot reproduce"),
+            answer,
+            orphan,
+        ] });
+        issue
+    }
+
+    /// The comments of WEB-1: the text of each and the author it answers.
+    async fn thread(state: &AppState) -> Vec<(String, Option<Option<String>>)> {
+        let issue = get_issue(state, &"WEB-1".into()).await.unwrap();
+        issue
+            .comments
+            .into_iter()
+            .map(|comment| {
+                let answers = comment.reply_to.map(|reply_to| reply_to.author_name);
+                (comment.body_md, answers)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_listed_after_the_comment_it_answers_with_the_author_of_that_one() {
+        let (_data_dir, state) = core_with(discussed_issue()).await;
+
+        let grace = Some(Some("Grace Hopper".to_owned()));
+        assert_eq!(
+            thread(&state).await,
+            [
+                ("Seen on staging".to_owned(), None),
+                ("Which build?".to_owned(), grace),
+                ("Cannot reproduce".to_owned(), None),
+                // Its parent is not among the comments
+                ("Agreed".to_owned(), Some(None)),
+            ]
+        );
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert_eq!(issue.comments[0].id.as_deref(), Some("10100"));
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_queued_with_its_parent_and_shows_as_pending_in_the_thread() {
+        let (_data_dir, state) = core_with(discussed_issue()).await;
+
+        reply_to_comment(&state, &"WEB-1".into(), "10101", " Try build 42 ")
+            .await
+            .unwrap();
+        // An answer to a reply: Jira takes it as one more reply to Grace's comment
+        reply_to_comment(&state, &"WEB-1".into(), "10102", "Build 41")
+            .await
+            .unwrap();
+
+        let payloads: Vec<serde_json::Value> = queued(&state)
+            .await
+            .iter()
+            .map(|(_, payload)| serde_json::from_str(payload).unwrap())
+            .collect();
+        assert_eq!(
+            payloads,
+            [
+                json!({ "text": "Try build 42", "parent_id": "10101" }),
+                json!({ "text": "Build 41", "parent_id": "10100" }),
+            ]
+        );
+        let grace = Some(Some("Grace Hopper".to_owned()));
+        let ada = Some(Some("Ada Lovelace".to_owned()));
+        assert_eq!(
+            thread(&state).await,
+            [
+                ("Seen on staging".to_owned(), None),
+                ("Which build?".to_owned(), grace.clone()),
+                ("Build 41".to_owned(), grace),
+                ("Cannot reproduce".to_owned(), None),
+                ("Try build 42".to_owned(), ada),
+                ("Agreed".to_owned(), Some(None)),
+            ]
+        );
+        let issue = get_issue(&state, &"WEB-1".into()).await.unwrap();
+        assert!(issue.comments[2].pending);
+        assert_eq!(issue.comment_total, 6);
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_refused_and_queues_nothing() {
+        let (_data_dir, state) = core_with(discussed_issue()).await;
+
+        let error = reply_to_comment(&state, &"WEB-1".into(), "10100", " \n")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "a comment cannot be empty");
+        assert_eq!(queued(&state).await, []);
     }
 
     #[tokio::test]
