@@ -1105,6 +1105,15 @@ pub(crate) mod tests {
         issues
     }
 
+    /// Waits for the project menu: the projects are read apart from the
+    /// issues, so the rows can be on screen a moment before the button.
+    #[track_caller]
+    pub(crate) fn wait_for_project_filter(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        wait_until(cx, window, |window| {
+            window.try_find("project-filter").is_some()
+        });
+    }
+
     /// Opens the project menu and clicks the item `name`.
     pub(crate) fn choose_project(window: &mut Window, cx: &mut gpui_kit::App, name: &str) {
         choose(window, cx, "project-filter", name)
@@ -1298,6 +1307,7 @@ pub(crate) mod tests {
         let data_dir = synced_two_projects(&tokio, &team_work());
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_project_filter(cx, window);
         wait_for_menu(
             cx,
             window,
@@ -1429,6 +1439,7 @@ pub(crate) mod tests {
         const MY_ENDPOINT: &str = "API-101: Add endpoint, In Progress, Ada Lovelace";
         const MY_DOCS: &str = "WEB-3: Write docs, In Progress, Ada Lovelace";
         wait_for_rows(cx, window, &[MY_ENDPOINT, MY_DOCS, MY_LOGOUT, LOGIN]);
+        wait_for_project_filter(cx, window);
         wait_until(cx, window, |window| {
             window.try_find("sprint-filter").is_some()
         });
@@ -1472,6 +1483,7 @@ pub(crate) mod tests {
         let data_dir = synced_with_sprints(&tokio, "");
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[ENDPOINT, DOCS, LOGOUT, LOGIN]);
+        wait_for_project_filter(cx, window);
         wait_for_menu(cx, window, "status-filter", &["Any status", "To Do"]);
 
         // A site without sprints: no button, and the key opens nothing
@@ -1665,6 +1677,7 @@ pub(crate) mod tests {
         let data_dir = synced_two_projects(&tokio, &two_projects());
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+        wait_for_project_filter(cx, window);
         in_window(cx, window, |window, _| {
             assert_eq!(window.find("project-filter").label(), Some("All projects"));
         });
@@ -1690,6 +1703,7 @@ pub(crate) mod tests {
         let data_dir = synced_two_projects(&tokio, &two_projects());
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+        wait_for_project_filter(cx, window);
 
         // The menu holds All projects, WEB and API
         for key in ["p", "down", "down", "enter"] {
@@ -1777,6 +1791,7 @@ pub(crate) mod tests {
         let data_dir = synced_two_projects(&tokio, &two_projects());
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+        wait_for_project_filter(cx, window);
 
         in_window(cx, window, |window, cx| {
             window.click("search", cx);
@@ -1815,10 +1830,7 @@ pub(crate) mod tests {
         let data_dir = synced_two_projects(&tokio, &two_projects());
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
-        // The projects are read apart from the issues, so the filter can come later
-        wait_until(cx, window, |window| {
-            window.try_find("project-filter").is_some()
-        });
+        wait_for_project_filter(cx, window);
         in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
         wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
 

@@ -209,7 +209,9 @@ impl Render for ProjectPicker {
 mod tests {
     use crate::{
         harness::{in_window, launch, tokio_runtime, wait_until},
-        issue_list::tests::{api_issue, choose_project, issue, rows, synced_on, watch},
+        issue_list::tests::{
+            api_issue, choose_project, issue, rows, synced_on, wait_for_project_filter, watch,
+        },
         runtime::Core,
         sign_in::tests::{fill_in_and_submit, jira},
     };
@@ -516,6 +518,7 @@ mod tests {
         let data_dir = synced_watching(&tokio, &server, &["WEB", "API"]);
         let window = launch(cx, &tokio, data_dir.path());
         wait_until(cx, window, |window| rows(window) == [API_LOGIN, WEB_LOGIN]);
+        wait_for_project_filter(cx, window);
         // The project that is about to be removed is the one the list is narrowed to
         in_window(cx, window, |window, cx| choose_project(window, cx, "API"));
         wait_until(cx, window, |window| rows(window) == [API_LOGIN]);
