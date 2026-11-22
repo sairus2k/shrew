@@ -1815,6 +1815,10 @@ pub(crate) mod tests {
         let data_dir = synced_two_projects(&tokio, &two_projects());
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[API_TOKEN, API_LOGIN, CHECKOUT, LOGOUT, LOGIN]);
+        // The projects are read apart from the issues, so the filter can come later
+        wait_until(cx, window, |window| {
+            window.try_find("project-filter").is_some()
+        });
         in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
         wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
 
