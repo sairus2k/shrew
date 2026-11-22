@@ -1,6 +1,7 @@
 pub(crate) mod assignable;
 pub(crate) mod engine;
 pub(crate) mod inbound;
+pub(crate) mod issue_record;
 pub(crate) mod jira_client;
 pub(crate) mod outbound;
 pub(crate) mod tempo_client;

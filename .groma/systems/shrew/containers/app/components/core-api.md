@@ -12,6 +12,7 @@ groma:
       file: crates/core/src/models.rs
     - scanner: rust
       file: crates/core/src/events.rs
+      symbol: rejection
   group: Core interface
   technology: Rust, tokio, sqlx
 description: The functions, data types and events through which the UI uses the core

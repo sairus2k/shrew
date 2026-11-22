@@ -249,7 +249,7 @@ pub(crate) async fn get_detail(
 }
 
 /// The id of the comment that `comment`, as the cache holds it, answers.
-/// `inbound::mark_replies` writes it as a string, and Jira sends a number with
+/// `issue_record::mark_replies` writes it as a string, and Jira sends a number with
 /// the comment it has just created.
 fn parent_id(comment: &Value) -> Option<String> {
     match &comment["parentId"] {

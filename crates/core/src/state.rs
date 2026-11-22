@@ -68,7 +68,7 @@ impl AppState {
     pub async fn store_issues(&self, issues: &[serde_json::Value]) -> anyhow::Result<()> {
         let mut tx = crate::db::begin(&self.pool).await?;
         for issue in issues {
-            let record = crate::sync::inbound::issue_record(issue)?;
+            let record = crate::sync::issue_record::issue_record(issue)?;
             crate::db::issues::upsert(&mut *tx, &record).await?;
         }
         tx.commit().await?;

@@ -8,7 +8,7 @@ use crate::{
     },
     models::{IssueKey, RequiredField, Transition},
     sync::{
-        inbound,
+        issue_record,
         jira_client::{JiraClient, JiraTransition},
     },
 };
@@ -138,7 +138,7 @@ fn from_jira(transition: JiraTransition) -> Transition {
         id: transition.id,
         name: transition.name,
         to_status: transition.to.name,
-        to_status_category: inbound::status_category(&transition.to.status_category.key),
+        to_status_category: issue_record::status_category(&transition.to.status_category.key),
         required_fields: transition
             .fields
             .into_iter()
@@ -159,6 +159,7 @@ mod tests {
     use super::*;
     use crate::{
         api, models::StatusCategory, start_syncing_without_keychain, start_without_keychain,
+        sync::inbound,
     };
     use serde_json::{Value, json};
     use std::{sync::Arc, time::Duration};
@@ -205,7 +206,7 @@ mod tests {
             .await
             .unwrap();
         for issue in issues {
-            let record = inbound::issue_record(issue).unwrap();
+            let record = issue_record::issue_record(issue).unwrap();
             crate::db::issues::upsert(&state.pool, &record)
                 .await
                 .unwrap();

@@ -9,9 +9,10 @@ use crate::{
         transitions::{self, Position},
         worklogs,
     },
+    events::rejection,
     models::{IssueKey, WorklogTarget},
     sync::{
-        inbound,
+        issue_record,
         jira_client::{JiraClient, JiraError},
         tempo_client::{TempoClient, TempoError},
     },
@@ -156,20 +157,6 @@ pub(crate) async fn process_queue(
 /// chosen from the status the failed one was to produce, which Jira does not have.
 const EARLIER_REJECTED: &str = "an earlier status change of this issue did not reach Jira";
 
-/// What the user is told about an entry that will not reach Jira.
-pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> SyncEvent {
-    let action = match entity_type {
-        "transition" => "status change",
-        "assignee" => "assignee change",
-        other => other,
-    };
-    SyncEvent::ChangeRejected {
-        key: key.clone(),
-        action: action.to_owned(),
-        reason: reason.to_owned(),
-    }
-}
-
 /// Reads the issue again and stores it as Jira has it, so that a change the
 /// user made and Jira refused does not stay on screen. Jira has not changed
 /// the issue, so its `updated` is no newer than the stored row's. `entity_type`
@@ -197,9 +184,9 @@ async fn roll_back(
     entity_type: &str,
     refused: bool,
 ) -> anyhow::Result<Vec<SyncEvent>> {
-    let mut issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
-    inbound::mark_replies(client, std::slice::from_mut(&mut issue)).await?;
-    let record = inbound::issue_record(&issue)?;
+    let mut issue = client.issue(key, issue_record::ISSUE_FIELDS).await?;
+    issue_record::mark_replies(client, std::slice::from_mut(&mut issue)).await?;
+    let record = issue_record::issue_record(&issue)?;
     let mut tx = crate::db::begin(&state.pool).await?;
     // An issue the cache does not have belongs to a project that is no longer
     // watched: upserting it would bring it back, and nothing syncs it there
@@ -886,7 +873,7 @@ mod tests {
 
     /// Puts WEB-1 into the cache, in To Do.
     async fn store_issue(state: &AppState) {
-        let issue = inbound::issue_record(&json!({
+        let issue = issue_record::issue_record(&json!({
             "id": "10001",
             "key": "WEB-1",
             "fields": {
@@ -1154,7 +1141,7 @@ mod tests {
         assert_eq!(delivered, keys(&["WEB-1"]));
 
         // The next poll brings the issue with the comment Jira has stored
-        let polled = inbound::issue_record(&json!({
+        let polled = issue_record::issue_record(&json!({
             "id": "10001",
             "key": "WEB-1",
             "fields": {
@@ -1188,7 +1175,7 @@ mod tests {
                 "comment": { "total": 2, "comments": [created_comment(), second] },
             },
         });
-        let record = inbound::issue_record(&discussed).unwrap();
+        let record = issue_record::issue_record(&discussed).unwrap();
         issues::upsert(&state.pool, &record).await.unwrap();
         // Jira sends the parent of the comment it has created as a number
         let mut created = created_comment();
@@ -2389,7 +2376,7 @@ mod tests {
 
     /// Puts WEB-1 into the cache as Jira has it, assigned to Ada.
     async fn store_issue_of_ada(state: &AppState) {
-        let record = inbound::issue_record(&web_1_of_ada()).unwrap();
+        let record = issue_record::issue_record(&web_1_of_ada()).unwrap();
         issues::upsert(&state.pool, &record).await.unwrap();
     }
 

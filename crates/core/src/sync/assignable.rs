@@ -55,7 +55,7 @@ async fn fetch_and_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api, start_without_keychain, sync::inbound};
+    use crate::{api, start_without_keychain, sync::issue_record};
     use serde_json::{Value, json};
     use std::sync::Arc;
     use wiremock::{
@@ -92,7 +92,7 @@ mod tests {
             .await
             .unwrap();
         for id in [1, 2] {
-            let record = inbound::issue_record(&issue(id)).unwrap();
+            let record = issue_record::issue_record(&issue(id)).unwrap();
             crate::db::issues::upsert(&state.pool, &record)
                 .await
                 .unwrap();

@@ -33,3 +33,17 @@ pub enum SyncEvent {
     },
     Error(String),
 }
+
+/// What the user is told about an entry that will not reach Jira.
+pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> SyncEvent {
+    let action = match entity_type {
+        "transition" => "status change",
+        "assignee" => "assignee change",
+        other => other,
+    };
+    SyncEvent::ChangeRejected {
+        key: key.clone(),
+        action: action.to_owned(),
+        reason: reason.to_owned(),
+    }
+}

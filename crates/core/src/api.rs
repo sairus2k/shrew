@@ -621,6 +621,7 @@ mod tests {
     use crate::{
         models::{Comment, StatusCategory, SyncStatus, Worklog},
         start_without_keychain,
+        sync::issue_record,
     };
     use serde_json::json;
     use wiremock::{
@@ -904,7 +905,7 @@ mod tests {
         sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
-        let record = inbound::issue_record(&issue).unwrap();
+        let record = issue_record::issue_record(&issue).unwrap();
         db::issues::upsert(&state.pool, &record).await.unwrap();
         (data_dir, state)
     }
@@ -1627,7 +1628,7 @@ mod tests {
         sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
-        let record = inbound::issue_record(&todo_issue()).unwrap();
+        let record = issue_record::issue_record(&todo_issue()).unwrap();
         db::issues::upsert(&state.pool, &record).await.unwrap();
         transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
             .await
