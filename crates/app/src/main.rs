@@ -91,6 +91,10 @@ struct Root {
     // Tempo keeps answering 401 in every cycle until the token is replaced,
     // and the user needs to be told once
     tempo_rejection_shown: bool,
+    // Jira rejected the API token and has accepted no new one yet. The engine
+    // says so once and pauses, so a home screen built later, as after saved
+    // projects, is given the banner from here
+    token_rejected: bool,
 }
 
 impl Root {
@@ -115,6 +119,7 @@ impl Root {
             focus: cx.focus_handle(),
             notified_error: None,
             tempo_rejection_shown: false,
+            token_rejected: false,
         };
         this.rest_focus(window, cx);
         this
@@ -163,6 +168,7 @@ impl Root {
     }
 
     fn ask_for_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.token_rejected = true;
         let Screen::Home { new_token, .. } = &mut self.screen else {
             return;
         };
@@ -171,6 +177,7 @@ impl Root {
         }
         let banner = cx.new(|cx| NewToken::new(new_token::REJECTED, window, cx));
         cx.subscribe_in(&banner, window, |this, _, _: &TokenRenewed, window, cx| {
+            this.token_rejected = false;
             if let Screen::Home { new_token, .. } = &mut this.screen {
                 *new_token = None;
             }
@@ -184,6 +191,9 @@ impl Root {
 
     fn show(&mut self, step: SetupStep, window: &mut Window, cx: &mut Context<Self>) {
         self.screen = Self::screen(step, window, cx);
+        if self.token_rejected {
+            self.ask_for_token(window, cx);
+        }
         self.rest_focus(window, cx);
         cx.notify();
     }
@@ -261,6 +271,7 @@ impl Root {
         cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
             // The next account starts with its own sync errors
             this.notified_error = None;
+            this.token_rejected = false;
             tray::forget(cx);
             // The choice went with the config of the account
             cx.set_global(keys::Hints(true));
@@ -272,6 +283,7 @@ impl Root {
         .detach();
         cx.subscribe(&account, |this, _, _: &TokenReplaced, cx| {
             // The banner of a rejected token asks for what Jira now has
+            this.token_rejected = false;
             if let Screen::Home { new_token, .. } = &mut this.screen {
                 *new_token = None;
                 cx.notify();

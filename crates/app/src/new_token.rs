@@ -127,7 +127,7 @@ impl Render for NewToken {
 mod tests {
     use crate::{
         harness::{close_settings, in_window, launch, tokio_runtime, wait_until},
-        issue_list::tests::{issue, rows, synced, synced_on},
+        issue_list::tests::{issue, rows, synced, synced_on, watch},
         runtime::Core,
         sign_in::tests::jira,
     };
@@ -135,7 +135,7 @@ mod tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext};
     use std::path::Path;
-    use wiremock::{MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
     /// The app with a finished initial sync against `server`, right after Jira
     /// answered a sync with 401.
@@ -209,6 +209,44 @@ mod tests {
         open_settings(cx, window);
         close_settings(cx, window);
 
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("new-token").is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_banner_is_still_there_after_the_projects_were_saved(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = jira(&tokio, ResponseTemplate::new(401));
+        let projects = serde_json::json!({
+            "isLast": true,
+            "values": [
+                { "id": "10001", "key": "API", "name": "Backend" },
+                { "id": "10000", "key": "WEB", "name": "Website" },
+            ],
+        });
+        tokio.block_on(
+            Mock::given(path("/rest/api/3/project/search"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(projects))
+                .mount(&server),
+        );
+        let data_dir = synced_on(&tokio, &server.uri(), &[issue(1, "Fix login")]);
+        watch(&tokio, data_dir.path(), &["WEB", "API"]);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| rows(window).len() == 1);
+        cx.update(|cx| cx.global::<Core>().state.emit(SyncEvent::TokenRejected));
+        wait_until(cx, window, |window| window.try_find("new-token").is_some());
+        open_settings(cx, window);
+        wait_until(cx, window, |window| {
+            window.try_find("project-API").is_some()
+        });
+
+        // Saving builds the home screen anew
+        in_window(cx, window, |window, cx| window.click("project-API", cx));
+        in_window(cx, window, |window, cx| window.click("watch-projects", cx));
+
+        wait_until(cx, window, |window| window.try_find("settings").is_none());
+        wait_until(cx, window, |window| rows(window).len() == 1);
         in_window(cx, window, |window, _| {
             assert!(window.try_find("new-token").is_some());
         });
