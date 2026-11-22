@@ -555,6 +555,14 @@ mod tests {
         assert!(!sync_requests.has_changed().unwrap());
         press(cx, &app, &["r"]);
         assert!(sync_requests.has_changed().unwrap());
+
+        // A request made while a cycle runs would start one more after it
+        let mut sync_requests = sync_requests;
+        sync_requests.mark_unchanged();
+        state.emit(app_core::SyncEvent::Started);
+        cx.run_until_parked();
+        press(cx, &app, &["r"]);
+        assert!(!sync_requests.has_changed().unwrap());
     }
 
     #[gpui_kit::test]

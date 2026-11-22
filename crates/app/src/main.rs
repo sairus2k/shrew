@@ -439,137 +439,142 @@ impl Render for Root {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_key = keys::hint(&EditUserSettings, cx);
         let projects_key = keys::hint(&EditProjects, cx);
-        let screen = match &self.screen {
-            Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
-            Screen::EnterToken { new_token, account } => div()
-                .id("enter-token")
-                .test_support()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(new_token.clone())
-                .child(div().px_4().py_2().flex().child(account.clone()))
-                .into_any_element(),
-            Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
-            Screen::InitialSync(sync) => sync.clone().into_any_element(),
-            Screen::Settings(settings) => settings.clone().into_any_element(),
-            Screen::Home {
-                list,
-                detail,
-                status,
-                account,
-                timer_status,
-                new_token,
-                ..
-            } => div()
-                .id("home")
-                .test_support()
-                .key_context(keys::HOME)
-                .on_action(cx.listener(Self::back))
-                .on_action(cx.listener(|this, _: &ChangeStatus, window, cx| {
-                    this.in_detail(window, cx, DetailPane::change_status)
-                }))
-                .on_action(cx.listener(|this, _: &ChangeAssignee, window, cx| {
-                    this.in_detail(window, cx, DetailPane::change_assignee)
-                }))
-                .on_action(cx.listener(|this, _: &WriteComment, window, cx| {
-                    this.in_detail(window, cx, DetailPane::write_comment)
-                }))
-                .on_action(cx.listener(|this, _: &LogTime, window, cx| {
-                    this.in_detail(window, cx, DetailPane::log_time)
-                }))
-                .on_action(cx.listener(|this, _: &OpenInJira, window, cx| {
-                    this.in_detail(window, cx, DetailPane::open_in_jira)
-                }))
-                .on_action(cx.listener(Self::toggle_timer))
-                .on_action(cx.listener(Self::open_timer_issue))
-                .on_action(|_: &SyncNow, _, cx| app_core::api::sync_now(&cx.global::<Core>().state))
-                .on_action(cx.listener(|this, _: &EditUserSettings, window, cx| {
-                    this.edit_settings(window, cx)
-                }))
-                .on_action(
-                    cx.listener(|this, _: &EditProjects, window, cx| {
+        let screen =
+            match &self.screen {
+                Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
+                Screen::EnterToken { new_token, account } => div()
+                    .id("enter-token")
+                    .test_support()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(new_token.clone())
+                    .child(div().px_4().py_2().flex().child(account.clone()))
+                    .into_any_element(),
+                Screen::ChooseProjects(picker) => picker.clone().into_any_element(),
+                Screen::InitialSync(sync) => sync.clone().into_any_element(),
+                Screen::Settings(settings) => settings.clone().into_any_element(),
+                Screen::Home {
+                    list,
+                    detail,
+                    status,
+                    account,
+                    timer_status,
+                    new_token,
+                    ..
+                } => div()
+                    .id("home")
+                    .test_support()
+                    .key_context(keys::HOME)
+                    .on_action(cx.listener(Self::back))
+                    .on_action(cx.listener(|this, _: &ChangeStatus, window, cx| {
+                        this.in_detail(window, cx, DetailPane::change_status)
+                    }))
+                    .on_action(cx.listener(|this, _: &ChangeAssignee, window, cx| {
+                        this.in_detail(window, cx, DetailPane::change_assignee)
+                    }))
+                    .on_action(cx.listener(|this, _: &WriteComment, window, cx| {
+                        this.in_detail(window, cx, DetailPane::write_comment)
+                    }))
+                    .on_action(cx.listener(|this, _: &LogTime, window, cx| {
+                        this.in_detail(window, cx, DetailPane::log_time)
+                    }))
+                    .on_action(cx.listener(|this, _: &OpenInJira, window, cx| {
+                        this.in_detail(window, cx, DetailPane::open_in_jira)
+                    }))
+                    .on_action(cx.listener(Self::toggle_timer))
+                    .on_action(cx.listener(Self::open_timer_issue))
+                    .on_action(|_: &SyncNow, _, cx| {
+                        let core = cx.global::<Core>();
+                        // A request made while a cycle runs would start one more after it
+                        if !core.sync.read(cx).sending {
+                            app_core::api::sync_now(&core.state)
+                        }
+                    })
+                    .on_action(cx.listener(|this, _: &EditUserSettings, window, cx| {
+                        this.edit_settings(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &EditProjects, window, cx| {
                         this.edit_projects(window, cx)
-                    }),
-                )
-                .on_action(|_: &ShowShortcuts, window, cx| keys::show(window, cx))
-                .size_full()
-                .flex()
-                .flex_col()
-                .children(new_token.clone())
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .child(
-                            div()
-                                .h_full()
-                                .min_w_0()
-                                .map(|list| match detail {
-                                    Some(_) => {
-                                        list.w(relative(0.4)).flex_none().bg(cx.theme().sidebar)
-                                    }
-                                    None => list.flex_1(),
-                                })
-                                .child(list.clone()),
-                        )
-                        .children(detail.clone().map(|detail| {
-                            div()
-                                .h_full()
-                                .flex_1()
-                                .min_w_0()
-                                .border_l_1()
-                                .border_color(cx.theme().border)
-                                .child(detail)
-                        })),
-                )
-                .child(
-                    div()
-                        .h(px(28.))
-                        .flex_none()
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .text_size(px(12.))
-                        .text_color(cx.theme().muted_foreground)
-                        .bg(cx.theme().status_bar)
-                        .border_t_1()
-                        .border_color(cx.theme().status_bar_border)
-                        .child(div().flex_1().min_w_0().child(status.clone()))
-                        .child(div().mr_2().child(timer_status.clone()))
-                        .child(
-                            Button::new("edit-settings")
-                                .ghost()
-                                .xsmall()
-                                .label("Settings")
-                                .children(settings_key)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.edit_settings(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("edit-projects")
-                                .ghost()
-                                .xsmall()
-                                .label("Projects")
-                                .children(projects_key)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.edit_projects(window, cx)
-                                })),
-                        )
-                        .child(account.clone())
-                        .child(
-                            Button::new("show-shortcuts")
-                                .ghost()
-                                .xsmall()
-                                .label("?")
-                                .accessibility_label("Keyboard shortcuts")
-                                .on_click(|_, window, cx| keys::show(window, cx)),
-                        ),
-                )
-                .into_any_element(),
-        };
+                    }))
+                    .on_action(|_: &ShowShortcuts, window, cx| keys::show(window, cx))
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .children(new_token.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .min_w_0()
+                                    .map(|list| match detail {
+                                        Some(_) => {
+                                            list.w(relative(0.4)).flex_none().bg(cx.theme().sidebar)
+                                        }
+                                        None => list.flex_1(),
+                                    })
+                                    .child(list.clone()),
+                            )
+                            .children(detail.clone().map(|detail| {
+                                div()
+                                    .h_full()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .border_l_1()
+                                    .border_color(cx.theme().border)
+                                    .child(detail)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .h(px(28.))
+                            .flex_none()
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .bg(cx.theme().status_bar)
+                            .border_t_1()
+                            .border_color(cx.theme().status_bar_border)
+                            .child(div().flex_1().min_w_0().child(status.clone()))
+                            .child(div().mr_2().child(timer_status.clone()))
+                            .child(
+                                Button::new("edit-settings")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Settings")
+                                    .children(settings_key)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.edit_settings(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("edit-projects")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Projects")
+                                    .children(projects_key)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.edit_projects(window, cx)
+                                    })),
+                            )
+                            .child(account.clone())
+                            .child(
+                                Button::new("show-shortcuts")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("?")
+                                    .accessibility_label("Keyboard shortcuts")
+                                    .on_click(|_, window, cx| keys::show(window, cx)),
+                            ),
+                    )
+                    .into_any_element(),
+            };
         div().size_full().track_focus(&self.focus).child(screen)
     }
 }
