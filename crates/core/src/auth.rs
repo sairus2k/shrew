@@ -162,7 +162,8 @@ pub(crate) async fn save(
     save_config(data_dir, config).await
 }
 
-/// Deletes the tokens and the config file. Succeeds when they are already gone.
+/// Deletes the tokens and the config file, with what a write of it that
+/// stopped halfway left. Succeeds when they are already gone.
 pub(crate) async fn remove(
     data_dir: &Path,
     tokens: Arc<dyn TokenStore>,
@@ -170,10 +171,13 @@ pub(crate) async fn remove(
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || tokens.delete()).await??;
     tokio::task::spawn_blocking(move || tempo_tokens.delete()).await??;
-    match tokio::fs::remove_file(data_dir.join(CONFIG_FILE)).await {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-        _ => Ok(()),
+    for file in [CONFIG_FILE, NEW_CONFIG_FILE] {
+        match tokio::fs::remove_file(data_dir.join(file)).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
     }
+    Ok(())
 }
 
 /// Writes the config file only: the token store is not touched.
@@ -252,6 +256,29 @@ mod tests {
         let loaded = load(data_dir.path(), tokens, tempo_tokens).await;
         assert_eq!(loaded, Some(config));
         assert!(!new_file.exists());
+    }
+
+    #[tokio::test]
+    async fn removing_the_account_leaves_no_file_that_names_it() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let tokens = Arc::new(TokenFile(data_dir.path().join("api-token")));
+        let tempo_tokens = Arc::new(TokenFile(data_dir.path().join("tempo-token")));
+        let mut config = account_config();
+        config.api_token = "secret".to_owned();
+        save(data_dir.path(), tokens.clone(), &config)
+            .await
+            .unwrap();
+        // A write of the config that stopped halfway
+        let new_file = data_dir.path().join(NEW_CONFIG_FILE);
+        std::fs::write(&new_file, r#"{ "email": "ada@example.com""#).unwrap();
+
+        remove(data_dir.path(), tokens.clone(), tempo_tokens.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_dir(data_dir.path()).unwrap().count(), 0);
+        // There is nothing left to delete
+        remove(data_dir.path(), tokens, tempo_tokens).await.unwrap();
     }
 
     #[tokio::test]
