@@ -1,6 +1,6 @@
 use crate::{
     adf,
-    db::worklogs,
+    db::{sync_queue, timer, worklogs},
     models::{
         AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
         RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
@@ -117,6 +117,40 @@ pub(crate) async fn upsert(
     .execute(executor)
     .await?;
     Ok(written.rows_affected() > 0)
+}
+
+/// What `store` did with an issue.
+pub(crate) struct Stored {
+    /// `false` means the cache already held this version or a newer one.
+    pub written: bool,
+    /// The key the cache had for the issue, when it wrote it under another.
+    pub moved_from: Option<IssueKey>,
+}
+
+/// `upsert` for an issue read from Jira, which may have moved to another
+/// project since the cache last saw it: the outbox entries, the worklogs and
+/// the running timer of the old key follow it. Every path that stores an issue
+/// of Jira goes through here, because the upsert rewrites the key and a later
+/// poll then finds no move to repair.
+pub(crate) async fn store(
+    conn: &mut sqlx::SqliteConnection,
+    issue: &IssueRecord,
+) -> sqlx::Result<Stored> {
+    // The upsert overwrites the old key, so it has to be read first
+    let old_key = key_of(&mut *conn, &issue.id).await?;
+    let written = upsert(&mut *conn, issue).await?;
+    let moved_from = old_key.filter(|old| written && *old != issue.key);
+    if let Some(old) = &moved_from {
+        // After the upsert, which finds the unsent changes of the issue by the
+        // key it had
+        sync_queue::rename_issue(&mut *conn, old, &issue.key).await?;
+        worklogs::rename_issue(&mut *conn, old, &issue.key).await?;
+        timer::rename_issue(&mut *conn, old, &issue.key).await?;
+    }
+    Ok(Stored {
+        written,
+        moved_from,
+    })
 }
 
 /// The key the cache holds the issue under, if it has it.

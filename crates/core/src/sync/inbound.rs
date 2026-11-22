@@ -112,8 +112,13 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             if !sync_state::watched(&mut *tx).await?.contains(project_key) {
                 break;
             }
+            let mut moved = Vec::new();
             for record in &records {
-                issues::upsert(&mut *tx, record).await?;
+                let stored = issues::store(&mut tx, record).await?;
+                if let Some(old) = stored.moved_from {
+                    moved.push(record.key.clone());
+                    moved.push(old);
+                }
                 synced += 1;
             }
             store_worklogs(state, &mut tx, &listed, &mut Vec::new()).await?;
@@ -124,6 +129,9 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             }
             tx.commit().await?;
             drop(saved);
+            if !moved.is_empty() {
+                state.events.send(SyncEvent::IssuesUpdated(moved)).ok();
+            }
             report(synced);
 
             if last_page {
@@ -192,20 +200,10 @@ pub(crate) async fn poll_updated_issues(
             if !watched.contains(&record.project_key) {
                 continue;
             }
-            // The upsert overwrites the old key, so it has to be read first:
-            // a view open under it would otherwise never hear of the move
-            let old_key = issues::key_of(&mut *tx, &record.id).await?;
-            if issues::upsert(&mut *tx, &record).await? {
-                let moved_from = old_key.filter(|old| *old != record.key);
-                if let Some(old) = &moved_from {
-                    // After the upsert, which finds the unsent changes of the
-                    // issue by the key it had
-                    sync_queue::rename_issue(&mut *tx, old, &record.key).await?;
-                    worklogs::rename_issue(&mut *tx, old, &record.key).await?;
-                    timer::rename_issue(&mut *tx, old, &record.key).await?;
-                }
+            let stored = issues::store(&mut tx, &record).await?;
+            if stored.written {
                 written.push(record.key);
-                written.extend(moved_from);
+                written.extend(stored.moved_from);
             }
         }
         store_worklogs(state, &mut tx, &listed, &mut Vec::new()).await?;
@@ -972,6 +970,59 @@ mod tests {
         );
         assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         assert_eq!(last_sync_at(&state).await, synced_at);
+    }
+
+    #[tokio::test]
+    async fn an_issue_that_moved_into_an_added_project_takes_its_changes_and_its_old_key_along() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = downloaded(&server, data_dir.path(), &["WEB"]).await;
+        sqlx::raw_sql(
+            "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, sync_status)
+                 VALUES ('40001', 'WEB-1', 600, '2026-03-29T08:15:00.000Z', 'synced');
+                 INSERT INTO sync_queue (entity_type, issue_key, operation, payload, status)
+                 VALUES ('comment', 'WEB-1', 'create', '{}', 'pending');
+                 INSERT INTO running_timer (id, issue_key, started_at)
+                 VALUES (1, 'WEB-1', 1774771200);",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        api::watch_projects(&state, &["WEB".to_owned(), "API".to_owned()])
+            .await
+            .unwrap();
+        // WEB-1 has moved from the watched WEB into the project that was just added
+        let mut moved = changed(issue(1, "API"), LATER, "Moved");
+        moved["key"] = json!("API-9");
+        mount_count(&server, "API", 1).await;
+        mount_page(&server, "API", None, page(&[moved], None)).await;
+        no_issue_worklogs().mount(&server).await;
+        received(&mut events);
+
+        api::initial_sync(&state).await.unwrap();
+
+        assert_eq!(stored_keys(&state).await, ["API-9", "WEB-2"]);
+        assert_eq!(
+            received(&mut events),
+            [
+                "API 0 / ~1",
+                r#"IssuesUpdated([IssueKey("API-9"), IssueKey("WEB-1")])"#,
+                "API 1 / ~1",
+                "InitialSyncComplete"
+            ]
+        );
+        let worklogs: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM worklogs")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(worklogs, ["API-9"]);
+        let running = timer::get(&state.pool).await.unwrap().unwrap();
+        assert_eq!(running.issue_key, "API-9".into());
+        let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, ["API-9"]);
     }
 
     #[tokio::test]

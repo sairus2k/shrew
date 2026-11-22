@@ -199,7 +199,10 @@ async fn roll_back(
     } else {
         0
     };
-    issues::upsert(&mut *tx, &record).await?;
+    let moved_to = issues::store(&mut tx, &record)
+        .await?
+        .moved_from
+        .map(|_| record.key.clone());
     if refused && !status_change {
         assignable::forget(&mut *tx, key).await?;
     }
@@ -215,8 +218,12 @@ async fn roll_back(
         transitions::forget(&mut *tx, &position).await?;
     }
     tx.commit().await?;
-    Ok((0..later)
-        .map(|_| rejection(key, "transition", EARLIER_REJECTED))
+    // The callers announce the key the issue had; a view open under it
+    // follows the move only if the new one is announced too
+    Ok(moved_to
+        .map(|key| SyncEvent::IssuesUpdated(vec![key]))
+        .into_iter()
+        .chain((0..later).map(|_| rejection(key, "transition", EARLIER_REJECTED)))
         .collect())
 }
 
@@ -401,7 +408,7 @@ mod tests {
     use super::*;
     use crate::{
         api,
-        db::sync_state,
+        db::{sync_state, timer},
         models::{RunningTimer, StatusCategory, SyncStatus, Transition, User},
         start_syncing_without_keychain, start_without_keychain,
         sync::inbound,
@@ -3494,5 +3501,69 @@ mod tests {
         assert_eq!(delivered, keys(&["API-9"]));
         let stored = "Seen on staging\\\nand in production".to_owned();
         assert_eq!(comments_of_api_9(&state).await, [(false, stored)]);
+    }
+
+    #[tokio::test]
+    async fn a_move_first_seen_by_the_re_read_after_a_refusal_takes_its_changes_and_its_old_key_along()
+     {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue_of_ada(&state).await;
+        sqlx::raw_sql(
+            "INSERT INTO worklogs (remote_id, issue_key, time_spent_sec, started_at, sync_status)
+                 VALUES ('40001', 'WEB-1', 600, '2026-03-29T08:15:00.000Z', 'synced');
+                 INSERT INTO sync_queue (entity_type, issue_key, operation, payload, status)
+                 VALUES ('comment', 'WEB-1', 'create', '{}', 'failed');
+                 INSERT INTO running_timer (id, issue_key, started_at)
+                 VALUES (1, 'WEB-1', 1774771200);",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        api::transition_issue(&state, &"WEB-1".into(), &start(), &json!({}))
+            .await
+            .unwrap();
+        transition("WEB-1")
+            .respond_with(ResponseTemplate::new(400).set_body_string("moved"))
+            .mount(&server)
+            .await;
+        // Jira answers the old key with the issue under its new one
+        let mut moved = web_1_of_ada();
+        moved["key"] = json!("API-9");
+        moved["fields"]["project"]["key"] = json!("API");
+        moved["fields"]["updated"] = json!("2026-03-30T10:00:00.000+0100");
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/WEB-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(moved))
+            .mount(&server)
+            .await;
+        received(&mut events);
+
+        process_queue(&state, &config(&server.uri()), &mut Vec::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issues::key_of(&state.pool, "10001").await.unwrap(),
+            Some("API-9".into())
+        );
+        let worklogs: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM worklogs")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(worklogs, ["API-9"]);
+        let running = timer::get(&state.pool).await.unwrap().unwrap();
+        assert_eq!(running.issue_key, "API-9".into());
+        let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, ["API-9"]);
+        // The key a view may be open under, and the one it follows to
+        let events = received(&mut events);
+        assert_eq!(events[0], r#"IssuesUpdated([IssueKey("WEB-1")])"#);
+        assert!(events[1].starts_with("ChangeRejected"), "{events:?}");
+        assert_eq!(events[2], r#"IssuesUpdated([IssueKey("API-9")])"#);
     }
 }
