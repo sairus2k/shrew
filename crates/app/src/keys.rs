@@ -362,12 +362,12 @@ mod tests {
         });
         // With an issue open the selection takes the pane along
         press(cx, &app, &["j"]);
-        in_window(cx, app.window, |window, _| {
-            assert_eq!(opened(window).as_deref(), Some("WEB-1"))
+        wait_until(cx, app.window, |window| {
+            opened(window).as_deref() == Some("WEB-1")
         });
         press(cx, &app, &["k"]);
-        in_window(cx, app.window, |window, _| {
-            assert_eq!(opened(window).as_deref(), Some("WEB-2"))
+        wait_until(cx, app.window, |window| {
+            opened(window).as_deref() == Some("WEB-2")
         });
 
         press(cx, &app, &["escape"]);

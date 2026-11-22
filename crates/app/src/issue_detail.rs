@@ -1148,6 +1148,28 @@ pub(crate) mod tests {
         });
     }
 
+    #[gpui_kit::test]
+    fn the_open_issue_stays_on_screen_until_the_next_one_is_read(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &[login_bug(), issue(2, "Fix logout")]);
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+
+        in_window(cx, window, |window, cx| window.click("issue-WEB-2", cx));
+        // The answer of the cache waits for the executor, which has not run
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("issue-detail").label(), Some("WEB-1"));
+            assert_eq!(label(window, "detail-summary"), "Fix login");
+        });
+
+        wait_until(cx, window, |window| {
+            window.find("issue-detail").label() == Some("WEB-2")
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "detail-summary"), "Fix logout");
+        });
+    }
+
     /// A mock Jira that finds WEB-1 and has no worklog changes.
     async fn jira_with_web_1() -> MockServer {
         let server = MockServer::start().await;

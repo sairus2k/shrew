@@ -68,6 +68,10 @@ enum Screen {
         list: Entity<IssueList>,
         // The issue the user opened from the list
         detail: Option<Entity<DetailPane>>,
+        // Waits for the cache to answer for an issue opened beside another one.
+        // Its pane replaces the other only then: shown at once it would be
+        // empty for a frame or two, which is a flash between two issues
+        opening: Option<Subscription>,
         status: Entity<SyncStatus>,
         account: Entity<Account>,
         timer: Entity<ActiveTimer>,
@@ -244,6 +248,7 @@ impl Root {
                 Screen::Home {
                     list,
                     detail: None,
+                    opening: None,
                     status: cx.new(SyncStatus::new),
                     account,
                     timer,
@@ -315,13 +320,20 @@ impl Root {
     /// Escape leads back to the list from wherever the focus is, and from the
     /// list it closes the issue.
     fn back(&mut self, _: &Back, window: &mut Window, cx: &mut Context<Self>) {
-        let Screen::Home { list, detail, .. } = &mut self.screen else {
+        let Screen::Home {
+            list,
+            detail,
+            opening,
+            ..
+        } = &mut self.screen
+        else {
             return;
         };
         let focus = list.focus_handle(cx);
         if !focus.is_focused(window) {
             focus.focus(window, cx);
         } else if detail.take().is_some() {
+            *opening = None;
             list.update(cx, |list, cx| list.closed(cx));
             cx.notify();
         }
@@ -374,6 +386,7 @@ impl Root {
         let Screen::Home {
             list,
             detail,
+            opening,
             timer,
             ..
         } = &mut self.screen
@@ -382,14 +395,18 @@ impl Root {
         };
         let issue = cx.new(|cx| IssueModel::new(opened.0.clone(), cx));
         let timer = timer.clone();
-        let pane = cx.new(|cx| DetailPane::new(issue, timer, window, cx));
+        let pane = cx.new(|cx| DetailPane::new(issue.clone(), timer, window, cx));
         let list = list.clone();
         cx.subscribe_in(
             &pane,
             window,
             move |this, _, _: &DetailClosed, window, cx| {
-                if let Screen::Home { detail, .. } = &mut this.screen {
+                if let Screen::Home {
+                    detail, opening, ..
+                } = &mut this.screen
+                {
                     *detail = None;
+                    *opening = None;
                 }
                 list.update(cx, |list, cx| list.closed(cx));
                 this.rest_focus(window, cx);
@@ -397,10 +414,24 @@ impl Root {
             },
         )
         .detach();
-        *detail = Some(pane);
-        // The issue shown until now may have had the focus in its comment
-        self.rest_focus(window, cx);
-        cx.notify();
+        if detail.is_none() {
+            *detail = Some(pane);
+            cx.notify();
+            return;
+        }
+        // The model notifies first when its read of the cache has ended
+        *opening = Some(cx.observe_in(&issue, window, move |this, _, window, cx| {
+            if let Screen::Home {
+                detail, opening, ..
+            } = &mut this.screen
+            {
+                *detail = Some(pane.clone());
+                *opening = None;
+            }
+            // The issue shown until now may have had the focus in its comment
+            this.rest_focus(window, cx);
+            cx.notify();
+        }));
     }
 }
 
