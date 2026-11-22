@@ -47,6 +47,7 @@ mod sync_status;
 mod theme;
 mod timer;
 mod transition;
+mod tray;
 mod worklog;
 
 // Names the data directory: ~/Library/Application Support/<APP_ID>
@@ -205,6 +206,7 @@ impl Root {
                 cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
                     // The next account starts with its own sync errors
                     this.notified_error = None;
+                    tray::forget(cx);
                     this.show(SetupStep::SignIn, window, cx)
                 })
                 .detach();
@@ -217,6 +219,7 @@ impl Root {
                     },
                 )
                 .detach();
+                tray::follow(timer.clone(), cx);
                 let timer_status = cx.new(|cx| TimerStatus::new(timer.clone(), cx));
                 let opening = list.clone();
                 cx.subscribe(
@@ -508,6 +511,14 @@ fn rejection_message(key: &IssueKey, action: &str, reason: &str) -> String {
     format!("{key}: {action} rejected: {reason}")
 }
 
+fn open_main_window(step: SetupStep, cx: &mut App) {
+    open_window(WindowOptions::default(), cx, |window, cx| {
+        cx.new(|cx| Root::new(step, window, cx))
+    })
+    .expect("failed to open window");
+    cx.activate(true);
+}
+
 fn main() -> anyhow::Result<()> {
     // sqlx and reqwest need a tokio runtime. GPUI drives the UI on its own executor,
     // so tokio runs beside it on two worker threads.
@@ -526,6 +537,7 @@ fn main() -> anyhow::Result<()> {
         theme::init(cx);
         menu::init(cx);
         keys::init(cx);
+        tray::init(cx);
 
         let sync = cx.new(|cx| SyncBridge::new(events, cx));
         cx.set_global(Core {
@@ -534,11 +546,8 @@ fn main() -> anyhow::Result<()> {
             sync,
         });
 
-        open_window(WindowOptions::default(), cx, |window, cx| {
-            cx.new(|cx| Root::new(step, window, cx))
-        })
-        .expect("failed to open window");
-        cx.activate(true);
+        tray::install(cx).expect("failed to create the menu bar item");
+        open_main_window(step, cx);
     });
     Ok(())
 }

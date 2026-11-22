@@ -44,6 +44,7 @@ pub(crate) fn launch(
     cx.update(crate::theme::init);
     cx.update(crate::menu::init);
     cx.update(crate::keys::init);
+    cx.update(crate::tray::init);
     let step = init_core(cx, tokio, data_dir);
     // The tokio side is outside GPUI's deterministic scheduler
     cx.executor().allow_parking();

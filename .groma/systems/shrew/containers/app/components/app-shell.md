@@ -43,3 +43,4 @@ At startup it installs the application menu of the macOS menu bar: Hide Shrew, H
 | [crates/app/src/main.rs](../../../../../../crates/app/src/main.rs) | [crates/app/src/new_token.rs](../../../../../../crates/app/src/new_token.rs) | Shows on rejected token | GPUI entity |
 | [crates/app/src/main.rs](../../../../../../crates/app/src/main.rs) | [crates/app/src/settings.rs](../../../../../../crates/app/src/settings.rs) | Opens settings | GPUI entity |
 | [crates/app/src/main.rs](../../../../../../crates/app/src/main.rs) | [crates/app/src/keys.rs](../../../../../../crates/app/src/keys.rs) | Handles shortcut actions | GPUI action |
+| [crates/app/src/main.rs](../../../../../../crates/app/src/main.rs) | [crates/app/src/tray.rs](../../../../../../crates/app/src/tray.rs) | Hands over the timer of the home screen and takes it away on sign-out | function call |

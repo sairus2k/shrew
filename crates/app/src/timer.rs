@@ -7,6 +7,7 @@ use app_core::{
     api,
     models::{IssueKey, RunningTimer},
 };
+use chrono::{Local, TimeZone};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
@@ -124,6 +125,17 @@ impl ActiveTimer {
     /// The issue the timer runs on.
     pub fn issue(&self) -> Option<&IssueKey> {
         self.running.as_ref().map(|timer| &timer.issue_key)
+    }
+
+    /// The timer in one line that stays the same while it runs: "WEB-1 since 14:05".
+    pub fn caption(&self) -> Option<String> {
+        self.running.as_ref().map(|timer| {
+            let started = Local
+                .timestamp_opt(timer.started_at, 0)
+                .single()
+                .map_or_else(String::new, |at| at.format("%H:%M").to_string());
+            format!("{} since {started}", timer.issue_key)
+        })
     }
 
     fn set_running(&mut self, running: Option<RunningTimer>, cx: &mut Context<Self>) {
