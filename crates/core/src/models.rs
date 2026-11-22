@@ -48,6 +48,32 @@ pub struct IssueRow {
     pub sync_status: SyncStatus,
 }
 
+/// Which issues the list shows. A field left `None` does not narrow it, and
+/// the fields that are set must all hold.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssueFilter {
+    pub project: Option<String>,
+    pub assignee: Option<AssigneeFilter>,
+    /// The name of a status. Projects that give a status the same name share it.
+    pub status: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssigneeFilter {
+    Unassigned,
+    /// The account id of the assignee.
+    User(String),
+}
+
+/// The values the cached issues have in the fields the list is filtered by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilterOptions {
+    /// Everyone an issue is assigned to, by name.
+    pub assignees: Vec<User>,
+    /// To do first, done last, by name inside a category.
+    pub statuses: Vec<String>,
+}
+
 /// One issue with everything the detail view shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueDetail {

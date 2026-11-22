@@ -5,13 +5,15 @@ use crate::runtime::{Core, spawn};
 use crate::theme::{status_dot, tabular_digits};
 use app_core::{
     SyncEvent, api,
-    models::{IssueKey, IssueRow, StatusCategory, SyncStatus},
+    models::{
+        AssigneeFilter, FilterOptions, IssueFilter, IssueKey, IssueRow, StatusCategory, SyncStatus,
+    },
 };
 use gpui_kit::component::{
     ActiveTheme, Sizable,
-    button::Button,
+    button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -20,12 +22,118 @@ use std::ops::Range;
 /// Emitted when the user picks an issue to read.
 pub struct IssueOpened(pub IssueKey);
 
+/// Whose issues the list shows, under the name the filter has for them.
+#[derive(Clone)]
+struct Assignee {
+    label: String,
+    filter: AssigneeFilter,
+}
+
+// The cache can hold an account under a name it had before
+impl PartialEq for Assignee {
+    fn eq(&self, other: &Self) -> bool {
+        self.filter == other.filter
+    }
+}
+
+/// What an item of a filter menu does. `None` takes the filter off.
+#[derive(Clone)]
+enum Pick {
+    Project(Option<String>),
+    Assignee(Option<Assignee>),
+    Status(Option<String>),
+    /// Takes every filter off. The search text is not one of them.
+    Clear,
+}
+
+#[derive(Clone)]
+struct Choice {
+    label: String,
+    pick: Pick,
+    chosen: bool,
+}
+
+/// One filter as its button and its menu show it.
+struct Filter {
+    id: &'static str,
+    clear_id: &'static str,
+    name: &'static str,
+    /// What the button says while nothing is chosen.
+    unset: &'static str,
+    value: Option<String>,
+    /// The first one takes the filter off.
+    choices: Vec<Choice>,
+}
+
+/// The menu of a filter: the choice that takes it off, then `values`.
+fn choices<T: Clone + PartialEq>(
+    any: &str,
+    mut values: Vec<T>,
+    chosen: Option<&T>,
+    label: impl Fn(&T) -> String,
+    pick: impl Fn(Option<T>) -> Pick,
+) -> Vec<Choice> {
+    // A sync can take the last issue with the chosen value out of the cache.
+    // The value stays in the menu, so that it is seen to be what is chosen
+    if let Some(chosen) = chosen.filter(|chosen| !values.contains(chosen)) {
+        values.push(chosen.clone());
+    }
+    let any = Choice {
+        label: any.to_owned(),
+        pick: pick(None),
+        chosen: chosen.is_none(),
+    };
+    let values = values.into_iter().map(|value| Choice {
+        label: label(&value),
+        chosen: chosen == Some(&value),
+        pick: pick(Some(value)),
+    });
+    std::iter::once(any).chain(values).collect()
+}
+
+fn menu_items(
+    mut menu: PopupMenu,
+    choices: &[Choice],
+    view: &Entity<IssueList>,
+    window: &mut Window,
+) -> PopupMenu {
+    for choice in choices {
+        let pick = choice.pick.clone();
+        menu = menu.item(
+            PopupMenuItem::new(choice.label.clone())
+                .checked(choice.chosen)
+                .on_click(
+                    window.listener_for(view, move |this, _, _, cx| this.pick(pick.clone(), cx)),
+                ),
+        );
+    }
+    menu
+}
+
+/// The frame of a filter that is set: the accent, as on the open issue's row.
+fn tinted(cx: &App) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().primary)
+        .bg(cx.theme().list_active)
+}
+
 pub struct IssueList {
     query: Entity<InputState>,
     // The watched projects; the filter is offered when there are several
     projects: Vec<String>,
-    // `None` shows every watched project
+    // What the cached issues can be filtered by
+    options: FilterOptions,
+    // The account id of the signed-in user
+    me: Option<String>,
+    // The filters; `None` does not narrow the list
     project: Option<String>,
+    assignee: Option<Assignee>,
+    status: Option<String>,
     issues: Vec<IssueRow>,
     // The issue shown beside the list
     opened: Option<IssueKey>,
@@ -66,6 +174,7 @@ impl IssueList {
         cx.subscribe(&sync, |this, _, event: &SyncEvent, cx| {
             if let SyncEvent::IssuesUpdated(_) = event {
                 this.reload(cx);
+                this.load_options(cx);
             }
         })
         .detach();
@@ -73,7 +182,11 @@ impl IssueList {
         let mut this = Self {
             query,
             projects: Vec::new(),
+            options: FilterOptions::default(),
+            me: None,
             project: None,
+            assignee: None,
+            status: None,
             issues: Vec::new(),
             opened: None,
             selected: None,
@@ -84,7 +197,27 @@ impl IssueList {
         };
         this.reload(cx);
         this.load_projects(cx);
+        this.load_options(cx);
         this
+    }
+
+    fn load_options(&mut self, cx: &mut Context<Self>) {
+        let load = spawn(cx, |state| async move {
+            let options = api::filter_options(&state).await?;
+            let me = api::account(&state).await.map(|account| account.account_id);
+            anyhow::Ok((options, me))
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok((options, me)) = load.await {
+                this.update(cx, |this, cx| {
+                    this.options = options;
+                    this.me = me;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn load_projects(&mut self, cx: &mut Context<Self>) {
@@ -103,10 +236,92 @@ impl IssueList {
         .detach();
     }
 
-    fn choose_project(&mut self, project: Option<String>, cx: &mut Context<Self>) {
-        self.project = project;
+    fn pick(&mut self, pick: Pick, cx: &mut Context<Self>) {
+        match pick {
+            Pick::Project(project) => self.project = project,
+            Pick::Assignee(assignee) => self.assignee = assignee,
+            Pick::Status(status) => self.status = status,
+            Pick::Clear => {
+                self.project = None;
+                self.assignee = None;
+                self.status = None;
+            }
+        }
         self.reload(cx);
         cx.notify();
+    }
+
+    /// The filters the user can set, in the order of their buttons.
+    fn filters(&self) -> Vec<Filter> {
+        let mut filters = Vec::new();
+        if self.projects.len() > 1 {
+            filters.push(Filter {
+                id: "project-filter",
+                clear_id: "project-filter-clear",
+                name: "Project",
+                unset: "All projects",
+                value: self.project.clone(),
+                choices: choices(
+                    "All projects",
+                    self.projects.clone(),
+                    self.project.as_ref(),
+                    String::clone,
+                    Pick::Project,
+                ),
+            });
+        }
+
+        // The signed-in user comes first and not again among the others
+        let me = self.me.iter().map(|me| Assignee {
+            label: "Me".to_owned(),
+            filter: AssigneeFilter::User(me.clone()),
+        });
+        let nobody = Assignee {
+            label: "Unassigned".to_owned(),
+            filter: AssigneeFilter::Unassigned,
+        };
+        let others = self.options.assignees.iter();
+        let others = others
+            .filter(|user| Some(&user.account_id) != self.me.as_ref())
+            .map(|user| Assignee {
+                label: user.display_name.clone(),
+                filter: AssigneeFilter::User(user.account_id.clone()),
+            });
+        filters.push(Filter {
+            id: "assignee-filter",
+            clear_id: "assignee-filter-clear",
+            name: "Assignee",
+            unset: "Assignee",
+            value: self.assignee.as_ref().map(|chosen| chosen.label.clone()),
+            choices: choices(
+                "Any assignee",
+                me.chain([nobody]).chain(others).collect(),
+                self.assignee.as_ref(),
+                |assignee| assignee.label.clone(),
+                Pick::Assignee,
+            ),
+        });
+        filters.push(Filter {
+            id: "status-filter",
+            clear_id: "status-filter-clear",
+            name: "Status",
+            unset: "Status",
+            value: self.status.clone(),
+            choices: choices(
+                "Any status",
+                self.options.statuses.clone(),
+                self.status.as_ref(),
+                String::clone,
+                Pick::Status,
+            ),
+        });
+        filters
+    }
+
+    /// The text the list is searched for. One character finds too much to be a search.
+    fn searched(&self, cx: &App) -> Option<String> {
+        let query = self.query.read(cx).value().trim().to_owned();
+        (query.chars().count() >= 2).then_some(query)
     }
 
     /// Moves the selection `by` rows. With nothing selected it starts at the
@@ -161,13 +376,16 @@ impl IssueList {
 
     // No debounce: an FTS5 query takes a few milliseconds and there is no IPC hop
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let query = self.query.read(cx).value().trim().to_owned();
-        let project = self.project.clone();
+        let query = self.searched(cx);
+        let filter = IssueFilter {
+            project: self.project.clone(),
+            assignee: self.assignee.as_ref().map(|chosen| chosen.filter.clone()),
+            status: self.status.clone(),
+        };
         let load = spawn(cx, move |state| async move {
-            if query.chars().count() < 2 {
-                api::list_issues(&state, project.as_deref()).await
-            } else {
-                api::search_issues(&state, &query, project.as_deref()).await
+            match query {
+                None => api::list_issues(&state, &filter).await,
+                Some(query) => api::search_issues(&state, &query, &filter).await,
             }
         });
         self.show(load, cx);
@@ -317,53 +535,188 @@ fn column_names(cx: &App) -> impl IntoElement {
         .child(div().w(px(ASSIGNEE_WIDTH)).flex_none().child("ASSIGNEE"))
 }
 
+impl IssueList {
+    /// A filter in the row of the search. Set, it shows its value and a cross
+    /// that takes it off.
+    fn filter_button(&self, filter: Filter, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let Filter {
+            id,
+            clear_id,
+            name,
+            unset,
+            value,
+            choices,
+        } = filter;
+        let label = match &value {
+            Some(value) => format!("{name}: {value}"),
+            None => unset.to_owned(),
+        };
+        let button = Button::new(id)
+            .small()
+            .label(label)
+            // The one filter with a key
+            .when(id == "project-filter", |button| {
+                button
+                    .track_focus(&self.filter_focus)
+                    .children(keys::hint(&FilterByProject, cx))
+            });
+        let clear = choices[0].pick.clone();
+        let menu = move |menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+            let menu = menu.scrollable(true).max_h(px(320.));
+            menu_items(menu, &choices, &view, window)
+        };
+        if value.is_none() {
+            return button
+                .outline()
+                .dropdown_caret(true)
+                .dropdown_menu(menu)
+                .into_any_element();
+        }
+        tinted(cx)
+            .child(button.ghost().dropdown_menu(menu))
+            .child(
+                Button::new(clear_id)
+                    .ghost()
+                    .xsmall()
+                    .label("×")
+                    .accessibility_label(format!("Clear the filter {name}"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.pick(clear.clone(), cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Every filter in the menu of one button, for a list too narrow for
+    /// their own buttons.
+    fn filters_button(
+        &self,
+        filters: Vec<Filter>,
+        choosable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.entity();
+        let set = filters
+            .iter()
+            .filter(|filter| filter.value.is_some())
+            .count();
+        let label = match set {
+            0 => "Filters".to_owned(),
+            set => format!("Filters · {set}"),
+        };
+        let button = Button::new("filters")
+            .track_focus(&self.filter_focus)
+            .small()
+            .label(label)
+            .dropdown_caret(true)
+            .when(choosable, |button| {
+                button.children(keys::hint(&FilterByProject, cx))
+            });
+        let menu = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
+            menu = menu.scrollable(true).max_h(px(420.));
+            for filter in &filters {
+                menu = menu.label(filter.name);
+                menu = menu_items(menu, &filter.choices, &view, window).separator();
+            }
+            menu.item(
+                PopupMenuItem::new("Clear filters")
+                    .disabled(set == 0)
+                    .on_click(
+                        window.listener_for(&view, |this, _, _, cx| this.pick(Pick::Clear, cx)),
+                    ),
+            )
+        };
+        if set == 0 {
+            return button.outline().dropdown_menu(menu).into_any_element();
+        }
+        tinted(cx)
+            .child(button.ghost().dropdown_menu(menu))
+            .into_any_element()
+    }
+
+    /// How many issues the list holds, and the way back to all of them.
+    fn count(&self, filtered: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let found = self.issues.len();
+        // A search returns the best matches only, so there can be more
+        let more = self.searched(cx).is_some() && found == api::SEARCH_LIMIT;
+        let text = format!(
+            "{found}{} {}",
+            if more { "+" } else { "" },
+            if found == 1 { "issue" } else { "issues" }
+        );
+        div()
+            .flex_none()
+            .h(px(24.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                div()
+                    .id("issue-count")
+                    .test_support()
+                    .aria_label(text.clone())
+                    .font_features(tabular_digits())
+                    .child(text),
+            )
+            .when(filtered, |line| {
+                line.child(
+                    Button::new("clear-filters")
+                        .link()
+                        .xsmall()
+                        .label("Clear filters")
+                        .on_click(cx.listener(|this, _, _, cx| this.pick(Pick::Clear, cx))),
+                )
+            })
+    }
+}
+
 impl Render for IssueList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity();
-        let projects = self.projects.clone();
-        let choosable = projects.len() > 1;
+        let filters = self.filters();
+        let filtered = filters.iter().any(|filter| filter.value.is_some());
+        // Beside an open issue the list is too narrow for the buttons of the
+        // filters, for the count and for the names of the columns
+        let narrow = self.opened.is_some();
+        // `p` opens the menu the project is chosen in: its own, or the one of
+        // all the filters
+        let choosable = self.projects.len() > 1;
+        let bar = div().p_3().flex().items_center().gap_2().child(
+            div().flex_1().min_w_0().child(
+                Input::new(&self.query)
+                    .id("search")
+                    .aria_label("Search issues")
+                    .when_some(keys::hint(&FocusSearch, cx), Input::suffix),
+            ),
+        );
+        let bar = if narrow {
+            bar.child(self.filters_button(filters, choosable, cx))
+        } else {
+            let buttons: Vec<_> = filters
+                .into_iter()
+                .map(|filter| self.filter_button(filter, cx))
+                .collect();
+            bar.children(buttons)
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(
+            .child(bar)
+            .children((!narrow).then(|| self.count(filtered, cx)))
+            .children((!narrow).then(|| column_names(cx)))
+            // Without this an empty list under a filter looks like an empty cache
+            .children((filtered && self.issues.is_empty()).then(|| {
                 div()
-                    .p_3()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&self.query)
-                                .id("search")
-                                .aria_label("Search issues")
-                                .when_some(keys::hint(&FocusSearch, cx), Input::suffix),
-                        ),
-                    )
-                    .when(choosable, |bar| {
-                        bar.child(
-                            Button::new("project-filter")
-                                .track_focus(&self.filter_focus)
-                                .small()
-                                .label(self.project.clone().unwrap_or("All projects".to_owned()))
-                                .children(keys::hint(&FilterByProject, cx))
-                                .dropdown_menu(move |mut menu, window, _| {
-                                    let choices = std::iter::once(None)
-                                        .chain(projects.iter().cloned().map(Some));
-                                    for choice in choices {
-                                        let label =
-                                            choice.clone().unwrap_or("All projects".to_owned());
-                                        menu = menu.item(PopupMenuItem::new(label).on_click(
-                                            window.listener_for(&view, move |this, _, _, cx| {
-                                                this.choose_project(choice.clone(), cx)
-                                            }),
-                                        ));
-                                    }
-                                    menu
-                                }),
-                        )
-                    }),
-            )
-            .children(self.opened.is_none().then(|| column_names(cx)))
+                    .id("no-matches")
+                    .test_support()
+                    .aria_label("No issues match the filters")
+                    .flex_none()
+                    .p_4()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No issues match the filters")
+            }))
             .child(
                 // Only the rows in view are built, so the cost of a frame does
                 // not grow with the number of issues
@@ -640,14 +993,359 @@ pub(crate) mod tests {
 
     /// Opens the project menu and clicks the item `name`.
     pub(crate) fn choose_project(window: &mut Window, cx: &mut gpui_kit::App, name: &str) {
-        window.click("project-filter", cx);
+        choose(window, cx, "project-filter", name)
+    }
+
+    /// Opens the menu of `button` and clicks the item `name`.
+    fn choose(window: &mut Window, cx: &mut gpui_kit::App, button: &'static str, name: &str) {
+        window.click(button, cx);
         window.render_frame(cx);
         let items = window.find_all_by_role(Role::MenuItem);
         let item = items.iter().find(|item| item.label() == Some(name));
-        let middle = item.expect("no such project").bounds().center();
+        let labels: Vec<_> = items.iter().map(|item| item.label()).collect();
+        let item = item.unwrap_or_else(|| panic!("no item {name} among {labels:?}"));
+        let middle = item.bounds().center();
         window.pointer_down(middle, MouseButton::Left, cx);
         window.pointer_up(middle, MouseButton::Left, cx);
         window.render_frame(cx);
+    }
+
+    /// The items of the menu of `button`. Leaves the menu closed.
+    fn menu_of(window: &mut Window, cx: &mut gpui_kit::App, button: &'static str) -> Vec<String> {
+        window.click(button, cx);
+        window.render_frame(cx);
+        let items = window.find_all_by_role(Role::MenuItem);
+        // A separator is an item without a label
+        let labels = items.iter().filter_map(|item| item.label());
+        let labels = labels.map(str::to_owned).collect();
+        window.press("escape", cx);
+        window.render_frame(cx);
+        labels
+    }
+
+    /// Waits until the menu of `button` holds `expected`: the core fills the
+    /// menus of the filters after the window is open, and again after a sync.
+    #[track_caller]
+    fn wait_for_menu(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        button: &'static str,
+        expected: &[&str],
+    ) {
+        let started = Instant::now();
+        loop {
+            cx.run_until_parked();
+            let menu = in_window(cx, window, |window, cx| menu_of(window, cx, button));
+            if menu == expected {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the menu of {button} holds {menu:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn label(window: &Window, id: &'static str) -> String {
+        window.find(id).label().unwrap().to_owned()
+    }
+
+    const ADA: (&str, &str) = ("5b10a", "Ada Lovelace");
+    const GRACE: (&str, &str) = ("7c20b", "Grace Hopper");
+
+    fn in_status(mut issue: Value, name: &str, category: &str) -> Value {
+        issue["fields"]["status"] = json!({ "name": name, "statusCategory": { "key": category } });
+        issue
+    }
+
+    fn assigned_to(mut issue: Value, (id, name): (&str, &str)) -> Value {
+        issue["fields"]["assignee"] = json!({ "accountId": id, "displayName": name });
+        issue
+    }
+
+    const MINE: &str = "WEB-1: Fix login, In Progress, Ada Lovelace";
+    const GRACES: &str = "WEB-2: Fix logout, To Do, Grace Hopper";
+    const NOBODYS: &str = "WEB-3: Broken checkout, In Progress, Unassigned";
+    const API_MINE: &str = "API-101: Login endpoint, In Progress, Ada Lovelace";
+
+    /// Two projects whose issues differ in assignee and status. The app is
+    /// signed in as Ada.
+    fn team_work() -> Vec<Value> {
+        let in_progress = |issue| in_status(issue, "In Progress", "indeterminate");
+        vec![
+            assigned_to(in_progress(issue(1, "Fix login")), ADA),
+            assigned_to(issue(2, "Fix logout"), GRACE),
+            in_progress(issue(3, "Broken checkout")),
+            assigned_to(in_progress(api_issue(101, "Login endpoint")), ADA),
+        ]
+    }
+
+    #[gpui_kit::test]
+    fn the_assignee_filter_offers_me_nobody_and_everyone_in_the_cache(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "assignee-filter",
+            &["Any assignee", "Me", "Unassigned", "Grace Hopper"],
+        );
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "assignee-filter"), "Assignee");
+            assert_eq!(label(window, "issue-count"), "4 issues");
+            assert!(window.try_find("assignee-filter-clear").is_none());
+            assert!(window.try_find("clear-filters").is_none());
+        });
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Me")
+        });
+        wait_for_rows(cx, window, &[API_MINE, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "assignee-filter"), "Assignee: Me");
+            assert_eq!(label(window, "issue-count"), "2 issues");
+        });
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Unassigned")
+        });
+        wait_for_rows(cx, window, &[NOBODYS]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "issue-count"), "1 issue");
+        });
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Grace Hopper")
+        });
+        wait_for_rows(cx, window, &[GRACES]);
+
+        in_window(cx, window, |window, cx| {
+            window.click("assignee-filter-clear", cx)
+        });
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "assignee-filter"), "Assignee");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_status_filter_offers_the_statuses_in_the_cache(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "In Progress"],
+        );
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "status-filter", "In Progress")
+        });
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status: In Progress");
+        });
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "status-filter", "Any status")
+        });
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_filters_combine_with_the_project_and_the_search(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "In Progress"],
+        );
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "status-filter", "In Progress");
+            choose(window, cx, "assignee-filter", "Me");
+        });
+        wait_for_rows(cx, window, &[API_MINE, MINE]);
+        in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
+        wait_for_rows(cx, window, &[MINE]);
+
+        // The search looks among the issues the filters let through
+        in_window(cx, window, |window, cx| {
+            choose_project(window, cx, "All projects");
+            choose(window, cx, "status-filter", "Any status");
+            window.click("search", cx);
+            window.input("fix", cx);
+        });
+        wait_for_rows(cx, window, &[MINE]);
+
+        // One action takes off every filter, and leaves the search
+        in_window(cx, window, |window, cx| {
+            choose_project(window, cx, "WEB");
+            window.click("clear-filters", cx);
+        });
+        wait_until(cx, window, |window| {
+            let mut found = rows(window);
+            found.sort();
+            found == [MINE, GRACES]
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "project-filter"), "All projects");
+            assert_eq!(label(window, "assignee-filter"), "Assignee");
+            assert_eq!(label(window, "status-filter"), "Status");
+            assert!(window.try_find("clear-filters").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_filter_whose_value_left_the_cache_says_why_the_list_is_empty(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "In Progress"],
+        );
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "status-filter", "To Do")
+        });
+        wait_for_rows(cx, window, &[GRACES]);
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("no-matches").is_none());
+        });
+
+        // The only issue in To Do is done now
+        let mut done = in_status(assigned_to(issue(2, "Fix logout"), GRACE), "Done", "done");
+        done["fields"]["updated"] = json!("2026-03-30T00:00:00.000+0000");
+        sync_brings(cx, &tokio, done);
+
+        wait_for_rows(cx, window, &[]);
+        // The chosen status is still in its menu, after the ones the cache has
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "In Progress", "Done", "To Do"],
+        );
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "no-matches"), "No issues match the filters");
+            assert_eq!(label(window, "status-filter"), "Status: To Do");
+            assert_eq!(label(window, "issue-count"), "0 issues");
+            window.click("clear-filters", cx);
+        });
+        wait_until(cx, window, |window| rows(window).len() == 4);
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("no-matches").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_count_of_a_search_that_was_cut_short_says_there_are_more(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let issues: Vec<_> = (1..=60)
+            .map(|id| issue(id, &format!("Task {id}")))
+            .collect();
+        let data_dir = synced(&tokio, &issues);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            label(window, "issue-count") == "60 issues"
+        });
+
+        in_window(cx, window, |window, cx| {
+            window.click("search", cx);
+            window.input("task", cx);
+        });
+
+        wait_until(cx, window, |window| {
+            label(window, "issue-count") == "50+ issues"
+        });
+    }
+
+    #[gpui_kit::test]
+    fn beside_an_open_issue_the_filters_are_in_one_menu(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "In Progress"],
+        );
+        in_window(cx, window, |window, cx| {
+            assert!(window.try_find("filters").is_none());
+            choose(window, cx, "status-filter", "In Progress");
+        });
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, MINE]);
+
+        in_window(cx, window, |window, cx| window.click("issue-WEB-3", cx));
+
+        // The filter set in the wide list is counted
+        in_window(cx, window, |window, cx| {
+            for gone in [
+                "project-filter",
+                "assignee-filter",
+                "status-filter",
+                "issue-count",
+            ] {
+                assert!(window.try_find(gone).is_none(), "{gone} is on screen");
+            }
+            assert_eq!(label(window, "filters"), "Filters · 1");
+            assert_eq!(
+                menu_of(window, cx, "filters"),
+                [
+                    "Project",
+                    "All projects",
+                    "WEB",
+                    "API",
+                    "Assignee",
+                    "Any assignee",
+                    "Me",
+                    "Unassigned",
+                    "Grace Hopper",
+                    "Status",
+                    "Any status",
+                    "To Do",
+                    "In Progress",
+                    "Clear filters",
+                ]
+            );
+        });
+        in_window(cx, window, |window, cx| choose(window, cx, "filters", "Me"));
+        wait_for_rows(cx, window, &[API_MINE, MINE]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "filters"), "Filters · 2");
+            choose(window, cx, "filters", "Any status");
+        });
+        // The menu that has just closed opens again in the next frame
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "filters", "WEB")
+        });
+        wait_for_rows(cx, window, &[MINE]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "filters"), "Filters · 2");
+            choose(window, cx, "filters", "Clear filters");
+        });
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "filters"), "Filters");
+        });
     }
 
     #[gpui_kit::test]
@@ -663,7 +1361,7 @@ pub(crate) mod tests {
         in_window(cx, window, |window, cx| choose_project(window, cx, "WEB"));
         wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
         in_window(cx, window, |window, _| {
-            assert_eq!(window.find("project-filter").label(), Some("WEB"));
+            assert_eq!(window.find("project-filter").label(), Some("Project: WEB"));
         });
 
         in_window(cx, window, |window, cx| choose_project(window, cx, "API"));
@@ -689,7 +1387,7 @@ pub(crate) mod tests {
 
         wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
         in_window(cx, window, |window, _| {
-            assert_eq!(window.find("project-filter").label(), Some("WEB"));
+            assert_eq!(window.find("project-filter").label(), Some("Project: WEB"));
         });
     }
 

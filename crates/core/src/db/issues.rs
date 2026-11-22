@@ -2,7 +2,8 @@ use crate::{
     adf,
     db::worklogs,
     models::{
-        Comment, IssueDetail, IssueKey, IssueRow, RejectedComment, StatusCategory, SyncStatus, User,
+        AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
+        RejectedComment, StatusCategory, SyncStatus, User,
     },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -404,11 +405,19 @@ pub(crate) async fn delete(executor: impl sqlx::SqliteExecutor<'_>, id: &str) ->
     Ok(())
 }
 
-/// Every cached issue, the one Jira changed last first.
-pub(crate) async fn list(
-    pool: &SqlitePool,
-    project_filter: Option<&str>,
-) -> sqlx::Result<Vec<IssueRow>> {
+// What the two queries below bind for `IssueFilter::assignee`: whether only
+// unassigned issues pass, and the account id that has to match
+fn assignee_binds(filter: &IssueFilter) -> (bool, Option<&str>) {
+    match &filter.assignee {
+        None => (false, None),
+        Some(AssigneeFilter::Unassigned) => (true, None),
+        Some(AssigneeFilter::User(id)) => (false, Some(id)),
+    }
+}
+
+/// The cached issues that pass `filter`, the one Jira changed last first.
+pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Result<Vec<IssueRow>> {
+    let (unassigned, assignee_id) = assignee_binds(filter);
     sqlx::query_as!(
         IssueRow,
         r#"
@@ -417,28 +426,38 @@ pub(crate) async fn list(
                assignee_name, project_key,
                sync_status AS "sync_status: SyncStatus"
         FROM issues
-        WHERE ? IS NULL OR project_key = ?
+        WHERE (? IS NULL OR project_key = ?)
+          AND (? IS NULL OR status = ?)
+          AND (NOT ? OR assignee_id IS NULL)
+          AND (? IS NULL OR assignee_id = ?)
         -- Both columns come from idx_issues_updated, so nothing is sorted
         ORDER BY remote_updated_at DESC, rowid DESC
         "#,
-        project_filter,
-        project_filter
+        filter.project,
+        filter.project,
+        filter.status,
+        filter.status,
+        unassigned,
+        assignee_id,
+        assignee_id
     )
     .fetch_all(pool)
     .await
 }
 
-/// Full-text search over key, summary and description, best match first.
-/// Every word of `query` must match, as a whole word, a stem or a prefix.
+/// Full-text search over key, summary and description among the issues that
+/// pass `filter`, best match first. Every word of `query` must match, as a
+/// whole word, a stem or a prefix.
 pub(crate) async fn search(
     pool: &SqlitePool,
     query: &str,
-    project_filter: Option<&str>,
+    filter: &IssueFilter,
     limit: i64,
 ) -> sqlx::Result<Vec<IssueRow>> {
     let Some(fts_query) = match_expression(query) else {
         return Ok(Vec::new());
     };
+    let (unassigned, assignee_id) = assignee_binds(filter);
 
     sqlx::query_as!(
         IssueRow,
@@ -451,16 +470,56 @@ pub(crate) async fn search(
         JOIN issues_fts ON i.rowid = issues_fts.rowid
         WHERE issues_fts MATCH ?
           AND (? IS NULL OR i.project_key = ?)
+          AND (? IS NULL OR i.status = ?)
+          AND (NOT ? OR i.assignee_id IS NULL)
+          AND (? IS NULL OR i.assignee_id = ?)
         ORDER BY issues_fts.rank
         LIMIT ?
         "#,
         fts_query,
-        project_filter,
-        project_filter,
+        filter.project,
+        filter.project,
+        filter.status,
+        filter.status,
+        unassigned,
+        assignee_id,
+        assignee_id,
         limit
     )
     .fetch_all(pool)
     .await
+}
+
+/// What the cached issues can be filtered by.
+pub(crate) async fn filter_options(pool: &SqlitePool) -> sqlx::Result<FilterOptions> {
+    // An account whose name changed has both names in the cache until every
+    // issue of it has been synced again
+    let assignees: Vec<(String, String)> = sqlx::query_as(
+        "SELECT assignee_id, COALESCE(MAX(assignee_name), '') AS name FROM issues
+         WHERE assignee_id IS NOT NULL
+         GROUP BY assignee_id
+         ORDER BY name COLLATE NOCASE",
+    )
+    .fetch_all(pool)
+    .await?;
+    let statuses = sqlx::query_scalar(
+        "SELECT status FROM issues
+         GROUP BY status
+         ORDER BY MIN(CASE status_category WHEN 'todo' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END),
+                  status COLLATE NOCASE",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(FilterOptions {
+        assignees: assignees
+            .into_iter()
+            .map(|(account_id, display_name)| User {
+                account_id,
+                display_name,
+            })
+            .collect(),
+        statuses,
+    })
 }
 
 // User input is not FTS5 syntax. Each word becomes a quoted string, so `"`, `*`,
@@ -509,8 +568,131 @@ mod tests {
     }
 
     async fn found(pool: &SqlitePool, query: &str, project: Option<&str>) -> Vec<String> {
-        let rows = search(pool, query, project, 10).await.unwrap();
+        let filter = IssueFilter {
+            project: project.map(str::to_owned),
+            ..Default::default()
+        };
+        let rows = search(pool, query, &filter, 10).await.unwrap();
         rows.iter().map(|row| row.key.to_string()).collect()
+    }
+
+    /// PROJ-1 of Ada in progress, PROJ-2 of Ada done, PROJ-3 of nobody in
+    /// progress, OTHER-1 of Grace in progress. All are about the login.
+    async fn seed_assigned(pool: &SqlitePool) {
+        let issues = [
+            ("PROJ-1", Some(("5b10a", "Ada Lovelace")), "In Progress"),
+            ("PROJ-2", Some(("5b10a", "Ada Lovelace")), "Done"),
+            ("PROJ-3", None, "In Progress"),
+            ("OTHER-1", Some(("7c20b", "Grace Hopper")), "In Progress"),
+        ];
+        for (n, (key, assignee, status)) in issues.into_iter().enumerate() {
+            let record = IssueRecord {
+                status: status.to_owned(),
+                status_category: match status {
+                    "Done" => StatusCategory::Done,
+                    _ => StatusCategory::InProgress,
+                },
+                assignee_id: assignee.map(|(id, _)| id.to_owned()),
+                assignee_name: assignee.map(|(_, name)| name.to_owned()),
+                ..issue(&format!("id-{n}"), key, T1, "Login fails")
+            };
+            upsert(pool, &record).await.unwrap();
+        }
+    }
+
+    fn of(id: &str) -> Option<AssigneeFilter> {
+        Some(AssigneeFilter::User(id.to_owned()))
+    }
+
+    /// The keys `list` and `search` return under `filter`, sorted. Both must agree.
+    async fn passing(pool: &SqlitePool, filter: IssueFilter) -> Vec<String> {
+        let keys = |rows: Vec<IssueRow>| {
+            let mut keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
+            keys.sort();
+            keys
+        };
+        let listed = keys(list(pool, &filter).await.unwrap());
+        let found = keys(search(pool, "login", &filter, 10).await.unwrap());
+        assert_eq!(listed, found);
+        listed
+    }
+
+    #[sqlx::test]
+    async fn the_assignee_narrows_the_list_and_the_search(pool: SqlitePool) {
+        seed_assigned(&pool).await;
+
+        let ada = IssueFilter {
+            assignee: of("5b10a"),
+            ..Default::default()
+        };
+        assert_eq!(passing(&pool, ada).await, ["PROJ-1", "PROJ-2"]);
+        let nobody = IssueFilter {
+            assignee: Some(AssigneeFilter::Unassigned),
+            ..Default::default()
+        };
+        assert_eq!(passing(&pool, nobody).await, ["PROJ-3"]);
+        let stranger = IssueFilter {
+            assignee: of("gone"),
+            ..Default::default()
+        };
+        assert!(passing(&pool, stranger).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn the_status_narrows_the_list_and_the_search(pool: SqlitePool) {
+        seed_assigned(&pool).await;
+
+        let in_progress = IssueFilter {
+            status: Some("In Progress".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            passing(&pool, in_progress).await,
+            ["OTHER-1", "PROJ-1", "PROJ-3"]
+        );
+    }
+
+    #[sqlx::test]
+    async fn the_filters_must_all_hold(pool: SqlitePool) {
+        seed_assigned(&pool).await;
+
+        let filter = IssueFilter {
+            project: Some("PROJ".to_owned()),
+            assignee: of("5b10a"),
+            status: Some("In Progress".to_owned()),
+        };
+        assert_eq!(passing(&pool, filter).await, ["PROJ-1"]);
+        let filter = IssueFilter {
+            project: Some("OTHER".to_owned()),
+            assignee: of("5b10a"),
+            status: None,
+        };
+        assert!(passing(&pool, filter).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn the_filter_options_are_what_the_cache_holds(pool: SqlitePool) {
+        assert_eq!(
+            filter_options(&pool).await.unwrap(),
+            FilterOptions::default()
+        );
+        seed_assigned(&pool).await;
+        upsert(&pool, &issue("9", "PROJ-9", T1, "In the backlog"))
+            .await
+            .unwrap();
+
+        let options = filter_options(&pool).await.unwrap();
+
+        let names: Vec<_> = options
+            .assignees
+            .iter()
+            .map(|user| (user.account_id.as_str(), user.display_name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [("5b10a", "Ada Lovelace"), ("7c20b", "Grace Hopper")]
+        );
+        assert_eq!(options.statuses, ["To Do", "In Progress", "Done"]);
     }
 
     #[sqlx::test]
@@ -671,7 +853,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = list(&pool, None).await.unwrap();
+        let rows = list(&pool, &IssueFilter::default()).await.unwrap();
         let keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
         assert_eq!(keys, ["PROJ-2", "PROJ-3", "PROJ-1"]);
     }
@@ -688,7 +870,11 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = list(&pool, Some("PROJ")).await.unwrap();
+        let filter = IssueFilter {
+            project: Some("PROJ".to_owned()),
+            ..Default::default()
+        };
+        let rows = list(&pool, &filter).await.unwrap();
         let keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
         assert_eq!(keys, ["PROJ-2", "PROJ-1"]);
     }
@@ -905,7 +1091,7 @@ mod tests {
             "",
             "   ",
         ] {
-            search(&pool, query, None, 10)
+            search(&pool, query, &IssueFilter::default(), 10)
                 .await
                 .unwrap_or_else(|err| panic!("query {query:?} failed: {err}"));
         }

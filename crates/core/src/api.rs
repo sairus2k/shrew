@@ -3,8 +3,8 @@
 use crate::{
     AppState, SyncEvent, auth, db,
     models::{
-        Account, IssueDetail, IssueKey, IssueRow, Project, RunningTimer, SetupStep, Transition,
-        User, WorklogSettings, WorklogTarget,
+        Account, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow, Project,
+        RunningTimer, SetupStep, Transition, User, WorklogSettings, WorklogTarget,
     },
     sync::{
         assignable, inbound,
@@ -337,10 +337,16 @@ pub async fn watched_projects(state: &AppState) -> anyhow::Result<Vec<String>> {
     Ok(db::sync_state::watched(&state.pool).await?)
 }
 
-/// Every issue in the local cache, or only those of `project`, the one Jira
-/// changed last first.
-pub async fn list_issues(state: &AppState, project: Option<&str>) -> anyhow::Result<Vec<IssueRow>> {
-    Ok(db::issues::list(&state.pool, project).await?)
+/// The issues in the local cache that pass `filter`, the one Jira changed last
+/// first.
+pub async fn list_issues(state: &AppState, filter: &IssueFilter) -> anyhow::Result<Vec<IssueRow>> {
+    Ok(db::issues::list(&state.pool, filter).await?)
+}
+
+/// The assignees and the statuses of the issues in the local cache: what the
+/// list can be filtered by.
+pub async fn filter_options(state: &AppState) -> anyhow::Result<FilterOptions> {
+    Ok(db::issues::filter_options(&state.pool).await?)
 }
 
 /// One issue from the local cache, with its description and comments as Markdown.
@@ -566,14 +572,18 @@ pub async fn discard_worklog(state: &AppState, entry_id: i64) -> anyhow::Result<
     Ok(())
 }
 
-/// The 50 best matches of `query` in the local cache, best first. Every word
-/// must match a key, a summary or a description, as a word, a stem or a prefix.
+/// How many issues `search_issues` returns at most.
+pub const SEARCH_LIMIT: usize = 50;
+
+/// The `SEARCH_LIMIT` best matches of `query` among the issues in the local
+/// cache that pass `filter`, best first. Every word must match a key, a summary
+/// or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
     state: &AppState,
     query: &str,
-    project: Option<&str>,
+    filter: &IssueFilter,
 ) -> anyhow::Result<Vec<IssueRow>> {
-    Ok(db::issues::search(&state.pool, query, project, 50).await?)
+    Ok(db::issues::search(&state.pool, query, filter, SEARCH_LIMIT as i64).await?)
 }
 
 #[cfg(test)]
@@ -1356,9 +1366,14 @@ mod tests {
         nothing_is_saved(data_dir.path(), &state);
         assert_eq!(account(&state).await, None);
         assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
-        assert!(list_issues(&state, None).await.unwrap().is_empty());
         assert!(
-            search_issues(&state, "login", None)
+            list_issues(&state, &IssueFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search_issues(&state, "login", &IssueFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1405,9 +1420,14 @@ mod tests {
 
         assert_eq!(signed_in.account_id, "7c20b");
         assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
-        assert!(list_issues(&state, None).await.unwrap().is_empty());
         assert!(
-            search_issues(&state, "login", None)
+            list_issues(&state, &IssueFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search_issues(&state, "login", &IssueFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1422,14 +1442,25 @@ mod tests {
         std::fs::remove_file(data_dir.path().join("config.json")).unwrap();
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(list_issues(&state, None).await.unwrap().len(), 1);
+        assert_eq!(
+            list_issues(&state, &IssueFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let server = jira(myself_grace()).await;
 
         sign_in(&state, &server.uri(), "grace@example.com", "her-token")
             .await
             .unwrap();
 
-        assert!(list_issues(&state, None).await.unwrap().is_empty());
+        assert!(
+            list_issues(&state, &IssueFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn myself_grace() -> ResponseTemplate {
@@ -1465,7 +1496,7 @@ mod tests {
 
     /// The issue with its unsent status, the outbox entry and the timer.
     async fn nothing_is_lost(state: &AppState) {
-        let issues = list_issues(state, None).await.unwrap();
+        let issues = list_issues(state, &IssueFilter::default()).await.unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].status, "In Progress");
         assert_eq!(unsent_changes(state).await.unwrap(), 1);
@@ -1604,7 +1635,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(signed_in.account_id, "7c20b");
-        assert!(list_issues(&state, None).await.unwrap().is_empty());
+        assert!(
+            list_issues(&state, &IssueFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(unsent_changes(&state).await.unwrap(), 0);
         assert_eq!(running_timer(&state).await.unwrap(), None);
         assert_eq!(db::owner(&state.pool).await.unwrap(), Some(signed_in));
@@ -1631,7 +1667,7 @@ mod tests {
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
-        let listed = list_issues(&state, None).await.unwrap();
+        let listed = list_issues(&state, &IssueFilter::default()).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "WEB-1".into());
     }

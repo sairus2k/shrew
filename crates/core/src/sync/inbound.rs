@@ -575,7 +575,7 @@ mod tests {
     use super::*;
     use crate::{
         api,
-        models::{SetupStep, SyncStatus},
+        models::{IssueFilter, SetupStep, SyncStatus},
         start_syncing_without_keychain, start_without_keychain,
     };
     use serde_json::json;
@@ -755,7 +755,11 @@ mod tests {
         assert_eq!(stored.project_key, "WEB");
         assert_eq!(stored.sync_status, SyncStatus::Synced);
         // The description went through ADF into the search index
-        let found = issues::search(&state.pool, "flaky", Some("API"), 10)
+        let api = IssueFilter {
+            project: Some("API".to_owned()),
+            ..Default::default()
+        };
+        let found = issues::search(&state.pool, "flaky", &api, 10)
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
@@ -1013,7 +1017,9 @@ mod tests {
         let server = MockServer::start().await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, mut events) = downloaded(&server, data_dir.path(), &["WEB", "API"]).await;
-        let found = api::search_issues(&state, "flaky", None).await.unwrap();
+        let found = api::search_issues(&state, "flaky", &IssueFilter::default())
+            .await
+            .unwrap();
         assert_eq!(found.len(), 3);
 
         api::watch_projects(&state, &["WEB".to_owned()])
@@ -1023,9 +1029,13 @@ mod tests {
         assert_eq!(api::watched_projects(&state).await.unwrap(), ["WEB"]);
         assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
-        let listed = api::list_issues(&state, None).await.unwrap();
+        let listed = api::list_issues(&state, &IssueFilter::default())
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 2);
-        let found = api::search_issues(&state, "flaky", None).await.unwrap();
+        let found = api::search_issues(&state, "flaky", &IssueFilter::default())
+            .await
+            .unwrap();
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|row| row.project_key == "WEB"));
         assert_eq!(
@@ -1292,9 +1302,13 @@ mod tests {
 
         assert_eq!(summary(&state, "WEB-1").await, "Renamed");
         assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
-        let listed = api::list_issues(&state, None).await.unwrap();
+        let listed = api::list_issues(&state, &IssueFilter::default())
+            .await
+            .unwrap();
         assert!(listed.iter().all(|row| row.project_key == "WEB"));
-        let found = api::search_issues(&state, "flaky", None).await.unwrap();
+        let found = api::search_issues(&state, "flaky", &IssueFilter::default())
+            .await
+            .unwrap();
         assert!(found.iter().all(|row| row.project_key == "WEB"));
     }
 
@@ -2119,7 +2133,7 @@ mod tests {
         );
         // The unseen issue is left to the poll
         assert_eq!(stored_keys(&state).await, ["WEB-1"]);
-        let found = issues::search(&state.pool, "number", None, 10)
+        let found = issues::search(&state.pool, "number", &IssueFilter::default(), 10)
             .await
             .unwrap();
         assert_eq!(found.len(), 1);
