@@ -162,7 +162,8 @@ pub struct RejectedComment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Worklog {
-    /// "You" for a worklog logged here that Jira has not sent back yet.
+    /// The user's own name for a worklog logged here that Jira has not sent
+    /// back yet.
     pub author_name: String,
     /// Unix seconds.
     pub started_at: i64,

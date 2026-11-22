@@ -14,6 +14,10 @@ pub(crate) struct Config {
     pub site_url: String, // https://{site}.atlassian.net
     pub email: String,
     pub account_id: String, // from GET /myself
+    // The name Jira shows the user under, from GET /myself. `None` in a config
+    // written before it was kept, until a sync cycle asks for it
+    #[serde(default)]
+    pub display_name: Option<String>,
     // Defaults, so a config written before it existed still loads
     #[serde(default)]
     pub worklog_target: WorklogTarget,

@@ -189,10 +189,11 @@ pub(crate) async fn delete_remote(
 }
 
 /// The worklogs of the issue, the one started last first. A worklog logged
-/// here has no author name until Jira sends it back.
+/// here has no author name until Jira sends it back: its author is `me`.
 pub(crate) async fn for_issue(
     executor: impl sqlx::SqliteExecutor<'_>,
     key: &IssueKey,
+    me: &str,
 ) -> sqlx::Result<Vec<Worklog>> {
     type Row = (
         Option<String>,
@@ -220,7 +221,7 @@ pub(crate) async fn for_issue(
         .into_iter()
         .map(
             |(author, started_at, seconds, comment, status, entry_id, error)| Worklog {
-                author_name: author.unwrap_or_else(|| "You".to_owned()),
+                author_name: author.unwrap_or_else(|| me.to_owned()),
                 started_at: DateTime::parse_from_rfc3339(&started_at)
                     .map_or(0, |at| at.timestamp()),
                 time_spent_secs: seconds.try_into().unwrap_or_default(),

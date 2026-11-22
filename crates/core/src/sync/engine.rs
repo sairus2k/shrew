@@ -2,8 +2,13 @@
 
 use crate::{
     AppState, SyncEvent,
+    auth::{self, Config},
     db::sync_state,
-    sync::{inbound, jira_client::JiraError, outbound, transitions},
+    sync::{
+        inbound,
+        jira_client::{JiraClient, JiraError},
+        outbound, transitions,
+    },
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, time::Instant};
@@ -171,6 +176,7 @@ async fn cycle(
         }
         // After the issue poll, which brings the issues a sprint was given
         inbound::refresh_sprints(state, &config, watched, &mut changed).await?;
+        learn_display_name(state, &config).await;
         anyhow::Ok(())
     }
     .await;
@@ -189,6 +195,24 @@ async fn cycle(
     synced?;
     state.events.send(SyncEvent::Completed).ok();
     Ok(())
+}
+
+/// Asks Jira for the name of the user when the config has none, as one
+/// written before the name was kept. A failure waits for the next cycle: the
+/// name only replaces "You" on what the user wrote here.
+async fn learn_display_name(state: &AppState, config: &Config) {
+    if config.display_name.is_some() {
+        return;
+    }
+    let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
+    let Ok(myself) = client.myself().await else {
+        return;
+    };
+    let mut saved = state.config.write().await;
+    if let Some(current) = saved.as_mut() {
+        current.display_name = myself.display_name;
+        auth::save_config(&state.data_dir, current).await.ok();
+    }
 }
 
 #[cfg(test)]

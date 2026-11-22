@@ -50,6 +50,8 @@ impl From<reqwest::Error> for JiraError {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Myself {
     pub account_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// The IANA name of the profile's time zone, such as `Europe/Paris`.
     #[serde(default)]
     pub time_zone: Option<String>,

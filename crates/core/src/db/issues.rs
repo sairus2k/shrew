@@ -158,11 +158,13 @@ pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Optio
     .await
 }
 
-/// `site_url` is the Jira site the cache was filled from.
+/// `site_url` is the Jira site the cache was filled from. `me` is the name of
+/// the user, the author of the comments and the worklogs Jira has not sent back.
 pub(crate) async fn get_detail(
     pool: &SqlitePool,
     key: &IssueKey,
     site_url: &str,
+    me: &str,
 ) -> sqlx::Result<Option<IssueDetail>> {
     let row = sqlx::query!(
         r#"
@@ -188,8 +190,8 @@ pub(crate) async fn get_detail(
     let comments = fields["comment"]["comments"]
         .as_array()
         .map_or(&[][..], Vec::as_slice);
-    let pending = pending_comments(pool, &row.key, &url).await?;
-    let worklogs = worklogs::for_issue(pool, &row.key).await?;
+    let pending = pending_comments(pool, &row.key, &url, me).await?;
+    let worklogs = worklogs::for_issue(pool, &row.key, me).await?;
     // A pending issue with nothing in the outbox shows a status that was
     // refused and could not be rolled back
     let (transition, assignee): (bool, bool) = sqlx::query_as(
@@ -321,6 +323,7 @@ async fn pending_comments(
     pool: &SqlitePool,
     key: &IssueKey,
     issue_url: &str,
+    me: &str,
 ) -> sqlx::Result<Vec<(Comment, Option<String>)>> {
     let entries: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, payload, status, error_msg FROM sync_queue
@@ -340,7 +343,7 @@ async fn pending_comments(
             let comment = Comment {
                 id: None,
                 reply_to: None,
-                author_name: "You".to_owned(),
+                author_name: me.to_owned(),
                 created: String::new(),
                 body_md: adf::to_markdown(Some(&adf::from_plain_text(text)), issue_url),
                 pending: !failed,

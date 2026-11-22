@@ -434,6 +434,7 @@ mod tests {
             site_url: site_url.to_owned(),
             email: "ada@example.com".to_owned(),
             account_id: "5b10a".to_owned(),
+            display_name: None,
             worklog_target: Default::default(),
             shortcut_hints: true,
             api_token: TOKEN.to_owned(),
@@ -798,6 +799,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sync_cycle_learns_the_name_of_the_user_a_config_does_not_have() {
+        let server = MockServer::start().await;
+        Mock::given(path("/rest/api/3/myself"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "accountId": "5b10a", "displayName": "Ada Lovelace" })),
+            )
+            // The cycle after the one that learnt the name does not ask
+            .expect(1)
+            .mount(&server)
+            .await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = syncing(&server, data_dir.path()).await;
+        sign_in(&state, &server).await;
+        cycle(&mut events).await;
+
+        let name = |state: Arc<AppState>| async move {
+            let config = state.config.read().await;
+            config.as_ref().unwrap().display_name.clone()
+        };
+        assert_eq!(name(state.clone()).await.as_deref(), Some("Ada Lovelace"));
+        let saved = std::fs::read_to_string(data_dir.path().join("config.json")).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["display_name"], "Ada Lovelace");
+
+        state.sync_waker.send(()).unwrap();
+        cycle(&mut events).await;
+    }
+
+    #[tokio::test]
     async fn a_sync_cycle_flushes_the_queue_before_it_polls() {
         let server = MockServer::start().await;
         let data_dir = tempfile::tempdir().unwrap();
@@ -1046,7 +1077,8 @@ mod tests {
 
     /// WEB-1's comments: whether each waits for Jira, and its Markdown.
     async fn comments(state: &AppState) -> Vec<(bool, String)> {
-        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail =
+            issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost", "You").await;
         let detail = detail.unwrap().unwrap();
         assert_eq!(detail.comment_total, detail.comments.len());
         detail
@@ -1181,7 +1213,8 @@ mod tests {
             sent[0].1["body"]["content"][0]["content"][0]["text"],
             "Which build?"
         );
-        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail =
+            issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost", "You").await;
         let thread: Vec<(Option<String>, bool)> = detail
             .unwrap()
             .unwrap()
@@ -1906,7 +1939,8 @@ mod tests {
                 rejected("WEB-1", "comment", reason)
             ]
         );
-        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail =
+            issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost", "You").await;
         let detail = detail.unwrap().unwrap();
         assert_eq!(detail.comment_total, 1);
         let [comment] = &detail.comments[..] else {
@@ -2017,7 +2051,8 @@ mod tests {
                 Some("Jira returned 403 Forbidden: ".to_owned())
             )]
         );
-        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail =
+            issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost", "You").await;
         let comment = &detail.unwrap().unwrap().comments[0];
         let refused = comment.rejected.clone().unwrap();
         assert_eq!(comment.body_md, "Seen on staging");
@@ -2311,7 +2346,8 @@ mod tests {
         // Watching the project again brings the refused comment back to where
         // it can be retried or discarded
         store_issue(&state).await;
-        let detail = issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost").await;
+        let detail =
+            issues::get_detail(&state.pool, &"WEB-1".into(), "http://localhost", "You").await;
         let comment = &detail.unwrap().unwrap().comments[0];
         assert_eq!(comment.body_md, "Seen on staging");
         assert!(comment.rejected.is_some());
@@ -3438,7 +3474,8 @@ mod tests {
     #[tokio::test]
     async fn a_comment_queued_before_a_move_is_delivered_under_the_new_key() {
         async fn comments_of_api_9(state: &AppState) -> Vec<(bool, String)> {
-            let detail = issues::get_detail(&state.pool, &"API-9".into(), "http://localhost").await;
+            let detail =
+                issues::get_detail(&state.pool, &"API-9".into(), "http://localhost", "You").await;
             let comments = detail.unwrap().unwrap().comments;
             comments
                 .into_iter()

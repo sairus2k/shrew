@@ -103,6 +103,7 @@ async fn sign_in_as(
         site_url,
         email: email.to_owned(),
         account_id: myself.account_id,
+        display_name: myself.display_name,
         api_token: api_token.to_owned(),
         worklog_target: Default::default(),
         shortcut_hints: true,
@@ -351,11 +352,13 @@ pub async fn filter_options(state: &AppState) -> anyhow::Result<FilterOptions> {
 
 /// One issue from the local cache, with its description and comments as Markdown.
 pub async fn get_issue(state: &AppState, key: &IssueKey) -> anyhow::Result<IssueDetail> {
-    let site_url = match &*state.config.read().await {
-        Some(config) => config.site_url.clone(),
+    let (site_url, me) = match &*state.config.read().await {
+        Some(config) => (config.site_url.clone(), config.display_name.clone()),
         None => bail!("Sign in first"),
     };
-    db::issues::get_detail(&state.pool, key, &site_url)
+    // A config written before the name was kept, until a sync cycle asks for it
+    let me = me.unwrap_or_else(|| "You".to_owned());
+    db::issues::get_detail(&state.pool, key, &site_url, &me)
         .await?
         .with_context(|| format!("issue {key} not found"))
 }
@@ -687,6 +690,7 @@ mod tests {
                 "site_url": server.uri(),
                 "email": "ada@example.com",
                 "account_id": "5b10a",
+                "display_name": "Ada",
                 "worklog_target": "jira",
                 "shortcut_hints": true,
             })
@@ -1032,9 +1036,9 @@ mod tests {
         assert_eq!(
             worklogs,
             [
-                worklog("You", 1_774_857_600, 1800, None, SyncStatus::Failed),
+                worklog("Ada", 1_774_857_600, 1800, None, SyncStatus::Failed),
                 worklog(
-                    "You",
+                    "Ada",
                     1_774_771_200,
                     900,
                     Some("Review"),
@@ -1333,7 +1337,7 @@ mod tests {
             [Comment {
                 id: None,
                 reply_to: None,
-                author_name: "You".to_owned(),
+                author_name: "Ada".to_owned(),
                 created: String::new(),
                 body_md: "Seen on staging\\\nand \\*prod\\*".to_owned(),
                 pending: true,
