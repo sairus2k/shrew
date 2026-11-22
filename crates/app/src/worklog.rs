@@ -1,5 +1,6 @@
 //! The form that logs time on an issue after the fact.
 
+use crate::drafts::{Draft, Drafts};
 use crate::duration::{local_minute, parse_duration, parse_local_minute};
 use crate::keys;
 use crate::runtime::spawn;
@@ -29,19 +30,48 @@ pub struct WorklogForm {
 
 impl WorklogForm {
     pub fn new(key: IssueKey, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let duration = cx.new(|cx| InputState::new(window, cx).placeholder("1h 30m"));
-        let started = cx.new(|cx| {
-            let mut input = InputState::new(window, cx);
-            input.set_value(local_minute(Local::now().timestamp()), window, cx);
+        let kept = Drafts::get(cx, &key);
+        let duration = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("1h 30m");
+            input.set_value(kept.duration, window, cx);
             input
         });
-        let comment = cx.new(|cx| InputState::new(window, cx).placeholder("Comment (optional)"));
-        let _enter = [&duration, &started, &comment].map(|input| {
-            cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { .. } = event {
-                    this.submit(window, cx);
-                }
-            })
+        let started = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            // A start the user left alone is the time of now, not the time of the last visit
+            let started = match kept.started.is_empty() {
+                true => local_minute(Local::now().timestamp()),
+                false => kept.started,
+            };
+            input.set_value(started, window, cx);
+            input
+        });
+        let comment = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Comment (optional)");
+            input.set_value(kept.worklog_comment, window, cx);
+            input
+        });
+        let keep: [fn(&mut Draft, String); 3] = [
+            |draft, text| draft.duration = text,
+            // Only what the user typed is kept: an untouched start is the time of now
+            |draft, text| draft.started = text,
+            |draft, text| draft.worklog_comment = text,
+        ];
+        let inputs = [&duration, &started, &comment];
+        let _enter = std::array::from_fn(|index| {
+            let keep = keep[index];
+            cx.subscribe_in(
+                inputs[index],
+                window,
+                move |this, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit(window, cx),
+                    InputEvent::Change => {
+                        let text = input.read(cx).value().to_string();
+                        Drafts::update(cx, &this.key, |draft| keep(draft, text));
+                    }
+                    _ => {}
+                },
+            )
         });
         Self {
             key,
@@ -89,6 +119,11 @@ impl WorklogForm {
                 match saved {
                     // The core announces the issue and the model reloads it, pending worklog included
                     Ok(()) => {
+                        // set_value does not emit Change
+                        Drafts::update(cx, &this.key, |draft| {
+                            draft.duration.clear();
+                            draft.worklog_comment.clear();
+                        });
                         for input in [&this.duration, &this.comment] {
                             input.update(cx, |input, cx| input.set_value("", window, cx));
                         }

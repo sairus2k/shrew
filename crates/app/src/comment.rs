@@ -1,6 +1,7 @@
 //! The input under the comments of an issue, for a new comment or an answer
 //! to one of them.
 
+use crate::drafts::Drafts;
 use crate::keys;
 use crate::runtime::spawn;
 use app_core::{api, models::IssueKey};
@@ -33,20 +34,33 @@ pub struct CommentForm {
 
 impl CommentForm {
     pub fn new(key: IssueKey, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10));
-        let _typing = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-            // Enter alone is a new line of the comment
-            if let InputEvent::PressEnter {
-                secondary: true, ..
-            } = event
-            {
-                this.submit(window, cx);
-            }
-            cx.notify()
+        let kept = Drafts::get(cx, &key);
+        let input = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx).auto_grow(3, 10);
+            input.set_value(kept.comment, window, cx);
+            input
         });
+        let _typing = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                match event {
+                    // Enter alone is a new line of the comment
+                    InputEvent::PressEnter {
+                        secondary: true, ..
+                    } => this.submit(window, cx),
+                    InputEvent::Change => {
+                        let text = input.read(cx).value().to_string();
+                        Drafts::update(cx, &this.key, |draft| draft.comment = text);
+                    }
+                    _ => {}
+                }
+                cx.notify()
+            },
+        );
         Self {
             key,
-            reply_to: None,
+            reply_to: kept.reply_to,
             input,
             sending: false,
             _typing,
@@ -59,8 +73,13 @@ impl CommentForm {
 
     /// What is written from now on answers `target`.
     pub fn reply_to(&mut self, target: ReplyTarget, cx: &mut Context<Self>) {
-        self.reply_to = Some(target);
+        self.keep_reply_to(Some(target), cx);
         cx.notify();
+    }
+
+    fn keep_reply_to(&mut self, target: Option<ReplyTarget>, cx: &mut Context<Self>) {
+        self.reply_to = target.clone();
+        Drafts::update(cx, &self.key, |draft| draft.reply_to = target);
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -87,7 +106,9 @@ impl CommentForm {
                 match saved {
                     // The core announces the issue and the model reloads it, pending comment included
                     Ok(()) => {
-                        this.reply_to = None;
+                        this.keep_reply_to(None, cx);
+                        // set_value does not emit Change
+                        Drafts::update(cx, &this.key, |draft| draft.comment.clear());
                         this.input
                             .update(cx, |input, cx| input.set_value("", window, cx))
                     }
@@ -128,7 +149,7 @@ impl Render for CommentForm {
                         .xsmall()
                         .label("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.reply_to = None;
+                            this.keep_reply_to(None, cx);
                             cx.notify();
                         })),
                 )

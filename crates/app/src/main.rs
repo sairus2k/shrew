@@ -29,6 +29,7 @@ use timer::{ActiveTimer, TimerIssueClicked, TimerStatus, TimerWriteFailed};
 mod account;
 mod assignee;
 mod comment;
+mod drafts;
 mod duration;
 #[cfg(test)]
 mod harness;
@@ -267,6 +268,7 @@ impl Root {
             tray::forget(cx);
             // The choice went with the config of the account
             cx.set_global(keys::Hints(true));
+            drafts::Drafts::clear(cx);
             this.show(SetupStep::SignIn, window, cx)
         })
         .detach();
