@@ -1,6 +1,6 @@
 use crate::models::Account;
 use sqlx::{
-    SqlitePool,
+    Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
 };
 use std::path::Path;
@@ -8,6 +8,7 @@ use std::path::Path;
 pub(crate) mod assignable;
 pub(crate) mod issues;
 pub(crate) mod sync_queue;
+pub(crate) mod sync_state;
 pub(crate) mod timer;
 pub(crate) mod transitions;
 pub(crate) mod worklogs;
@@ -25,12 +26,21 @@ pub(crate) async fn init(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Deletes everything that came from Jira: the cache belongs to the site and
-/// the account that filled it.
+/// Begins a transaction that writes.
+// The write lock is taken here and not at the first write. SQLite does not
+// wait when a transaction that has already read asks for it while another
+// connection is writing: it refuses at once with "database is locked", and
+// the sync engine writes in every cycle.
+pub(crate) async fn begin(pool: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
+/// Deletes everything that came from Jira, and how far the sync has read it:
+/// the cache belongs to the site and the account that filled it.
 pub(crate) async fn clear(pool: &SqlitePool) -> sqlx::Result<()> {
     // The triggers on `issues` empty the search index
     sqlx::raw_sql(
-        "BEGIN;
+        "BEGIN IMMEDIATE;
          DELETE FROM issues;
          DELETE FROM users;
          DELETE FROM projects;
@@ -40,6 +50,8 @@ pub(crate) async fn clear(pool: &SqlitePool) -> sqlx::Result<()> {
          DELETE FROM worklogs;
          DELETE FROM running_timer;
          DELETE FROM cache_owner;
+         DELETE FROM watched_projects;
+         INSERT OR REPLACE INTO sync_state (id) VALUES (1);
          COMMIT;",
     )
     .execute(pool)

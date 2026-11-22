@@ -42,7 +42,7 @@ pub(crate) async fn stop(
     pool: &sqlx::SqlitePool,
     stopped_at: i64,
 ) -> anyhow::Result<Option<IssueKey>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin(pool).await?;
     let row: Option<(IssueKey, i64)> =
         sqlx::query_as("DELETE FROM running_timer RETURNING issue_key, started_at")
             .fetch_optional(&mut *tx)

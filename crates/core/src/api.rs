@@ -104,12 +104,6 @@ async fn sign_in_as(
         email: email.to_owned(),
         account_id: myself.account_id,
         api_token: api_token.to_owned(),
-        watched_projects: Vec::new(),
-        last_sync_at: None,
-        pending_projects: Vec::new(),
-        last_reconcile_at: 0,
-        last_worklog_sync_at: 0,
-        last_worklog_delete_sync_at: 0,
         worklog_target: Default::default(),
         tempo_api_token: String::new(),
     };
@@ -245,20 +239,24 @@ pub fn sync_now(state: &AppState) {
 
 /// When the last sync that completed had started, in Unix milliseconds.
 /// `None` until the initial sync has finished.
-pub async fn last_sync_at(state: &AppState) -> Option<i64> {
-    state.config.read().await.as_ref()?.last_sync_at
+pub async fn last_sync_at(state: &AppState) -> anyhow::Result<Option<i64>> {
+    Ok(db::sync_state::load(&state.pool).await?.last_sync_at)
 }
 
-pub async fn setup_step(state: &AppState) -> SetupStep {
+pub async fn setup_step(state: &AppState) -> anyhow::Result<SetupStep> {
     match &*state.config.read().await {
-        None => SetupStep::SignIn,
-        Some(config) if config.api_token.is_empty() => SetupStep::EnterToken,
-        Some(config) if config.watched_projects.is_empty() => SetupStep::ChooseProjects,
-        Some(config) if config.last_sync_at.is_none() || !config.pending_projects.is_empty() => {
-            SetupStep::InitialSync
-        }
-        Some(_) => SetupStep::Ready,
+        None => return Ok(SetupStep::SignIn),
+        Some(config) if config.api_token.is_empty() => return Ok(SetupStep::EnterToken),
+        Some(_) => {}
     }
+    let sync = db::sync_state::load(&state.pool).await?;
+    Ok(if sync.watched_projects.is_empty() {
+        SetupStep::ChooseProjects
+    } else if sync.last_sync_at.is_none() || !sync.pending_projects.is_empty() {
+        SetupStep::InitialSync
+    } else {
+        SetupStep::Ready
+    })
 }
 
 /// The projects the account can see, ordered by name.
@@ -280,33 +278,20 @@ pub async fn projects(state: &AppState) -> anyhow::Result<Vec<Project>> {
 /// sync the added projects wait for `initial_sync` to download them, and the
 /// cached issues of the removed ones are deleted, with their worklogs and
 /// timer. Their queued changes are still sent to Jira: the user made them on
-/// purpose.
+/// purpose. The list and the deletion are one transaction: after a failure
+/// the cache holds the issues of the projects the list names.
 pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow::Result<()> {
     if project_keys.is_empty() {
         bail!("Choose at least one project");
     }
-    let mut saved = state.config.write().await;
-    let mut config = saved.clone().context("Sign in first")?;
-    if config.last_sync_at.is_some() {
-        let added = project_keys
-            .iter()
-            .filter(|key| !config.watched_projects.contains(key));
-        config
-            .pending_projects
-            .retain(|key| project_keys.contains(key));
-        for key in added {
-            if !config.pending_projects.contains(key) {
-                config.pending_projects.push(key.clone());
-            }
-        }
-    }
-    config.watched_projects = project_keys.to_vec();
-    auth::save_config(&state.data_dir, &config).await?;
-    *saved = Some(config);
+    // Held until the commit, as the pass for deleted issues holds it: a page
+    // of a sync is stored before the delete or filtered by the new list
+    let saved = state.config.write().await;
+    saved.as_ref().context("Sign in first")?;
 
-    // Under the config lock, as the pass for deleted issues is
     let mut removed = Vec::new();
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state.pool).await?;
+    db::sync_state::watch(&mut tx, project_keys).await?;
     for issue in db::issues::cached(&mut *tx).await? {
         if !project_keys.contains(&issue.project_key) {
             db::issues::delete(&mut *tx, &issue.id).await?;
@@ -318,6 +303,7 @@ pub async fn watch_projects(state: &AppState, project_keys: &[String]) -> anyhow
         }
     }
     tx.commit().await?;
+    drop(saved);
     if !removed.is_empty() {
         state.events.send(SyncEvent::IssuesUpdated(removed)).ok();
     }
@@ -332,11 +318,8 @@ pub async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
 }
 
 /// The projects whose issues the app keeps locally, in the order they were chosen.
-pub async fn watched_projects(state: &AppState) -> Vec<String> {
-    match &*state.config.read().await {
-        Some(config) => config.watched_projects.clone(),
-        None => Vec::new(),
-    }
+pub async fn watched_projects(state: &AppState) -> anyhow::Result<Vec<String>> {
+    Ok(db::sync_state::watched(&state.pool).await?)
 }
 
 /// Every issue in the local cache, or only those of `project`, the one Jira
@@ -376,7 +359,7 @@ pub async fn transition_issue(
     let payload = json!({ "transition": { "id": transition.id }, "fields": fields });
     // One transaction: a crash must not leave a status Jira will never hear
     // of, or an outbox entry for a status the user does not see
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state.pool).await?;
     let found = db::issues::set_pending_status(
         &mut *tx,
         key,
@@ -420,7 +403,7 @@ pub async fn assign_issue(
     let payload = json!({ "accountId": assignee.map(|user| &user.account_id) });
     // One transaction, as for a transition: the assignee shown and the entry
     // Jira will get must not part ways
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state.pool).await?;
     if !db::issues::set_pending_assignee(&mut *tx, key, assignee).await? {
         bail!("issue {key} not found");
     }
@@ -489,7 +472,7 @@ pub async fn log_time(
     }
     // One transaction: the worklog shown and the entry Jira will get must not
     // part ways
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state.pool).await?;
     db::worklogs::log(&mut tx, &worklog).await?;
     tx.commit().await?;
 
@@ -653,12 +636,6 @@ mod tests {
                 "site_url": server.uri(),
                 "email": "ada@example.com",
                 "account_id": "5b10a",
-                "watched_projects": [],
-                "last_sync_at": null,
-                "pending_projects": [],
-                "last_reconcile_at": 0,
-                "last_worklog_sync_at": 0,
-                "last_worklog_delete_sync_at": 0,
                 "worklog_target": "jira",
             })
         );
@@ -768,11 +745,11 @@ mod tests {
             .await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
         sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
 
         let accessible = projects(&state).await.unwrap();
         assert_eq!(
@@ -788,16 +765,15 @@ mod tests {
                 },
             ]
         );
-        assert!(watched_projects(&state).await.is_empty());
+        assert!(watched_projects(&state).await.unwrap().is_empty());
         watch_projects(&state, &["WEB".to_owned()]).await.unwrap();
 
-        assert_eq!(watched_projects(&state).await, ["WEB"]);
-        assert_eq!(setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::InitialSync);
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(setup_step(&state).await, SetupStep::InitialSync);
-        let config = state.config.read().await;
-        assert_eq!(config.as_ref().unwrap().watched_projects, ["WEB"]);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::InitialSync);
+        assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
     }
 
     #[tokio::test]
@@ -812,7 +788,7 @@ mod tests {
         let error = watch_projects(&state, &[]).await.unwrap_err();
 
         assert_eq!(error.to_string(), "Choose at least one project");
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
     }
 
     #[tokio::test]
@@ -827,7 +803,7 @@ mod tests {
 
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
 
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
     }
 
     fn paragraph(text: &str) -> serde_json::Value {
@@ -1337,7 +1313,7 @@ mod tests {
 
         nothing_is_saved(data_dir.path(), &state);
         assert_eq!(account(&state).await, None);
-        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
         assert!(list_issues(&state, None).await.unwrap().is_empty());
         assert!(
             search_issues(&state, "login", None)
@@ -1351,7 +1327,7 @@ mod tests {
         state.pool.close().await;
 
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
     }
 
     #[tokio::test]
@@ -1370,7 +1346,7 @@ mod tests {
 
         assert_eq!(again, first);
         assert_eq!(account(&state).await, Some(first));
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
     }
 
     #[tokio::test]
@@ -1386,7 +1362,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(signed_in.account_id, "7c20b");
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
         assert!(list_issues(&state, None).await.unwrap().is_empty());
         assert!(
             search_issues(&state, "login", None)
@@ -1478,14 +1454,14 @@ mod tests {
         data_dir: &std::path::Path,
     ) {
         let (state, _events) = start_without_keychain(data_dir).await.unwrap();
-        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
         nothing_is_lost(&state).await;
 
         sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
             .await
             .unwrap();
 
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
         nothing_is_lost(&state).await;
         the_unsent_change_is_delivered(&state, server).await;
         state.pool.close().await;
@@ -1533,7 +1509,7 @@ mod tests {
         state.tokens.delete().unwrap();
 
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(setup_step(&state).await, SetupStep::EnterToken);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::EnterToken);
         assert_eq!(
             account(&state).await.map(|account| account.email),
             Some("ada@example.com".to_owned())
@@ -1542,7 +1518,7 @@ mod tests {
 
         renew_token(&state, "secret-token").await.unwrap();
 
-        assert_eq!(setup_step(&state).await, SetupStep::ChooseProjects);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
         assert_eq!(
             state.tokens.load().unwrap().as_deref(),
             Some("secret-token")
@@ -1574,7 +1550,7 @@ mod tests {
                 account_id: "5b10a".to_owned(),
             })
         );
-        assert_eq!(setup_step(&state).await, SetupStep::SignIn);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
         assert_eq!(
             state.tokens.load().unwrap().as_deref(),
             Some("secret-token")
@@ -1592,27 +1568,111 @@ mod tests {
         assert_eq!(db::owner(&state.pool).await.unwrap(), Some(signed_in));
     }
 
-    // The test below records a weakness found in SHR-92 as the code behaves
-    // today. SHR-98 fixes it and turns its assertions around.
-
     #[tokio::test]
-    async fn a_project_list_saved_without_its_cache_change_leaves_the_issues_of_a_removed_project()
-    {
+    async fn a_change_of_the_watched_projects_that_fails_leaves_the_list_and_the_cache_agreeing() {
         let (data_dir, state) = core_with(todo_issue()).await;
         watch_projects(&state, &["WEB".to_owned()]).await.unwrap();
-        // Stands in for a crash between the two writes of `watch_projects`:
-        // the config file is written, the transaction on the cache never runs
-        state.pool.close().await;
+        // The list is written first, and then the delete of WEB-1 fails
+        sqlx::raw_sql(
+            "CREATE TRIGGER disk_full BEFORE DELETE ON issues
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
 
         watch_projects(&state, &["OPS".to_owned()])
             .await
             .unwrap_err();
 
+        assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
+        state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(watched_projects(&state).await, ["OPS"]);
+        assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
         let listed = list_issues(&state, None).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "WEB-1".into());
+    }
+
+    /// Closes the core and rewrites its `config.json` the way a build that
+    /// kept the sync state there wrote it.
+    async fn written_by_an_earlier_build(data_dir: &std::path::Path, state: &AppState) {
+        state.pool.close().await;
+        let config_file = data_dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+        config["watched_projects"] = json!(["WEB", "API", "OPS"]);
+        config["pending_projects"] = json!(["OPS"]);
+        config["last_sync_at"] = json!(4_000);
+        config["last_reconcile_at"] = json!(3_000);
+        config["last_worklog_sync_at"] = json!(2_000);
+        config["last_worklog_delete_sync_at"] = json!(1_000);
+        std::fs::write(&config_file, config.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_sync_state_an_earlier_build_kept_in_the_config_moves_to_the_database() {
+        let (data_dir, state) = core_with(todo_issue()).await;
+        written_by_an_earlier_build(data_dir.path(), &state).await;
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+
+        let moved = db::sync_state::SyncState {
+            watched_projects: ["WEB", "API", "OPS"].map(str::to_owned).into(),
+            pending_projects: vec!["OPS".to_owned()],
+            last_sync_at: Some(4_000),
+            last_reconcile_at: 3_000,
+            last_worklog_sync_at: 2_000,
+            last_worklog_delete_sync_at: 1_000,
+        };
+        assert_eq!(db::sync_state::load(&state.pool).await.unwrap(), moved);
+        // Only OPS is left to download, as before the update
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::InitialSync);
+        let config = std::fs::read(data_dir.path().join("config.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&config).unwrap();
+        assert_eq!(config["account_id"], "5b10a");
+        assert!(config.get("watched_projects").is_none());
+        assert!(config.get("last_sync_at").is_none());
+
+        // The database has moved on: what the config said is not read again
+        watch_projects(&state, &["WEB".to_owned()]).await.unwrap();
+        written_by_an_earlier_build(data_dir.path(), &state).await;
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::Ready);
+    }
+
+    /// A data dir with the account of `from` and no database.
+    fn without_its_database(from: &std::path::Path) -> tempfile::TempDir {
+        let data_dir = tempfile::tempdir().unwrap();
+        for file in ["config.json", "api-token"] {
+            std::fs::copy(from.join(file), data_dir.path().join(file)).unwrap();
+        }
+        data_dir
+    }
+
+    #[tokio::test]
+    async fn a_database_that_went_missing_beside_a_saved_account_gets_the_initial_sync() {
+        let (with_database, state) = core_with(todo_issue()).await;
+        written_by_an_earlier_build(with_database.path(), &state).await;
+
+        // The config of an earlier build says the sync has finished, of a
+        // database that is gone
+        let data_dir = without_its_database(with_database.path());
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert!(account(&state).await.is_some());
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::InitialSync);
+        assert_eq!(last_sync_at(&state).await.unwrap(), None);
+        assert_eq!(
+            watched_projects(&state).await.unwrap(),
+            ["WEB", "API", "OPS"]
+        );
+
+        // The projects were in the database too: they are chosen again
+        let data_dir = without_its_database(data_dir.path());
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert!(account(&state).await.is_some());
+        assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
     }
 
     #[tokio::test]

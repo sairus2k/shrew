@@ -63,7 +63,7 @@ pub(crate) mod tests {
         let (state, events) = tokio
             .block_on(app_core::start_without_keychain(data_dir))
             .unwrap();
-        let step = tokio.block_on(app_core::api::setup_step(&state));
+        let step = tokio.block_on(app_core::api::setup_step(&state)).unwrap();
         let handle = tokio.handle().clone();
         cx.update(|cx| {
             let sync = cx.new(|cx| SyncBridge::new(events, cx));

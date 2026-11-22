@@ -26,3 +26,4 @@ Three jobs. The initial sync downloads every issue of the watched (or newly adde
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/auth.rs](../../../../../../crates/core/src/auth.rs) | Saves sync positions | Rust call |
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/adf.rs](../../../../../../crates/core/src/adf.rs) | Extracts searchable text | Rust call |
 | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/sync_queue.rs](../../../../../../crates/core/src/db/sync_queue.rs) | Re-keys or drops entries | sqlx |
+| [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | [crates/core/src/db/sync_state.rs](../../../../../../crates/core/src/db/sync_state.rs) | Moves the sync positions with each stored page | sqlx |

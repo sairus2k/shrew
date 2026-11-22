@@ -112,7 +112,7 @@ fn show_window(cx: &mut App) {
             .ok();
         return;
     }
-    let step = spawn(cx, |state| async move { Ok(api::setup_step(&state).await) });
+    let step = spawn(cx, |state| async move { api::setup_step(&state).await });
     cx.spawn(async move |cx| {
         if let Ok(step) = step.await {
             cx.update(|cx| {

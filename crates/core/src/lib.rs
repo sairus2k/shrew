@@ -83,6 +83,14 @@ async fn open(
         };
         db::set_owner(&pool, &owner).await?;
     }
+    if let Some(config) = &config
+        && let Some(legacy) = auth::legacy_sync_state(data_dir).await
+    {
+        // In this order: a start that stops between the two finds the state
+        // in both places and keeps the one in the database
+        db::sync_state::import(&pool, &legacy).await?;
+        auth::save_config(data_dir, config).await?;
+    }
     let (events, events_rx) = mpsc::unbounded_channel();
     let (sync_waker, wake_rx) = watch::channel(());
     let state = AppState {
@@ -144,7 +152,7 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(applied, 12);
+        assert_eq!(applied, 13);
         state.pool.close().await;
     }
 }

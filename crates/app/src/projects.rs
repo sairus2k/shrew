@@ -54,7 +54,7 @@ impl ProjectPicker {
             // Nothing is watched during the setup
             Ok((
                 api::projects(&state).await?,
-                api::watched_projects(&state).await,
+                api::watched_projects(&state).await?,
             ))
         });
         self.error = None;
@@ -92,7 +92,7 @@ impl ProjectPicker {
         let watched = self.watched.clone();
         let save = spawn(cx, move |state| async move {
             api::watch_projects(&state, &watched).await?;
-            Ok(api::setup_step(&state).await)
+            api::setup_step(&state).await
         });
         self.error = None;
         self.saving = Some(cx.spawn(async move |this, cx| {
@@ -209,13 +209,15 @@ impl Render for ProjectPicker {
 mod tests {
     use crate::{
         harness::{in_window, launch, tokio_runtime, wait_until},
-        issue_list::tests::{api_issue, choose_project, issue, rows, synced_on},
+        issue_list::tests::{api_issue, choose_project, issue, rows, synced_on, watch},
+        runtime::Core,
         sign_in::tests::{fill_in_and_submit, jira},
     };
+    use app_core::{api, models::SetupStep};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, TestAppContext};
     use serde_json::json;
-    use std::{path::Path, time::Duration};
+    use std::time::Duration;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_partial_json, method, path, path_regex},
@@ -282,9 +284,7 @@ mod tests {
             assert!(window.try_find("initial-sync").is_some());
             assert!(window.try_find("choose-projects").is_none());
         });
-        let config = std::fs::read_to_string(data_dir.path().join("config.json")).unwrap();
-        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
-        assert_eq!(config["watched_projects"], json!(["WEB"]));
+        assert_eq!(watched(cx, &tokio), ["WEB"]);
     }
 
     fn mount_projects(tokio: &tokio::runtime::Runtime, server: &MockServer) {
@@ -313,16 +313,14 @@ mod tests {
             issues.push(api_issue(101, "Login endpoint"));
         }
         let data_dir = synced_on(tokio, &server.uri(), &issues);
-        let file = data_dir.path().join("config.json");
-        let mut config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        config["watched_projects"] = json!(watched);
-        std::fs::write(file, config.to_string()).unwrap();
+        watch(tokio, data_dir.path(), watched);
         data_dir
     }
 
-    fn config(data_dir: &Path) -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(data_dir.join("config.json")).unwrap()).unwrap()
+    /// The watched projects the core has saved.
+    fn watched(cx: &mut TestAppContext, tokio: &tokio::runtime::Runtime) -> Vec<String> {
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        tokio.block_on(api::watched_projects(&state)).unwrap()
     }
 
     fn open_projects(cx: &mut TestAppContext, window: AnyWindowHandle) {
@@ -387,10 +385,7 @@ mod tests {
         wait_until(cx, window, |window| {
             rows(window).len() == 2 && window.try_find("choose-projects").is_none()
         });
-        assert_eq!(
-            config(data_dir.path())["watched_projects"],
-            json!(["WEB", "API"])
-        );
+        assert_eq!(watched(cx, &tokio), ["WEB", "API"]);
         // The cache is untouched, and so is the choice after a restart
         let window = launch(cx, &tokio, data_dir.path());
         wait_until(cx, window, |window| rows(window).len() == 2);
@@ -416,7 +411,7 @@ mod tests {
             assert!(window.try_find("choose-projects").is_some());
             assert!(window.try_find("home").is_none());
         });
-        assert_eq!(config(data_dir.path())["watched_projects"], json!(["WEB"]));
+        assert_eq!(watched(cx, &tokio), ["WEB"]);
     }
 
     #[gpui_kit::test]
@@ -475,7 +470,9 @@ mod tests {
                 .iter()
                 .any(|request| String::from_utf8_lossy(&request.body).contains("project = \"WEB\""))
         );
-        assert_eq!(config(data_dir.path())["pending_projects"], json!([]));
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+        let step = tokio.block_on(api::setup_step(&state)).unwrap();
+        assert_eq!(step, SetupStep::Ready);
     }
 
     #[gpui_kit::test]
@@ -535,7 +532,7 @@ mod tests {
             window.input("login", cx);
         });
         wait_until(cx, window, |window| rows(window) == [WEB_LOGIN]);
-        assert_eq!(config(data_dir.path())["watched_projects"], json!(["WEB"]));
+        assert_eq!(watched(cx, &tokio), ["WEB"]);
     }
 
     #[gpui_kit::test]

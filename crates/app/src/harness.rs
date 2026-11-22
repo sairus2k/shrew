@@ -135,6 +135,8 @@ pub(crate) fn tab_to(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'sta
 /// has not synced yet.
 pub(crate) fn watching_web(server: &MockServer) -> tempfile::TempDir {
     let data_dir = tempfile::tempdir().unwrap();
+    // The config of a build that kept the watched projects in it: the start
+    // moves them into the database
     let config = json!({
         "site_url": server.uri(),
         "email": "ada@example.com",

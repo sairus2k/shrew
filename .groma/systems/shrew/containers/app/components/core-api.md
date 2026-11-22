@@ -36,3 +36,4 @@ A write never waits for Jira: in one SQLite transaction it changes the cached ro
 | [crates/core/src/api.rs](../../../../../../crates/core/src/api.rs) | [crates/core/src/sync/transitions.rs](../../../../../../crates/core/src/sync/transitions.rs) | Gets transitions | Rust call |
 | [crates/core/src/api.rs](../../../../../../crates/core/src/api.rs) | [crates/core/src/sync/assignable.rs](../../../../../../crates/core/src/sync/assignable.rs) | Gets assignable people | Rust call |
 | [crates/core/src/api.rs](../../../../../../crates/core/src/api.rs) | [crates/core/src/sync/engine.rs](../../../../../../crates/core/src/sync/engine.rs) | Wakes after writes | tokio watch channel |
+| [crates/core/src/api.rs](../../../../../../crates/core/src/api.rs) | [crates/core/src/db/sync_state.rs](../../../../../../crates/core/src/db/sync_state.rs) | Saves the watched projects and reads the setup step | sqlx |

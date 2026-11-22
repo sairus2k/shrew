@@ -57,7 +57,7 @@ impl InitialSync {
         });
         // The first sync of an account is the only one that runs before `last_sync_at` is set
         let first_sync_done = spawn(cx, |state| async move {
-            Ok(api::last_sync_at(&state).await.is_some())
+            Ok(api::last_sync_at(&state).await?.is_some())
         });
         let _load = cx.spawn(async move |this, cx| {
             let added = first_sync_done.await.unwrap_or(false);

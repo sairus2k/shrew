@@ -58,7 +58,7 @@ impl NewToken {
         let api_token = self.api_token.read(cx).value();
         let check = spawn(cx, move |state| async move {
             api::renew_token(&state, &api_token).await?;
-            Ok(api::setup_step(&state).await)
+            api::setup_step(&state).await
         });
         self.error = None;
         self.checking = Some(cx.spawn(async move |this, cx| {

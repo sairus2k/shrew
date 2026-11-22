@@ -1,4 +1,4 @@
-use crate::models::WorklogTarget;
+use crate::{db::sync_state::SyncState, models::WorklogTarget};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 
@@ -14,28 +14,7 @@ pub(crate) struct Config {
     pub site_url: String, // https://{site}.atlassian.net
     pub email: String,
     pub account_id: String, // from GET /myself
-    // The fields below default, so a config written before they existed still loads
-    #[serde(default)]
-    pub watched_projects: Vec<String>, // project keys
-    // When the last sync started, in Unix milliseconds. `None` until the initial
-    // sync has finished
-    #[serde(default)]
-    pub last_sync_at: Option<i64>,
-    // Watched projects added after the initial sync whose issues are not all
-    // downloaded yet. A quit in the middle leaves them here for the next start.
-    #[serde(default)]
-    pub pending_projects: Vec<String>,
-    // When the last pass for deleted and moved issues started, in Unix
-    // milliseconds. 0 until the first one
-    #[serde(default)]
-    pub last_reconcile_at: i64,
-    // Where the next poll of changed worklogs starts, in Unix milliseconds: the
-    // `until` Jira gave with the last page. 0 asks for every worklog, once.
-    #[serde(default)]
-    pub last_worklog_sync_at: i64,
-    // Same for the poll of deleted worklogs, which Jira reports separately
-    #[serde(default)]
-    pub last_worklog_delete_sync_at: i64,
+    // Defaults, so a config written before it existed still loads
     #[serde(default)]
     pub worklog_target: WorklogTarget,
     // Lives in the token store, never in the config file
@@ -152,6 +131,17 @@ pub(crate) async fn load(
     })
 }
 
+/// The sync state of a config written before the database held it, or `None`
+/// for a config without it. `db::sync_state::import` takes it over, and the
+/// next write of the config drops it from the file.
+pub(crate) async fn legacy_sync_state(data_dir: &Path) -> Option<SyncState> {
+    let json = tokio::fs::read(data_dir.join(CONFIG_FILE)).await.ok()?;
+    let config: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    // Such a config always has the list, empty before the projects were chosen
+    config.get("watched_projects")?;
+    serde_json::from_value(config).ok()
+}
+
 pub(crate) async fn save(
     data_dir: &Path,
     tokens: Arc<dyn TokenStore>,
@@ -251,7 +241,7 @@ mod tests {
         assert_eq!(loaded.as_ref(), Some(&config));
 
         // The next write is not stopped by what the crash left
-        config.last_sync_at = Some(7);
+        config.worklog_target = WorklogTarget::Tempo;
         save_config(data_dir.path(), &config).await.unwrap();
         let loaded = load(data_dir.path(), tokens, tempo_tokens).await;
         assert_eq!(loaded, Some(config));

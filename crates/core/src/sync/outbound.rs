@@ -60,7 +60,7 @@ pub(crate) async fn process_queue(
             Ok(delivered_as) => {
                 // One transaction: an issue must not stay pending with nothing left to send,
                 // and a comment must not be missing from both the outbox and the cache
-                let mut tx = state.pool.begin().await?;
+                let mut tx = crate::db::begin(&state.pool).await?;
                 sync_queue::mark_synced(&mut *tx, entry.id).await?;
                 match &delivered_as {
                     Delivered::Comment(comment) => {
@@ -199,7 +199,7 @@ async fn roll_back(
 ) -> anyhow::Result<Vec<SyncEvent>> {
     let issue = client.issue(key, inbound::ISSUE_FIELDS).await?;
     let record = inbound::issue_record(&issue)?;
-    let mut tx = state.pool.begin().await?;
+    let mut tx = crate::db::begin(&state.pool).await?;
     // An issue the cache does not have belongs to a project that is no longer
     // watched: upserting it would bring it back, and nothing syncs it there
     if !issues::mark_stale(&mut *tx, &record.id).await? {
@@ -410,6 +410,7 @@ mod tests {
     use super::*;
     use crate::{
         api,
+        db::sync_state,
         models::{RunningTimer, StatusCategory, SyncStatus, Transition, User},
         start_syncing_without_keychain, start_without_keychain,
         sync::inbound,
@@ -429,12 +430,6 @@ mod tests {
             site_url: site_url.to_owned(),
             email: "ada@example.com".to_owned(),
             account_id: "5b10a".to_owned(),
-            watched_projects: vec!["WEB".to_owned()],
-            last_sync_at: Some(inbound::now_ms().unwrap()),
-            pending_projects: Vec::new(),
-            last_reconcile_at: 0,
-            last_worklog_sync_at: 0,
-            last_worklog_delete_sync_at: 0,
             worklog_target: Default::default(),
             api_token: TOKEN.to_owned(),
             tempo_api_token: String::new(),
@@ -749,6 +744,9 @@ mod tests {
 
     async fn sign_in(state: &AppState, server: &MockServer) {
         *state.config.write().await = Some(config(&server.uri()));
+        sync_state::set_synced(&state.pool, &["WEB"], inbound::now_ms().unwrap())
+            .await
+            .unwrap();
         state.sync_waker.send(()).unwrap();
     }
 
@@ -2728,8 +2726,11 @@ mod tests {
 
         let config = config(&server.uri());
         *state.config.write().await = Some(config.clone());
+        sync_state::set_synced(&state.pool, &["WEB"], 1)
+            .await
+            .unwrap();
         let mut changed = Vec::new();
-        inbound::poll_updated_issues(&state, &config, 1, &mut changed)
+        inbound::poll_updated_issues(&state, &config, &["WEB".to_owned()], 1, &mut changed)
             .await
             .unwrap();
 
@@ -2770,8 +2771,11 @@ mod tests {
 
         let config = config(&server.uri());
         *state.config.write().await = Some(config.clone());
+        sync_state::set_synced(&state.pool, &["WEB"], 1)
+            .await
+            .unwrap();
         let mut changed = Vec::new();
-        inbound::poll_updated_issues(&state, &config, 1, &mut changed)
+        inbound::poll_updated_issues(&state, &config, &["WEB".to_owned()], 1, &mut changed)
             .await
             .unwrap();
 
@@ -3207,10 +3211,13 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         store_issue(&state).await;
-        let mut config = tempo_config(&state, &jira, &tempo);
+        *state.config.write().await = Some(tempo_config(&state, &jira, &tempo));
+        let now = inbound::now_ms().unwrap();
+        sync_state::set_synced(&state.pool, &["WEB"], now)
+            .await
+            .unwrap();
         // The pass for deleted issues would find WEB-1 missing from this Jira
-        config.last_reconcile_at = inbound::now_ms().unwrap();
-        *state.config.write().await = Some(config);
+        sync_state::reconciled(&state.pool, now).await.unwrap();
         tempo_worklog_call()
             .respond_with(ResponseTemplate::new(200).set_body_json(tempo_created(7)))
             .expect(1)
@@ -3283,11 +3290,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "issues": [moved] })))
             .mount(server)
             .await;
-        let mut config = config(&server.uri());
-        config.watched_projects.push("API".to_owned());
+        let config = config(&server.uri());
         *state.config.write().await = Some(config.clone());
-        let last_sync_at = config.last_sync_at.unwrap();
-        inbound::poll_updated_issues(state, &config, last_sync_at, &mut Vec::new())
+        let last_sync_at = inbound::now_ms().unwrap();
+        sync_state::set_synced(&state.pool, &["WEB", "API"], last_sync_at)
+            .await
+            .unwrap();
+        let watched = ["WEB".to_owned(), "API".to_owned()];
+        inbound::poll_updated_issues(state, &config, &watched, last_sync_at, &mut Vec::new())
             .await
             .unwrap();
     }

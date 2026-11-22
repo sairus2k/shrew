@@ -241,7 +241,7 @@ pub(crate) async fn retry(
     pool: &sqlx::SqlitePool,
     entry_id: i64,
 ) -> sqlx::Result<Option<IssueKey>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin(pool).await?;
     let entry: Option<(IssueKey, String)> = sqlx::query_as(
         "UPDATE sync_queue SET status = 'pending', retry_count = 0, error_msg = NULL
          WHERE id = ? AND entity_type = 'worklog' AND status = 'failed'
@@ -267,7 +267,7 @@ pub(crate) async fn discard(
     pool: &sqlx::SqlitePool,
     entry_id: i64,
 ) -> sqlx::Result<Option<IssueKey>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin(pool).await?;
     let entry: Option<(IssueKey, String)> = sqlx::query_as(
         "DELETE FROM sync_queue
          WHERE id = ? AND entity_type = 'worklog' AND status = 'failed'

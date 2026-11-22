@@ -2,6 +2,7 @@
 
 use crate::{
     AppState, SyncEvent,
+    db::sync_state,
     sync::{inbound, jira_client::JiraError, outbound, transitions},
 };
 use std::{sync::Arc, time::Duration};
@@ -137,7 +138,8 @@ async fn cycle(
     let Some(config) = state.config.read().await.clone() else {
         return Ok(());
     };
-    let Some(last_sync_at) = config.last_sync_at else {
+    let sync = sync_state::load(&state.pool).await?;
+    let Some(last_sync_at) = sync.last_sync_at else {
         return Ok(());
     };
 
@@ -156,12 +158,15 @@ async fn cycle(
         // Local changes go out first: the poll then reads what Jira made of them
         outbound::process_queue(state, &config, &mut changed).await?;
         outbound::roll_back_unconfirmed(state, &config, &mut changed).await;
-        inbound::poll_updated_issues(state, &config, last_sync_at, &mut changed).await?;
-        inbound::poll_updated_worklogs(state, &config, &mut changed).await?;
-        inbound::poll_deleted_worklogs(state, &config, &mut changed).await?;
+        let watched = &sync.watched_projects;
+        inbound::poll_updated_issues(state, &config, watched, last_sync_at, &mut changed).await?;
+        inbound::poll_updated_worklogs(state, &config, sync.last_worklog_sync_at, &mut changed)
+            .await?;
+        let deleted_since = sync.last_worklog_delete_sync_at;
+        inbound::poll_deleted_worklogs(state, &config, deleted_since, &mut changed).await?;
         // Deleted and moved issues never match `updated >=`: the poll cannot see them
-        if inbound::reconcile_due(&config, *reconciled, inbound::now_ms()?) {
-            changed.extend(inbound::reconcile_removed_issues(state, &config).await?);
+        if inbound::reconcile_due(sync.last_reconcile_at, *reconciled, inbound::now_ms()?) {
+            changed.extend(inbound::reconcile_removed_issues(state, &config, watched).await?);
             *reconciled = true;
         }
         anyhow::Ok(())

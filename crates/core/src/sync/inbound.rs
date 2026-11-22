@@ -2,10 +2,12 @@
 
 use crate::{
     AppState, SyncEvent, adf,
-    auth::{self, Config},
+    auth::Config,
     db::{
         issues::{self, IssueRecord, JiraTimestamp},
-        sync_queue, timer,
+        sync_queue,
+        sync_state::{self, Position},
+        timer,
         worklogs::{self, RemoteWorklog},
     },
     models::{IssueKey, StatusCategory},
@@ -152,14 +154,15 @@ pub(crate) fn status_category(key: &str) -> StatusCategory {
 /// starts over; issues that are already stored are skipped by the upsert.
 pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
     let config = state.config.read().await.clone().context("Sign in first")?;
+    let sync = sync_state::load(&state.pool).await?;
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     // An issue that changes while the pages are read can be missed by them. The
     // first incremental sync starts from this moment and picks it up.
     let started_at = now_ms()?;
 
-    let to_download = match config.last_sync_at {
-        Some(_) => &config.pending_projects,
-        None => &config.watched_projects,
+    let to_download = match sync.last_sync_at {
+        Some(_) => &sync.pending_projects,
+        None => &sync.watched_projects,
     };
     for project_key in to_download {
         let jql = format!("project = \"{project_key}\" ORDER BY updated DESC");
@@ -187,7 +190,7 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
                 .collect();
             // The worklog poll of the first setup starts from zero and brings
             // them all; one that has moved on never will
-            let listed = match config.last_sync_at {
+            let listed = match sync.last_sync_at {
                 Some(_) => worklogs_of(&client, records.iter()).await?,
                 None => Vec::new(),
             };
@@ -195,61 +198,55 @@ pub(crate) async fn initial_sync(state: &AppState) -> anyhow::Result<()> {
             // either stored before `watch_projects` deletes the rows of a
             // removed project or not stored at all
             let saved = state.config.read().await;
-            let watched = saved
-                .as_ref()
-                .is_some_and(|current| current.watched_projects.contains(project_key));
-            if !watched {
-                break;
-            }
             // One transaction per page: a commit per issue would make the disk
             // the slowest part of the sync
-            let mut tx = state.pool.begin().await?;
+            let mut tx = crate::db::begin(&state.pool).await?;
+            if !sync_state::watched(&mut *tx).await?.contains(project_key) {
+                break;
+            }
             for record in &records {
                 issues::upsert(&mut *tx, record).await?;
                 synced += 1;
             }
             store_worklogs(state, &mut tx, &listed, &mut Vec::new()).await?;
+            // The approximate total is never the reason to stop
+            let last_page = page.next_page_token.is_none();
+            if last_page {
+                sync_state::downloaded(&mut *tx, project_key).await?;
+            }
             tx.commit().await?;
             drop(saved);
             report(synced);
 
-            // The approximate total is never the reason to stop
-            if page.next_page_token.is_none() {
+            if last_page {
                 break;
             }
             page_token = page.next_page_token;
         }
-
-        // The saved config may have moved on meanwhile: only this project is ours to clear
-        let mut saved = state.config.write().await;
-        if let Some(current) = saved.as_mut() {
-            current.pending_projects.retain(|key| key != project_key);
-            auth::save_config(&state.data_dir, current).await?;
-        }
     }
 
-    let mut saved = state.config.write().await;
-    if let Some(current) = saved.as_mut() {
-        current.last_sync_at.get_or_insert(started_at);
-        auth::save_config(&state.data_dir, current).await?;
+    // A sign-out during the sync has reset the state: its time is not ours to set
+    if state.config.read().await.is_some() {
+        sync_state::finish_initial_sync(&state.pool, started_at).await?;
     }
-    drop(saved);
     state.events.send(SyncEvent::InitialSyncComplete).ok();
     Ok(())
 }
 
-/// Stores the issues Jira changed since `last_sync_at` and moves the saved sync
-/// time forward. The keys of the rows that changed are added to `changed` page
-/// by page, so the caller can announce them even when a later page fails.
+/// Stores the issues Jira changed in `watched_projects` since `last_sync_at`
+/// and moves the saved sync time forward with the last page. The keys of the
+/// rows that changed are added to `changed` page by page, so the caller can
+/// announce them even when a later page fails.
 pub(crate) async fn poll_updated_issues(
     state: &AppState,
     config: &Config,
+    watched_projects: &[String],
     last_sync_at: i64,
     changed: &mut Vec<IssueKey>,
 ) -> anyhow::Result<()> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     let started_at = now_ms()?;
-    let jql = incremental_jql(&config.watched_projects, last_sync_at, started_at);
+    let jql = incremental_jql(watched_projects, last_sync_at, started_at);
 
     let mut page_token = None;
     loop {
@@ -273,8 +270,8 @@ pub(crate) async fn poll_updated_issues(
         // the rows of a removed project under the write lock, so a page is
         // either stored before that delete or filtered by the new list
         let saved = state.config.read().await;
-        let watched = saved.as_ref().map_or(&[][..], |c| &c.watched_projects[..]);
-        let mut tx = state.pool.begin().await?;
+        let mut tx = crate::db::begin(&state.pool).await?;
+        let watched = sync_state::watched(&mut *tx).await?;
         for record in records {
             if !watched.contains(&record.project_key) {
                 continue;
@@ -296,26 +293,21 @@ pub(crate) async fn poll_updated_issues(
             }
         }
         store_worklogs(state, &mut tx, &listed, &mut Vec::new()).await?;
+        // The pages are ordered by time, so only the last one completes the
+        // span up to `started_at`
+        let last_page = page.next_page_token.is_none();
+        if last_page {
+            sync_state::advance(&mut *tx, Position::Issues, last_sync_at, started_at).await?;
+        }
         tx.commit().await?;
         drop(saved);
         changed.extend(written);
 
-        if page.next_page_token.is_none() {
-            break;
+        if last_page {
+            return Ok(());
         }
         page_token = page.next_page_token;
     }
-
-    let mut saved = state.config.write().await;
-    // A sign-in during the poll starts a new setup: its sync time is not ours to set
-    if let Some(current) = saved
-        .as_mut()
-        .filter(|current| current.last_sync_at == Some(last_sync_at))
-    {
-        current.last_sync_at = Some(started_at);
-        auth::save_config(&state.data_dir, current).await?;
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -414,16 +406,16 @@ async fn worklogs_of(
     Ok(listed)
 }
 
-/// Stores the worklogs Jira changed since the last poll, those of issues the
-/// cache has, and moves the saved time forward. The keys of the issues whose
-/// worklogs were written are added to `changed`.
+/// Stores the worklogs Jira changed since `since`, those of issues the cache
+/// has, and moves the saved time forward page by page. The keys of the issues
+/// whose worklogs were written are added to `changed`.
 pub(crate) async fn poll_updated_worklogs(
     state: &AppState,
     config: &Config,
+    mut since: i64,
     changed: &mut Vec<IssueKey>,
 ) -> anyhow::Result<()> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
-    let mut since = config.last_worklog_sync_at;
     loop {
         let page = client.updated_worklogs(since).await?;
         let ids: Vec<i64> = page
@@ -436,37 +428,29 @@ pub(crate) async fn poll_updated_worklogs(
         } else {
             client.worklogs(&ids).await?
         };
-        let mut tx = state.pool.begin().await?;
+        let mut tx = crate::db::begin(&state.pool).await?;
         store_worklogs(state, &mut tx, &listed, changed).await?;
-        tx.commit().await?;
         // Jira's time, not the local clock: the next poll asks from where this one ended
-        since = page.until.max(since);
+        let until = page.until.max(since);
+        sync_state::advance(&mut *tx, Position::Worklogs, since, until).await?;
+        tx.commit().await?;
+        since = until;
         if page.last_page {
-            break;
+            return Ok(());
         }
     }
-
-    let mut saved = state.config.write().await;
-    // A sign-in during the poll starts a new setup: its sync time is not ours to set
-    if let Some(current) = saved
-        .as_mut()
-        .filter(|current| current.last_worklog_sync_at == config.last_worklog_sync_at)
-    {
-        current.last_worklog_sync_at = since;
-        auth::save_config(&state.data_dir, current).await?;
-    }
-    Ok(())
 }
 
-/// Removes the worklogs Jira deleted since the last poll and moves the saved
-/// time forward. The keys of the issues that lost a worklog are added to `changed`.
+/// Removes the worklogs Jira deleted since `since` and moves the saved time
+/// forward page by page. The keys of the issues that lost a worklog are added
+/// to `changed`.
 pub(crate) async fn poll_deleted_worklogs(
     state: &AppState,
     config: &Config,
+    mut since: i64,
     changed: &mut Vec<IssueKey>,
 ) -> anyhow::Result<()> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
-    let mut since = config.last_worklog_delete_sync_at;
     loop {
         let page = client.deleted_worklogs(since).await?;
         let ids: Vec<i64> = page
@@ -474,29 +458,20 @@ pub(crate) async fn poll_deleted_worklogs(
             .iter()
             .map(|worklog| worklog.worklog_id)
             .collect();
-        let mut tx = state.pool.begin().await?;
+        let mut tx = crate::db::begin(&state.pool).await?;
         for key in worklogs::delete_remote(&mut tx, &ids).await? {
             if !changed.contains(&key) {
                 changed.push(key);
             }
         }
+        let until = page.until.max(since);
+        sync_state::advance(&mut *tx, Position::DeletedWorklogs, since, until).await?;
         tx.commit().await?;
-        since = page.until.max(since);
+        since = until;
         if page.last_page {
-            break;
+            return Ok(());
         }
     }
-
-    let mut saved = state.config.write().await;
-    // A sign-in during the poll starts a new setup: its sync time is not ours to set
-    if let Some(current) = saved
-        .as_mut()
-        .filter(|current| current.last_worklog_delete_sync_at == config.last_worklog_delete_sync_at)
-    {
-        current.last_worklog_delete_sync_at = since;
-        auth::save_config(&state.data_dir, current).await?;
-    }
-    Ok(())
 }
 
 // The span is relative ("-5m"), which Jira counts back from its own clock. A
@@ -520,47 +495,52 @@ fn in_projects(watched_projects: &[String]) -> String {
 
 /// Whether the pass for deleted and moved issues should run in this sync
 /// cycle: in the first one after the app started, then once an hour.
-pub(crate) fn reconcile_due(config: &Config, reconciled_since_start: bool, now: i64) -> bool {
+pub(crate) fn reconcile_due(
+    last_reconcile_at: i64,
+    reconciled_since_start: bool,
+    now: i64,
+) -> bool {
     // A saved time in the future means the clock was set back: waiting for it
     // to pass could take days
-    !reconciled_since_start
-        || !(0..RECONCILE_INTERVAL_MS).contains(&(now - config.last_reconcile_at))
+    !reconciled_since_start || !(0..RECONCILE_INTERVAL_MS).contains(&(now - last_reconcile_at))
 }
 
-/// Removes the cached issues that Jira no longer has in the watched projects:
+/// Removes the cached issues that Jira no longer has in `watched_projects`:
 /// deleted, moved to an unwatched project or hidden from the user. Returns
 /// their keys.
 pub(crate) async fn reconcile_removed_issues(
     state: &AppState,
     config: &Config,
+    watched_projects: &[String],
 ) -> anyhow::Result<Vec<IssueKey>> {
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
     let started_at = now_ms()?;
     // A failed page ends the pass here. A partial listing would read as "the
     // rest was deleted".
     let remote: HashSet<String> = client
-        .issue_ids(&in_projects(&config.watched_projects))
+        .issue_ids(&in_projects(watched_projects))
         .await?
         .into_iter()
         .collect();
 
-    let mut saved = state.config.write().await;
+    // The write lock keeps `watch_projects` and the pages of an initial sync
+    // out until the commit
+    let saved = state.config.write().await;
+    let mut tx = crate::db::begin(&state.pool).await?;
     // After a sign-in or a change of the watched projects during the listing,
     // the cache is no longer the one these ids describe
-    let Some(current) = saved.as_mut().filter(|current| {
-        current.site_url == config.site_url
-            && current.account_id == config.account_id
-            && current.watched_projects == config.watched_projects
-    }) else {
+    let same_account = saved.as_ref().is_some_and(|current| {
+        current.site_url == config.site_url && current.account_id == config.account_id
+    });
+    if !same_account || sync_state::watched(&mut *tx).await? != watched_projects {
         return Ok(Vec::new());
-    };
+    }
 
     let mut removed = Vec::new();
     let mut rejected = Vec::new();
-    let mut tx = state.pool.begin().await?;
     // Ids that only Jira has are new issues: the incremental poll stores them
     for issue in issues::cached(&mut *tx).await? {
-        if config.watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
+        if watched_projects.contains(&issue.project_key) && !remote.contains(&issue.id) {
             issues::delete(&mut *tx, &issue.id).await?;
             worklogs::delete_for_issue(&mut *tx, &issue.key).await?;
             timer::delete_for_issue(&mut *tx, &issue.key).await?;
@@ -577,13 +557,12 @@ pub(crate) async fn reconcile_removed_issues(
             removed.push(issue.key);
         }
     }
+    sync_state::reconciled(&mut *tx, started_at).await?;
     tx.commit().await?;
+    drop(saved);
     for event in rejected {
         state.events.send(event).ok();
     }
-
-    current.last_reconcile_at = started_at;
-    auth::save_config(&state.data_dir, current).await?;
     Ok(removed)
 }
 
@@ -740,7 +719,10 @@ mod tests {
         mount_page(&server, "WEB", Some("tok"), page(&[issue(3, "WEB")], None)).await;
         mount_count(&server, "API", 1).await;
         mount_page(&server, "API", None, page(&[issue(4, "API")], None)).await;
-        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(
+            api::setup_step(&state).await.unwrap(),
+            SetupStep::InitialSync
+        );
 
         api::initial_sync(&state).await.unwrap();
 
@@ -759,7 +741,7 @@ mod tests {
                 "InitialSyncComplete",
             ]
         );
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
 
         let stored = issues::get(&state.pool, &"WEB-1".into())
             .await
@@ -823,7 +805,7 @@ mod tests {
                 "InitialSyncComplete",
             ]
         );
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
     }
 
     fn without_summary(mut issue: Value) -> Value {
@@ -847,7 +829,7 @@ mod tests {
         api::initial_sync(&state).await.unwrap();
 
         assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-3"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         let received = received(&mut events);
         assert_eq!(received.last().unwrap(), "InitialSyncComplete");
         let skipped: Vec<_> = received
@@ -875,7 +857,7 @@ mod tests {
             .filter(|event| event.starts_with("WEB "))
             .collect();
         assert_eq!(progress, ["WEB 0 / ~3", "WEB 1 / ~3", "WEB 2 / ~3"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
     }
 
     #[tokio::test]
@@ -893,7 +875,10 @@ mod tests {
         assert!(error.to_string().contains("503"), "{error}");
         assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
         assert_eq!(received(&mut events), ["WEB 0 / ~3", "WEB 2 / ~3"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(
+            api::setup_step(&state).await.unwrap(),
+            SetupStep::InitialSync
+        );
         state.pool.close().await;
 
         // Jira is back, and the app is started again
@@ -902,7 +887,10 @@ mod tests {
         mount_page(&server, "WEB", None, page(&first, Some("tok"))).await;
         mount_page(&server, "WEB", Some("tok"), page(&[issue(3, "WEB")], None)).await;
         let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(
+            api::setup_step(&state).await.unwrap(),
+            SetupStep::InitialSync
+        );
 
         api::initial_sync(&state).await.unwrap();
 
@@ -912,7 +900,7 @@ mod tests {
 
         // A finished sync is not repeated by the start after it
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
     }
 
     /// A core that watches `projects`, with every project's issues downloaded:
@@ -953,8 +941,11 @@ mod tests {
 
         api::watch_projects(&state, &new_projects).await.unwrap();
 
-        assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(api::watched_projects(&state).await.unwrap(), ["WEB", "API"]);
+        assert_eq!(
+            api::setup_step(&state).await.unwrap(),
+            SetupStep::InitialSync
+        );
         mount_count(&server, "API", 1).await;
         mount_page(&server, "API", None, page(&[issue(3, "API")], None)).await;
         no_issue_worklogs().mount(&server).await;
@@ -966,7 +957,7 @@ mod tests {
             received(&mut events),
             ["API 0 / ~1", "API 1 / ~1", "InitialSyncComplete"]
         );
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         assert_eq!(last_sync_at(&state).await, synced_at);
     }
 
@@ -986,7 +977,10 @@ mod tests {
         let error = api::initial_sync(&state).await.unwrap_err();
 
         assert!(error.to_string().contains("503"), "{error}");
-        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(
+            api::setup_step(&state).await.unwrap(),
+            SetupStep::InitialSync
+        );
         state.pool.close().await;
 
         server.reset().await;
@@ -995,8 +989,11 @@ mod tests {
         mount_page(&server, "API", Some("tok"), page(&[issue(4, "API")], None)).await;
         no_issue_worklogs().mount(&server).await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::InitialSync);
+        assert_eq!(api::watched_projects(&state).await.unwrap(), ["WEB", "API"]);
+        assert_eq!(
+            api::setup_step(&state).await.unwrap(),
+            SetupStep::InitialSync
+        );
 
         // Only API is asked for: Jira answers 404 to any other query
         api::initial_sync(&state).await.unwrap();
@@ -1005,10 +1002,10 @@ mod tests {
             stored_keys(&state).await,
             ["API-3", "API-4", "WEB-1", "WEB-2"]
         );
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
     }
 
     #[tokio::test]
@@ -1023,8 +1020,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(api::watched_projects(&state).await, ["WEB"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::watched_projects(&state).await.unwrap(), ["WEB"]);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         assert_eq!(stored_keys(&state).await, ["WEB-1", "WEB-2"]);
         let listed = api::list_issues(&state, None).await.unwrap();
         assert_eq!(listed.len(), 2);
@@ -1046,8 +1043,8 @@ mod tests {
         let error = api::watch_projects(&state, &[]).await.unwrap_err();
 
         assert_eq!(error.to_string(), "Choose at least one project");
-        assert_eq!(api::watched_projects(&state).await, ["WEB", "API"]);
-        assert_eq!(api::setup_step(&state).await, SetupStep::Ready);
+        assert_eq!(api::watched_projects(&state).await.unwrap(), ["WEB", "API"]);
+        assert_eq!(api::setup_step(&state).await.unwrap(), SetupStep::Ready);
         assert_eq!(stored_keys(&state).await, ["API-3", "WEB-1", "WEB-2"]);
     }
 
@@ -1089,19 +1086,16 @@ mod tests {
         page(&issues, None)
     }
 
+    async fn saved(state: &AppState) -> sync_state::SyncState {
+        sync_state::load(&state.pool).await.unwrap()
+    }
+
     async fn last_reconcile_at(state: &AppState) -> i64 {
-        state
-            .config
-            .read()
-            .await
-            .as_ref()
-            .unwrap()
-            .last_reconcile_at
+        saved(state).await.last_reconcile_at
     }
 
     async fn last_sync_at(state: &AppState) -> i64 {
-        let config = state.config.read().await;
-        config.as_ref().unwrap().last_sync_at.unwrap()
+        saved(state).await.last_sync_at.unwrap()
     }
 
     /// The poll for the last `minutes`, answered with `response`.
@@ -1180,11 +1174,69 @@ mod tests {
         );
         assert_eq!(summary(&state, "WEB-1").await, "Renamed");
         assert_eq!(stored_keys(&state).await, ["API-5", "WEB-1", "WEB-2"]);
-        let now = last_sync_at(&state).await;
-        assert!(now > before);
-        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
-        let saved: Value = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(saved["last_sync_at"], json!(now));
+        assert!(last_sync_at(&state).await > before);
+    }
+
+    #[tokio::test]
+    async fn a_sync_cycle_and_a_change_of_the_watched_projects_leave_the_config_file_alone() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let before = saved(&state).await;
+        let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
+        poll(JUST_SYNCED, page(&[renamed], None))
+            .mount(&server)
+            .await;
+        // A write of the config would replace this
+        let config_file = data_dir.path().join("config.json");
+        std::fs::write(&config_file, "as it was").unwrap();
+
+        state.sync_waker.send(()).unwrap();
+        assert_eq!(
+            cycle(&mut events).await,
+            [
+                "Started",
+                r#"IssuesUpdated([IssueKey("WEB-1")])"#,
+                "Completed"
+            ]
+        );
+        api::watch_projects(&state, &["WEB".to_owned()])
+            .await
+            .unwrap();
+
+        let now = saved(&state).await;
+        assert!(now.last_sync_at > before.last_sync_at);
+        assert!(now.last_reconcile_at > before.last_reconcile_at);
+        assert_eq!(now.watched_projects, ["WEB"]);
+        assert_eq!(std::fs::read_to_string(&config_file).unwrap(), "as it was");
+    }
+
+    #[tokio::test]
+    async fn a_page_whose_position_cannot_be_saved_is_not_stored() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
+        let before = last_sync_at(&state).await;
+        let renamed = changed(issue(1, "WEB"), LATER, "Renamed");
+        poll(JUST_SYNCED, page(&[renamed], None))
+            .mount(&server)
+            .await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER disk_full BEFORE UPDATE ON sync_state
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        state.sync_waker.send(()).unwrap();
+
+        let events = cycle(&mut events).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events[1].contains("disk full"), "{events:?}");
+        // The page and its position are one transaction
+        assert_eq!(summary(&state, "WEB-1").await, "Issue number 1");
+        assert_eq!(last_sync_at(&state).await, before);
     }
 
     #[tokio::test]
@@ -1527,8 +1579,7 @@ mod tests {
     }
 
     async fn saved_worklog_time(state: &AppState) -> i64 {
-        let config = state.config.read().await;
-        config.as_ref().unwrap().last_worklog_sync_at
+        saved(state).await.last_worklog_sync_at
     }
 
     #[tokio::test]
@@ -1596,9 +1647,6 @@ mod tests {
             ["Grace Hopper"; 2].map(|name| Some(name.to_owned()))
         );
         assert_eq!(saved_worklog_time(&state).await, 9_000);
-        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
-        let saved: Value = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(saved["last_worklog_sync_at"], json!(9_000));
 
         // The next cycle asks from the end of the last page, and a worklog Jira
         // changed meanwhile replaces the stored one
@@ -1666,9 +1714,7 @@ mod tests {
             remaining,
             [(Some("3".to_owned()), 60), (None, 120), (None, 180)]
         );
-        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
-        let saved: Value = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(saved["last_worklog_delete_sync_at"], json!(9_000));
+        assert_eq!(saved(&state).await.last_worklog_delete_sync_at, 9_000);
 
         // The next cycle asks from the end of the last page, which `expect(1)` checks
         worklogs_deleted(9_000, &[], 9_500, true)
@@ -1677,16 +1723,7 @@ mod tests {
         state.sync_waker.send(()).unwrap();
 
         assert_eq!(cycle(&mut events).await, ["Started", "Completed"]);
-        assert_eq!(
-            state
-                .config
-                .read()
-                .await
-                .as_ref()
-                .unwrap()
-                .last_worklog_delete_sync_at,
-            9_500
-        );
+        assert_eq!(saved(&state).await.last_worklog_delete_sync_at, 9_500);
     }
 
     #[tokio::test]
@@ -1915,8 +1952,11 @@ mod tests {
         .unwrap();
         listing(ids(1..2)).with_priority(1).mount(&server).await;
         let config = state.config.read().await.clone().unwrap();
+        let watched = saved(&state).await.watched_projects;
 
-        reconcile_removed_issues(&state, &config).await.unwrap();
+        reconcile_removed_issues(&state, &config, &watched)
+            .await
+            .unwrap();
 
         let rows = stored_worklogs(&state).await;
         assert_eq!(rows.len(), 1);
@@ -1967,13 +2007,13 @@ mod tests {
         let server = MockServer::start().await;
         let data_dir = tempfile::tempdir().unwrap();
         let (state, _events) = synced(&server, data_dir.path(), &[issue(1, "WEB")]).await;
-        state.pool.close().await;
         // The app was last synced three hours ago
-        let config_file = data_dir.path().join("config.json");
-        let mut config: Value =
-            serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
-        config["last_sync_at"] = json!(now_ms().unwrap() - 3 * 60 * 60 * 1000);
-        std::fs::write(&config_file, config.to_string()).unwrap();
+        sqlx::query("UPDATE sync_state SET last_sync_at = ?")
+            .bind(now_ms().unwrap() - 3 * 60 * 60 * 1000)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.pool.close().await;
 
         // Only a poll for those three hours is answered; any other gets a 404
         server.reset().await;
@@ -2084,11 +2124,7 @@ mod tests {
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, "WEB-1".into());
-        let passed_at = last_reconcile_at(&state).await;
-        assert!(passed_at > 0);
-        let saved = std::fs::read(data_dir.path().join("config.json")).unwrap();
-        let saved: Value = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(saved["last_reconcile_at"], json!(passed_at));
+        assert!(last_reconcile_at(&state).await > 0);
 
         // The next cycle is within the hour: the listing is not asked for again
         state.sync_waker.send(()).unwrap();
@@ -2130,8 +2166,11 @@ mod tests {
             .await
             .unwrap();
         let config = state.config.read().await.clone().unwrap();
+        let watched = saved(&state).await.watched_projects;
 
-        let removed = reconcile_removed_issues(&state, &config).await.unwrap();
+        let removed = reconcile_removed_issues(&state, &config, &watched)
+            .await
+            .unwrap();
 
         assert_eq!(removed, std::slice::from_ref(&gone));
         let reason = "The issue no longer exists in Jira or is not visible to you";
@@ -2234,22 +2273,16 @@ mod tests {
 
     #[test]
     fn the_pass_runs_on_start_then_hourly() {
-        let mut config: Config = serde_json::from_value(json!({
-            "site_url": "http://localhost",
-            "email": "ada@example.com",
-            "account_id": "5b10a",
-        }))
-        .unwrap();
         const HOUR: i64 = 60 * 60 * 1000;
-        config.last_reconcile_at = 10 * HOUR;
+        let last = 10 * HOUR;
 
         // The app has just started: the saved time does not matter
-        assert!(reconcile_due(&config, false, 10 * HOUR + 1));
-        assert!(!reconcile_due(&config, true, 10 * HOUR + 1));
-        assert!(!reconcile_due(&config, true, 11 * HOUR - 1));
-        assert!(reconcile_due(&config, true, 11 * HOUR));
+        assert!(reconcile_due(last, false, 10 * HOUR + 1));
+        assert!(!reconcile_due(last, true, 10 * HOUR + 1));
+        assert!(!reconcile_due(last, true, 11 * HOUR - 1));
+        assert!(reconcile_due(last, true, 11 * HOUR));
         // The clock was set back since the last pass
-        assert!(reconcile_due(&config, true, 9 * HOUR));
+        assert!(reconcile_due(last, true, 9 * HOUR));
     }
 
     #[test]

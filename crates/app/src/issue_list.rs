@@ -88,9 +88,10 @@ impl IssueList {
     }
 
     fn load_projects(&mut self, cx: &mut Context<Self>) {
-        let load = spawn(cx, |state| async move {
-            Ok(api::watched_projects(&state).await)
-        });
+        let load = spawn(
+            cx,
+            |state| async move { api::watched_projects(&state).await },
+        );
         cx.spawn(async move |this, cx| {
             let projects = load.await;
             this.update(cx, |this, cx| {
@@ -445,8 +446,6 @@ pub(crate) mod tests {
             "site_url": site_url,
             "email": "ada@example.com",
             "account_id": "5b10a",
-            "watched_projects": ["WEB"],
-            "last_sync_at": 1,
         });
         std::fs::write(data_dir.path().join("config.json"), config.to_string()).unwrap();
         std::fs::write(data_dir.path().join("api-token"), "secret-token").unwrap();
@@ -456,7 +455,16 @@ pub(crate) mod tests {
                 .unwrap();
             state.store_issues(issues).await.unwrap();
         });
+        watch(tokio, data_dir.path(), &["WEB"]);
         data_dir
+    }
+
+    /// Makes the app of `data_dir` watch `projects`, their initial sync finished.
+    pub(crate) fn watch(tokio: &Runtime, data_dir: &std::path::Path, projects: &[&str]) {
+        tokio.block_on(async {
+            let (state, _events) = app_core::start_without_keychain(data_dir).await.unwrap();
+            state.set_synced(projects).await.unwrap();
+        });
     }
 
     /// What the sync engine does when Jira reports a new or changed issue.
@@ -471,10 +479,7 @@ pub(crate) mod tests {
     /// ids 101 and 102 so that they are newer than the WEB issues.
     fn synced_two_projects(tokio: &Runtime, issues: &[Value]) -> tempfile::TempDir {
         let data_dir = synced(tokio, issues);
-        let path = data_dir.path().join("config.json");
-        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        config["watched_projects"] = json!(["WEB", "API"]);
-        std::fs::write(path, config.to_string()).unwrap();
+        watch(tokio, data_dir.path(), &["WEB", "API"]);
         data_dir
     }
 

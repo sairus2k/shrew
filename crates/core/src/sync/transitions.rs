@@ -3,7 +3,7 @@
 use crate::{
     AppState,
     db::{
-        issues,
+        issues, sync_state,
         transitions::{self as cache, Position},
     },
     models::{IssueKey, RequiredField, Transition},
@@ -70,7 +70,7 @@ pub(crate) async fn preload(state: &AppState) {
         return;
     };
     // The initial sync is still filling the cache, with requests of its own
-    if config.last_sync_at.is_none() {
+    if !matches!(sync_state::load(&state.pool).await, Ok(sync) if sync.last_sync_at.is_some()) {
         return;
     }
     let client = JiraClient::new(&config.site_url, &config.email, &config.api_token);
@@ -580,8 +580,9 @@ mod tests {
     }
 
     async fn finish_initial_sync(state: &AppState) {
-        let mut config = state.config.write().await;
-        config.as_mut().unwrap().last_sync_at = Some(inbound::now_ms().unwrap());
+        sync_state::finish_initial_sync(&state.pool, inbound::now_ms().unwrap())
+            .await
+            .unwrap();
     }
 
     /// `core_with` after the initial sync, which is when the preload starts.

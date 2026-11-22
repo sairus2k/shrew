@@ -563,7 +563,7 @@ fn main() -> anyhow::Result<()> {
 
     let data_dir = dirs::data_dir().expect("no data dir").join(APP_ID);
     let (state, events) = tokio.block_on(app_core::start(&data_dir))?;
-    let step = tokio.block_on(app_core::api::setup_step(&state));
+    let step = tokio.block_on(app_core::api::setup_step(&state))?;
 
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);

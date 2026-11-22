@@ -66,13 +66,19 @@ impl AppState {
     /// Stores issues the way a sync does. Each one is an element of a Jira
     /// search page. No event is sent.
     pub async fn store_issues(&self, issues: &[serde_json::Value]) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin(&self.pool).await?;
         for issue in issues {
             let record = crate::sync::inbound::issue_record(issue)?;
             crate::db::issues::upsert(&mut *tx, &record).await?;
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Makes the app one that watches `projects` and has finished their
+    /// initial sync, without a Jira to download them from.
+    pub async fn set_synced(&self, projects: &[&str]) -> anyhow::Result<()> {
+        Ok(crate::db::sync_state::set_synced(&self.pool, projects, 1).await?)
     }
 
     /// Runs one cycle of the sync engine and the transition preload that

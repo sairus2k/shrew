@@ -52,10 +52,7 @@ impl SyncStatus {
         .detach();
 
         // What the previous run of the app saved, until this one completes a sync
-        let saved = spawn(
-            cx,
-            |state| async move { Ok(api::last_sync_at(&state).await) },
-        );
+        let saved = spawn(cx, |state| async move { api::last_sync_at(&state).await });
         let _load = cx.spawn(async move |this, cx| {
             let saved = saved.await.ok().flatten();
             this.update(cx, |this, cx| {

@@ -26,3 +26,4 @@ The wait depends on attention: 3 minutes while the window is focused, 15 in the 
 | [crates/core/src/sync/engine.rs](../../../../../../crates/core/src/sync/engine.rs) | [crates/core/src/sync/outbound.rs](../../../../../../crates/core/src/sync/outbound.rs) | Delivers outbox first | Rust call |
 | [crates/core/src/sync/engine.rs](../../../../../../crates/core/src/sync/engine.rs) | [crates/core/src/sync/inbound.rs](../../../../../../crates/core/src/sync/inbound.rs) | Polls Jira changes | Rust call |
 | [crates/core/src/sync/engine.rs](../../../../../../crates/core/src/sync/engine.rs) | [crates/core/src/events.rs](../../../../../../crates/core/src/events.rs) | Announces sync results | tokio mpsc channel |
+| [crates/core/src/sync/engine.rs](../../../../../../crates/core/src/sync/engine.rs) | [crates/core/src/db/sync_state.rs](../../../../../../crates/core/src/db/sync_state.rs) | Reads where each poll of a cycle starts | sqlx |
