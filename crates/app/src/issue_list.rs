@@ -1,6 +1,9 @@
 //! The main screen: the cached issues and the search over them.
 
-use crate::keys::{self, FilterByProject, FocusSearch, OpenSelected, SelectNext, SelectPrevious};
+use crate::keys::{
+    self, FilterByAssignee, FilterByProject, FilterByStatus, FocusSearch, OpenSelected, SelectNext,
+    SelectPrevious,
+};
 use crate::runtime::{Core, spawn};
 use crate::theme::{status_dot, tabular_digits};
 use app_core::{
@@ -63,6 +66,10 @@ struct Filter {
     value: Option<String>,
     /// The first one takes the filter off.
     choices: Vec<Choice>,
+    /// Of the button, for the shortcut that opens its menu.
+    focus: FocusHandle,
+    /// The action of that shortcut.
+    key: Box<dyn Action>,
 }
 
 /// The menu of a filter: the choice that takes it off, then `values`.
@@ -141,7 +148,10 @@ pub struct IssueList {
     selected: Option<IssueKey>,
     // Rests here while the user types nowhere, which is when the shortcuts apply
     focus: FocusHandle,
+    // Of the project filter, and of the button all the filters collapse into
     filter_focus: FocusHandle,
+    assignee_focus: FocusHandle,
+    status_focus: FocusHandle,
     scroll: UniformListScrollHandle,
     loading: Task<()>,
 }
@@ -192,6 +202,8 @@ impl IssueList {
             selected: None,
             focus: cx.focus_handle(),
             filter_focus: cx.focus_handle(),
+            assignee_focus: cx.focus_handle(),
+            status_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             loading: Task::ready(()),
         };
@@ -268,6 +280,8 @@ impl IssueList {
                     String::clone,
                     Pick::Project,
                 ),
+                focus: self.filter_focus.clone(),
+                key: Box::new(FilterByProject),
             });
         }
 
@@ -300,6 +314,8 @@ impl IssueList {
                 |assignee| assignee.label.clone(),
                 Pick::Assignee,
             ),
+            focus: self.assignee_focus.clone(),
+            key: Box::new(FilterByAssignee),
         });
         filters.push(Filter {
             id: "status-filter",
@@ -314,6 +330,8 @@ impl IssueList {
                 String::clone,
                 Pick::Status,
             ),
+            focus: self.status_focus.clone(),
+            key: Box::new(FilterByStatus),
         });
         filters
     }
@@ -547,6 +565,8 @@ impl IssueList {
             unset,
             value,
             choices,
+            focus,
+            key,
         } = filter;
         let label = match &value {
             Some(value) => format!("{name}: {value}"),
@@ -555,12 +575,8 @@ impl IssueList {
         let button = Button::new(id)
             .small()
             .label(label)
-            // The one filter with a key
-            .when(id == "project-filter", |button| {
-                button
-                    .track_focus(&self.filter_focus)
-                    .children(keys::hint(&FilterByProject, cx))
-            });
+            .track_focus(&focus)
+            .children(keys::hint(key.as_ref(), cx));
         let clear = choices[0].pick.clone();
         let menu = move |menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
             let menu = menu.scrollable(true).max_h(px(320.));
@@ -588,12 +604,7 @@ impl IssueList {
 
     /// Every filter in the menu of one button, for a list too narrow for
     /// their own buttons.
-    fn filters_button(
-        &self,
-        filters: Vec<Filter>,
-        choosable: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn filters_button(&self, filters: Vec<Filter>, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let set = filters
             .iter()
@@ -608,9 +619,8 @@ impl IssueList {
             .small()
             .label(label)
             .dropdown_caret(true)
-            .when(choosable, |button| {
-                button.children(keys::hint(&FilterByProject, cx))
-            });
+            // The key of every filter opens this menu; one of them fits
+            .children(keys::hint(filters[0].key.as_ref(), cx));
         let menu = move |mut menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
             menu = menu.scrollable(true).max_h(px(420.));
             for filter in &filters {
@@ -691,7 +701,7 @@ impl Render for IssueList {
             ),
         );
         let bar = if narrow {
-            bar.child(self.filters_button(filters, choosable, cx))
+            bar.child(self.filters_button(filters, cx))
         } else {
             let buttons: Vec<_> = filters
                 .into_iter()
@@ -738,6 +748,22 @@ impl Render for IssueList {
                     if choosable {
                         keys::open_menu(&this.filter_focus, window, cx)
                     }
+                }))
+                .on_action(cx.listener(move |this, _: &FilterByAssignee, window, cx| {
+                    let button = if narrow {
+                        &this.filter_focus
+                    } else {
+                        &this.assignee_focus
+                    };
+                    keys::open_menu(button, window, cx)
+                }))
+                .on_action(cx.listener(move |this, _: &FilterByStatus, window, cx| {
+                    let button = if narrow {
+                        &this.filter_focus
+                    } else {
+                        &this.status_focus
+                    };
+                    keys::open_menu(button, window, cx)
                 }))
                 .flex_1()
                 .min_h_0(),
@@ -1388,6 +1414,49 @@ pub(crate) mod tests {
         wait_for_rows(cx, window, &[CHECKOUT, LOGOUT, LOGIN]);
         in_window(cx, window, |window, _| {
             assert_eq!(window.find("project-filter").label(), Some("Project: WEB"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_assignee_and_the_status_are_chosen_from_the_keyboard(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "In Progress"],
+        );
+
+        // The menu holds Any assignee, Me, Unassigned and Grace Hopper
+        for key in ["shift-a", "down", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[API_MINE, MINE]);
+
+        // The menu holds Any status, To Do and In Progress
+        for key in ["shift-s", "down", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "assignee-filter"), "Assignee: Me");
+            assert_eq!(label(window, "status-filter"), "Status: To Do");
+        });
+
+        // Beside an open issue the same keys open the menu of all the filters
+        in_window(cx, window, |window, cx| {
+            window.click("clear-filters", cx);
+        });
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, cx| window.press("enter", cx));
+        for key in ["shift-s", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        in_window(cx, window, |window, _| {
+            assert!(!window.find_all_by_role(Role::MenuItem).is_empty());
         });
     }
 
