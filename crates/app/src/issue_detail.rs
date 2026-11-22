@@ -4,6 +4,7 @@ use crate::assignee::AssigneeButton;
 use crate::comment::CommentForm;
 use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
+use crate::keys;
 use crate::runtime::spawn;
 use crate::theme::{badge, tabular_digits};
 use crate::timer::{ActiveTimer, TimerControl};
@@ -589,6 +590,7 @@ impl Render for DetailPane {
             .ghost()
             .small()
             .label("Close")
+            .children(keys::hint(&keys::Back, cx))
             .on_click(cx.listener(|_, _, _, cx| cx.emit(DetailClosed)));
         let issue = self.issue.read(cx);
         let open_in_jira = issue.detail.as_ref().map(|detail| {
@@ -596,6 +598,7 @@ impl Render for DetailPane {
             Button::new("open-in-jira")
                 .small()
                 .label("Open in Jira")
+                .children(keys::hint(&keys::OpenInJira, cx))
                 .on_click(move |_, _, cx| cx.open_url(&url))
         });
 
@@ -820,6 +823,10 @@ pub(crate) mod tests {
             assert_eq!((pane.left(), pane.right()), (px(321.), px(800.)));
             for text in texts(window) {
                 let line = text.bounds();
+                // The key hint of the search is a text of the list
+                if line.right() <= pane.left() {
+                    continue;
+                }
                 assert!(
                     line.left() >= pane.left() && line.right() <= pane.right(),
                     "{line:?} is outside {pane:?}"

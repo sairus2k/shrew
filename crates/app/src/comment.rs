@@ -1,5 +1,6 @@
 //! The input under the comments of an issue.
 
+use crate::keys;
 use crate::runtime::spawn;
 use app_core::{api, models::IssueKey};
 use gpui_kit::component::{
@@ -90,7 +91,15 @@ impl Render for CommentForm {
                     .id("comment-input")
                     .test_support()
                     .w_full()
-                    .child(Textarea::new(&self.input).aria_label("New comment")),
+                    .relative()
+                    .child(Textarea::new(&self.input).aria_label("New comment"))
+                    // Only over an empty input: the corner is where the first
+                    // line of a comment ends
+                    .children(
+                        keys::hint(&keys::WriteComment, cx)
+                            .filter(|_| empty)
+                            .map(|hint| div().absolute().top_1p5().right_1p5().child(hint)),
+                    ),
             )
             .child(
                 Button::new("submit-comment")

@@ -1,6 +1,7 @@
 //! The assignee of an issue as a button whose menu holds the people it can be assigned to.
 
 use crate::issue::IssueModel;
+use crate::keys;
 use crate::runtime::spawn;
 use app_core::{api, models::User};
 use gpui_kit::component::{
@@ -131,6 +132,7 @@ impl Render for AssigneeButton {
             .accessibility_label(assignee.clone())
             .children(avatar)
             .child(assignee)
+            .children(keys::hint(&keys::ChangeAssignee, cx))
             .disabled(people.is_empty())
             .dropdown_menu(move |mut menu, window, _| {
                 menu = menu.scrollable(true).max_h(px(320.));

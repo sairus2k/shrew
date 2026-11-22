@@ -105,6 +105,7 @@ async fn sign_in_as(
         account_id: myself.account_id,
         api_token: api_token.to_owned(),
         worklog_target: Default::default(),
+        shortcut_hints: true,
         tempo_api_token: String::new(),
     };
     let account = Account {
@@ -209,6 +210,20 @@ pub async fn set_worklog_target(state: &AppState, target: WorklogTarget) -> anyh
     drop(saved);
     state.sync_waker.send(()).ok();
     Ok(())
+}
+
+/// Whether the controls show the key of their shortcut. They do until the
+/// user turns it off, and while nobody is signed in.
+pub async fn shortcut_hints(state: &AppState) -> bool {
+    let config = state.config.read().await;
+    config.as_ref().is_none_or(|config| config.shortcut_hints)
+}
+
+pub async fn set_shortcut_hints(state: &AppState, shown: bool) -> anyhow::Result<()> {
+    let mut saved = state.config.write().await;
+    let current = saved.as_mut().context("Sign in first")?;
+    current.shortcut_hints = shown;
+    auth::save_config(&state.data_dir, current).await
 }
 
 /// Saves the Tempo API token in the token store. It is not checked: Tempo has
@@ -637,6 +652,7 @@ mod tests {
                 "email": "ada@example.com",
                 "account_id": "5b10a",
                 "worklog_target": "jira",
+                "shortcut_hints": true,
             })
         );
         assert_eq!(
@@ -722,6 +738,32 @@ mod tests {
 
         sign_out(&state).await.unwrap();
         assert_eq!(state.tempo_tokens.load().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_shortcut_hints_are_shown_until_turned_off_and_the_choice_survives_a_restart() {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        // Nobody is signed in, and there is no config to keep the choice
+        assert!(shortcut_hints(&state).await);
+        assert!(set_shortcut_hints(&state, false).await.is_err());
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        assert!(shortcut_hints(&state).await);
+
+        set_shortcut_hints(&state, false).await.unwrap();
+        assert!(!shortcut_hints(&state).await);
+        state.pool.close().await;
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert!(!shortcut_hints(&state).await);
+        set_shortcut_hints(&state, true).await.unwrap();
+        state.pool.close().await;
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert!(shortcut_hints(&state).await);
     }
 
     fn project_list() -> ResponseTemplate {

@@ -20,12 +20,18 @@ actions!(
         OpenTimerIssue,
         OpenInJira,
         SyncNow,
-        EditTimeTracking,
+        EditUserSettings,
         EditProjects,
         ShowShortcuts,
         Back
     ]
 );
+
+/// Whether the controls show the key of their shortcut. The core keeps the
+/// choice; this is its copy for the render, which cannot wait for the core.
+pub struct Hints(pub bool);
+
+impl Global for Hints {}
 
 /// The key context of the issue list, which has the focus while the user
 /// types nowhere. Every shortcut of one key is bound in it, so that typing in
@@ -51,7 +57,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-t", OpenTimerIssue, Some(LIST)),
         KeyBinding::new("b", OpenInJira, Some(LIST)),
         KeyBinding::new("r", SyncNow, Some(LIST)),
-        KeyBinding::new("cmd-,", EditTimeTracking, Some(LIST)),
+        KeyBinding::new("cmd-,", EditUserSettings, Some(LIST)),
         KeyBinding::new("shift-p", EditProjects, Some(LIST)),
         KeyBinding::new("?", ShowShortcuts, Some(LIST)),
         KeyBinding::new("escape", Back, Some(HOME)),
@@ -82,7 +88,7 @@ fn listed() -> [(Box<dyn Action>, &'static str); 17] {
         ),
         (Box::new(OpenInJira), "Open in Jira"),
         (Box::new(SyncNow), "Sync now"),
-        (Box::new(EditTimeTracking), "Time tracking settings"),
+        (Box::new(EditUserSettings), "Settings"),
         (Box::new(EditProjects), "Choose the projects"),
         (Box::new(ShowShortcuts), "Show this list"),
     ]
@@ -104,6 +110,24 @@ fn keys_of(action: &dyn Action, cx: &App) -> Vec<Keystroke> {
         .bindings_for_action(action)
         .filter_map(|binding| Some(binding.keystrokes().first()?.inner().clone()))
         .collect()
+}
+
+/// The key of `action`, to show in the control that does the same, or nothing
+/// when the user turned the hints off. With several keys bound, the first.
+pub fn hint(action: &dyn Action, cx: &App) -> Option<AnyElement> {
+    if !cx.global::<Hints>().0 {
+        return None;
+    }
+    let key = keys_of(action, cx).into_iter().next()?;
+    Some(
+        div()
+            .id(SharedString::from(format!("hint:{}", action.name())))
+            .test_support()
+            .aria_label(key.display(OperatingSystem::Mac).to_string())
+            .flex_none()
+            .child(Kbd::new(key))
+            .into_any_element(),
+    )
 }
 
 fn line(
@@ -173,6 +197,7 @@ pub fn open_menu(button: &FocusHandle, window: &mut Window, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use super::{ChangeStatus, LIST};
     use crate::harness::{
         in_window, launch, no_worklog_changes, tab_to, tokio_runtime, wait_until,
     };
@@ -180,7 +205,7 @@ mod tests {
     use crate::runtime::Core;
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::{TestQueryExt, TestWindowExt};
-    use gpui_kit::{AnyWindowHandle, Role, TestAppContext, Window};
+    use gpui_kit::{AnyWindowHandle, KeyBinding, Role, TestAppContext, Window};
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -591,6 +616,144 @@ mod tests {
         });
     }
 
+    /// The hints on screen: the action each stands for and the key it shows.
+    fn hints(window: &Window) -> Vec<(String, String)> {
+        let mut hints: Vec<_> = window
+            .elements()
+            .iter()
+            .filter_map(|element| {
+                let action = element.path().last()?.to_string();
+                let action = action.strip_prefix("hint:keys::")?.to_owned();
+                Some((action, element.label()?.to_owned()))
+            })
+            .collect();
+        hints.sort();
+        hints
+    }
+
+    #[gpui_kit::test]
+    fn every_control_with_a_shortcut_shows_the_key_bound_to_it(cx: &mut TestAppContext) {
+        let app = app(cx);
+        open_top(cx, &app);
+        // The running timer adds its issue to the status bar
+        press(cx, &app, &["t"]);
+
+        let shown = in_window(cx, app.window, |window, _| hints(window));
+
+        let expected = [
+            ("Back", "⎋"),
+            ("ChangeAssignee", "A"),
+            ("ChangeStatus", "S"),
+            ("EditProjects", "⇧P"),
+            ("EditUserSettings", "⌘,"),
+            ("FocusSearch", "/"),
+            ("LogTime", "W"),
+            ("OpenInJira", "B"),
+            ("OpenTimerIssue", "⇧T"),
+            ("ToggleTimer", "T"),
+            ("WriteComment", "C"),
+        ];
+        let shown: Vec<_> = shown
+            .iter()
+            .map(|(action, key)| (action.as_str(), key.as_str()))
+            .collect();
+        assert_eq!(shown, expected);
+    }
+
+    #[gpui_kit::test]
+    fn a_hint_shows_the_key_the_keymap_binds_now(cx: &mut TestAppContext) {
+        let app = app(cx);
+        open_top(cx, &app);
+
+        cx.update(|cx| {
+            cx.clear_key_bindings();
+            cx.bind_keys([KeyBinding::new("x", ChangeStatus, Some(LIST))]);
+        });
+
+        // An action without a key has no hint
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(hints(window), [("ChangeStatus".to_owned(), "X".to_owned())])
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_hints_are_turned_off_in_the_settings_and_the_shortcuts_keep_working(
+        cx: &mut TestAppContext,
+    ) {
+        let app = app(cx);
+        let state = cx.update(|cx| cx.global::<Core>().state.clone());
+
+        press(cx, &app, &["cmd-,"]);
+        in_window(cx, app.window, |window, cx| {
+            assert_eq!(window.find("shortcut-hints").checked(), Some(true));
+            window.click("shortcut-hints", cx);
+        });
+        wait_until(cx, app.window, |window| {
+            window.find("shortcut-hints").checked() == Some(false)
+        });
+        in_window(cx, app.window, |window, cx| {
+            window.click("close-settings", cx)
+        });
+        wait_until(cx, app.window, |window| window.try_find("home").is_some());
+
+        // The core has it, and the next start reads it from there
+        assert!(!app._tokio.block_on(app_core::api::shortcut_hints(&state)));
+        open_top(cx, &app);
+        press(cx, &app, &["t"]);
+        in_window(cx, app.window, |window, _| {
+            assert!(hints(window).is_empty());
+            assert!(window.try_find("stop-timer").is_some());
+        });
+        press(cx, &app, &["s"]);
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(menu(window), ["Start"])
+        });
+        press(cx, &app, &["escape", "?"]);
+        in_window(cx, app.window, |window, cx| {
+            assert!(window.has_active_dialog(cx))
+        });
+        press(cx, &app, &["escape"]);
+
+        // And back on
+        press(cx, &app, &["cmd-,"]);
+        in_window(cx, app.window, |window, cx| {
+            window.click("shortcut-hints", cx)
+        });
+        wait_until(cx, app.window, |window| {
+            window.find("shortcut-hints").checked() == Some(true)
+        });
+        in_window(cx, app.window, |window, cx| {
+            window.click("close-settings", cx)
+        });
+        wait_until(cx, app.window, |window| window.try_find("home").is_some());
+        in_window(cx, app.window, |window, _| {
+            assert!(!hints(window).is_empty())
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_app_started_with_the_hints_turned_off_shows_none(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let issues = [issue(1, "Fix login")];
+        let data_dir = synced_on(&tokio, "https://127.0.0.1:1", &issues);
+        tokio.block_on(async {
+            let (state, _events) = app_core::start_without_keychain(data_dir.path())
+                .await
+                .unwrap();
+            app_core::api::set_shortcut_hints(&state, false)
+                .await
+                .unwrap();
+        });
+
+        let window = launch(cx, &tokio, data_dir.path());
+
+        wait_until(cx, window, |window| rows(window).len() == 1);
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("edit-settings").is_some());
+            assert!(hints(window).is_empty());
+        });
+    }
+
     fn shortcuts(window: &Window) -> Vec<String> {
         (0usize..)
             .map_while(|index| window.try_find(("shortcut", index)))
@@ -619,7 +782,7 @@ mod tests {
             "⇧T: Open the issue of the running timer",
             "B: Open in Jira",
             "R: Sync now",
-            "⌘,: Time tracking settings",
+            "⌘,: Settings",
             "⇧P: Choose the projects",
             "?: Show this list",
             "Tab, ⇧Tab: Move through the buttons and the fields",

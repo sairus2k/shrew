@@ -64,8 +64,10 @@ pub(crate) mod tests {
             .block_on(app_core::start_without_keychain(data_dir))
             .unwrap();
         let step = tokio.block_on(app_core::api::setup_step(&state)).unwrap();
+        let hints = tokio.block_on(app_core::api::shortcut_hints(&state));
         let handle = tokio.handle().clone();
         cx.update(|cx| {
+            cx.set_global(crate::keys::Hints(hints));
             let sync = cx.new(|cx| SyncBridge::new(events, cx));
             cx.set_global(Core {
                 state,

@@ -1,6 +1,7 @@
 //! The form that logs time on an issue after the fact.
 
 use crate::duration::{local_minute, parse_duration, parse_local_minute};
+use crate::keys;
 use crate::runtime::spawn;
 use app_core::{api, models::IssueKey};
 use chrono::Local;
@@ -10,6 +11,7 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState},
     notification::Notification,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub struct WorklogForm {
@@ -120,7 +122,8 @@ impl Render for WorklogForm {
                         div().w(px(90.)).flex_none().child(
                             Input::new(&self.duration)
                                 .id("worklog-duration")
-                                .aria_label("Time spent"),
+                                .aria_label("Time spent")
+                                .when_some(keys::hint(&keys::LogTime, cx), Input::suffix),
                         ),
                     )
                     .child(

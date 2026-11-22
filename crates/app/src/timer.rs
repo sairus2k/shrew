@@ -1,6 +1,7 @@
 //! The running timer. It lives in SQLite; this entity holds a copy for
 //! rendering and sends every start and stop to the core.
 
+use crate::keys;
 use crate::runtime::spawn;
 use crate::theme::tabular_digits;
 use app_core::{
@@ -212,10 +213,12 @@ impl Render for TimerControl {
             Some(_) => Button::new("stop-timer")
                 .small()
                 .label("Stop")
+                .children(keys::hint(&keys::ToggleTimer, cx))
                 .on_click(move |_, _, cx| timer.update(cx, |timer, cx| timer.stop(cx))),
             None => Button::new("start-timer")
                 .small()
                 .label("Start timer")
+                .children(keys::hint(&keys::ToggleTimer, cx))
                 .on_click(move |_, _, cx| {
                     timer.update(cx, |timer, cx| timer.start(key.clone(), cx))
                 }),
@@ -290,6 +293,7 @@ impl Render for TimerStatus {
                     }))
                     .child(key),
             )
+            .children(keys::hint(&keys::OpenTimerIssue, cx))
             .child(
                 div()
                     .id("running-timer-elapsed")

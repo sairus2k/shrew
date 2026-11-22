@@ -15,7 +15,7 @@ use issue::IssueModel;
 use issue_detail::{DetailClosed, DetailPane};
 use issue_list::{IssueList, IssueOpened};
 use keys::{
-    Back, ChangeAssignee, ChangeStatus, EditProjects, EditTimeTracking, LogTime, OpenInJira,
+    Back, ChangeAssignee, ChangeStatus, EditProjects, EditUserSettings, LogTime, OpenInJira,
     OpenTimerIssue, ShowShortcuts, SyncNow, ToggleTimer, WriteComment,
 };
 use new_token::{NewToken, TokenRenewed};
@@ -260,6 +260,8 @@ impl Root {
             // The next account starts with its own sync errors
             this.notified_error = None;
             tray::forget(cx);
+            // The choice went with the config of the account
+            cx.set_global(keys::Hints(true));
             this.show(SetupStep::SignIn, window, cx)
         })
         .detach();
@@ -404,6 +406,8 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings_key = keys::hint(&EditUserSettings, cx);
+        let projects_key = keys::hint(&EditProjects, cx);
         let screen = match &self.screen {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
             Screen::EnterToken { new_token, account } => div()
@@ -449,7 +453,7 @@ impl Render for Root {
                 .on_action(cx.listener(Self::toggle_timer))
                 .on_action(cx.listener(Self::open_timer_issue))
                 .on_action(|_: &SyncNow, _, cx| app_core::api::sync_now(&cx.global::<Core>().state))
-                .on_action(cx.listener(|this, _: &EditTimeTracking, window, cx| {
+                .on_action(cx.listener(|this, _: &EditUserSettings, window, cx| {
                     this.edit_settings(window, cx)
                 }))
                 .on_action(
@@ -507,7 +511,8 @@ impl Render for Root {
                             Button::new("edit-settings")
                                 .ghost()
                                 .xsmall()
-                                .label("Time tracking")
+                                .label("Settings")
+                                .children(settings_key)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.edit_settings(window, cx)
                                 })),
@@ -517,6 +522,7 @@ impl Render for Root {
                                 .ghost()
                                 .xsmall()
                                 .label("Projects")
+                                .children(projects_key)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.edit_projects(window, cx)
                                 })),
@@ -538,7 +544,7 @@ impl Render for Root {
 }
 
 const TEMPO_REJECTED: &str = "Tempo rejected the API token, so logged time waits in the queue. \
-     Save a new token under Time tracking, or switch the target to Jira";
+     Save a new token under Settings, or switch the target to Jira";
 
 fn rejection_message(key: &IssueKey, action: &str, reason: &str) -> String {
     format!("{key}: {action} rejected: {reason}")
@@ -564,6 +570,7 @@ fn main() -> anyhow::Result<()> {
     let data_dir = dirs::data_dir().expect("no data dir").join(APP_ID);
     let (state, events) = tokio.block_on(app_core::start(&data_dir))?;
     let step = tokio.block_on(app_core::api::setup_step(&state))?;
+    let hints = tokio.block_on(app_core::api::shortcut_hints(&state));
 
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
@@ -572,6 +579,7 @@ fn main() -> anyhow::Result<()> {
         keys::init(cx);
         tray::init(cx);
 
+        cx.set_global(keys::Hints(hints));
         let sync = cx.new(|cx| SyncBridge::new(events, cx));
         cx.set_global(Core {
             state,

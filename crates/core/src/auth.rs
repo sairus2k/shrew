@@ -17,12 +17,18 @@ pub(crate) struct Config {
     // Defaults, so a config written before it existed still loads
     #[serde(default)]
     pub worklog_target: WorklogTarget,
+    #[serde(default = "shown")]
+    pub shortcut_hints: bool,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,
     // Same; empty when the user has not saved a Tempo token
     #[serde(skip)]
     pub tempo_api_token: String,
+}
+
+fn shown() -> bool {
+    true
 }
 
 /// Where the API token is kept. The calls block: run them off the async threads.

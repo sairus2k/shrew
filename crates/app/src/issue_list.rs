@@ -335,7 +335,8 @@ impl Render for IssueList {
                         div().flex_1().min_w_0().child(
                             Input::new(&self.query)
                                 .id("search")
-                                .aria_label("Search issues"),
+                                .aria_label("Search issues")
+                                .when_some(keys::hint(&FocusSearch, cx), Input::suffix),
                         ),
                     )
                     .when(choosable, |bar| {
@@ -344,6 +345,7 @@ impl Render for IssueList {
                                 .track_focus(&self.filter_focus)
                                 .small()
                                 .label(self.project.clone().unwrap_or("All projects".to_owned()))
+                                .children(keys::hint(&FilterByProject, cx))
                                 .dropdown_menu(move |mut menu, window, _| {
                                     let choices = std::iter::once(None)
                                         .chain(projects.iter().cloned().map(Some));

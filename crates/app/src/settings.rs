@@ -1,5 +1,7 @@
-//! Where logged time goes, Jira or Tempo, and the Tempo API token.
+//! The settings: where logged time goes, Jira or Tempo, with the Tempo API
+//! token, and whether the controls show the keys of their shortcuts.
 
+use crate::keys::Hints;
 use crate::runtime::spawn;
 use app_core::{
     api,
@@ -8,6 +10,7 @@ use app_core::{
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
 };
 use gpui_kit::*;
@@ -22,6 +25,7 @@ pub struct Settings {
     error: Option<SharedString>,
     saving: Option<Task<()>>,
     _load: Task<()>,
+    _hints: Task<()>,
 }
 
 impl EventEmitter<SettingsClosed> for Settings {}
@@ -45,6 +49,7 @@ impl Settings {
             error: None,
             saving: None,
             _load: Task::ready(()),
+            _hints: Task::ready(()),
         };
         this._load = this.run(
             cx,
@@ -96,6 +101,25 @@ impl Settings {
             api::save_tempo_token(&state, &token).await?;
             api::worklog_settings(&state).await
         }));
+        cx.notify();
+    }
+
+    fn show_hints(&mut self, shown: bool, cx: &mut Context<Self>) {
+        self.error = None;
+        let saved = spawn(cx, move |state| async move {
+            api::set_shortcut_hints(&state, shown).await
+        });
+        self._hints = cx.spawn(async move |this, cx| {
+            let result = saved.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => cx.set_global(Hints(shown)),
+                    Err(error) => this.error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
         cx.notify();
     }
 }
@@ -184,6 +208,13 @@ impl Render for Settings {
                                 .on_click(cx.listener(|this, _, _, cx| this.save_token(cx))),
                         ),
                     ),
+            )
+            .child(div().mt_3().text_xl().child("Keyboard shortcuts"))
+            .child(
+                Checkbox::new("shortcut-hints")
+                    .label("Show the key of a shortcut in its button or field")
+                    .checked(cx.global::<Hints>().0)
+                    .on_click(cx.listener(|this, shown: &bool, _, cx| this.show_hints(*shown, cx))),
             )
             .children(self.error.clone().map(|error| {
                 div()

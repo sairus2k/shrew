@@ -431,6 +431,7 @@ mod tests {
             email: "ada@example.com".to_owned(),
             account_id: "5b10a".to_owned(),
             worklog_target: Default::default(),
+            shortcut_hints: true,
             api_token: TOKEN.to_owned(),
             tempo_api_token: String::new(),
         }

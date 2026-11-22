@@ -1,6 +1,7 @@
 //! The status of an issue as a button whose menu holds the transitions out of it.
 
 use crate::issue::IssueModel;
+use crate::keys;
 use crate::runtime::spawn;
 use crate::theme::status_dot;
 use app_core::{
@@ -181,6 +182,7 @@ impl Render for StatusButton {
                     .accessibility_label(status.clone().unwrap_or_default())
                     .children(dot)
                     .child(status.unwrap_or_default())
+                    .children(keys::hint(&keys::ChangeStatus, cx))
                     .disabled(transitions.is_empty())
                     .dropdown_menu(move |mut menu, window, _| {
                         for transition in transitions.iter().cloned() {
