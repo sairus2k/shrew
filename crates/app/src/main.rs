@@ -258,7 +258,7 @@ impl Root {
     }
 
     fn account(in_settings: bool, window: &mut Window, cx: &mut Context<Self>) -> Entity<Account> {
-        let account = cx.new(|cx| Account::new(in_settings, cx));
+        let account = cx.new(|cx| Account::new(in_settings, window, cx));
         cx.subscribe_in(&account, window, |this, _, _: &SignedOut, window, cx| {
             // The next account starts with its own sync errors
             this.notified_error = None;

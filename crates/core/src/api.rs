@@ -166,9 +166,10 @@ pub async fn sign_out(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replaces the API token after `SyncEvent::TokenRejected`, or saves one at
-/// `SetupStep::EnterToken`. The token is checked with Jira and saved only if
-/// Jira accepts it; the sync then resumes.
+/// Replaces the API token: after `SyncEvent::TokenRejected`, when the user
+/// asks to in the settings, or to save one at `SetupStep::EnterToken`. The
+/// token is checked with Jira and saved only if Jira accepts it for the saved
+/// account; the sync then resumes.
 /// The error says what went wrong in words meant for the user.
 pub async fn renew_token(state: &AppState, api_token: &str) -> anyhow::Result<()> {
     let api_token = api_token.trim();
@@ -181,6 +182,10 @@ pub async fn renew_token(state: &AppState, api_token: &str) -> anyhow::Result<()
         .myself()
         .await
     {
+        // The cache and the outbox are of the saved account
+        Ok(myself) if myself.account_id != config.account_id => {
+            bail!("This API token belongs to another Jira account")
+        }
         Ok(_) => {}
         Err(JiraError::Unauthorized) => bail!("Jira rejected the API token"),
         Err(JiraError::Status(status, _)) => bail!("{site_url} answered {status}"),
@@ -1852,6 +1857,32 @@ mod tests {
         );
         nothing_is_lost(&state).await;
         the_unsent_change_is_delivered(&state, &server).await;
+    }
+
+    #[tokio::test]
+    async fn a_token_of_another_account_is_refused_and_the_saved_one_stays() {
+        let (server, _data_dir, state) = core_with_an_unsent_change().await;
+        Mock::given(path("/rest/api/3/myself"))
+            .and(basic_auth("ada@example.com", "her-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "accountId": "7c20b", "displayName": "Grace" })),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let error = renew_token(&state, "her-token").await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "This API token belongs to another Jira account"
+        );
+        assert_eq!(
+            state.tokens.load().unwrap().as_deref(),
+            Some("secret-token")
+        );
+        nothing_is_lost(&state).await;
     }
 
     #[tokio::test]

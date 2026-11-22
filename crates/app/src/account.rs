@@ -1,5 +1,6 @@
-//! The signed-in account and its sign-out: a row of the settings, and one line
-//! under the form that asks for a missing token.
+//! The signed-in account and its sign-out: a row of the settings, with the
+//! replacement of the API token under it, and one line under the form that
+//! asks for a missing token.
 
 use crate::runtime::spawn;
 use app_core::api;
@@ -8,6 +9,7 @@ use gpui_kit::component::{
     ActiveTheme, Sizable, WindowExt as _,
     avatar::Avatar,
     button::{Button, ButtonVariants},
+    input::{Input, InputEvent, InputState},
     notification::Notification,
 };
 use gpui_kit::*;
@@ -23,13 +25,39 @@ pub struct Account {
     name: Option<SharedString>,
     site: Option<SharedString>,
     signing_out: Option<Task<()>>,
+    api_token: Entity<InputState>,
+    // The field for a new API token is shown
+    replacing: bool,
+    // Jira accepted a new token since the page was opened
+    replaced: bool,
+    token_error: Option<SharedString>,
+    saving_token: Option<Task<()>>,
+    // Takes the focus from the token field when the field goes away: GPUI
+    // Kit keeps a focused input alive, and Tab would start from a field
+    // that is not on the page
+    focus: FocusHandle,
     _load: Task<()>,
 }
 
 impl EventEmitter<SignedOut> for Account {}
 
 impl Account {
-    pub fn new(in_settings: bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(in_settings: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let api_token = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("New API token")
+        });
+        cx.subscribe_in(
+            &api_token,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.save_token(window, cx);
+                }
+            },
+        )
+        .detach();
         let account = spawn(cx, |state| async move {
             Ok((api::account(&state).await, api::display_name(&state).await))
         });
@@ -52,8 +80,134 @@ impl Account {
             name: None,
             site: None,
             signing_out: None,
+            api_token,
+            replacing: false,
+            replaced: false,
+            token_error: None,
+            saving_token: None,
+            focus: cx.focus_handle(),
             _load,
         }
+    }
+
+    fn replace_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replacing = true;
+        self.api_token
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn hide_token_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.replacing = false;
+        self.token_error = None;
+        self.api_token
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn save_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving_token.is_some() {
+            return;
+        }
+        let token = self.api_token.read(cx).value();
+        let saved = spawn(cx, move |state| async move {
+            api::renew_token(&state, &token).await
+        });
+        self.token_error = None;
+        self.saving_token = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = saved.await;
+            this.update_in(cx, |this, window, cx| {
+                this.saving_token = None;
+                match result {
+                    Ok(()) => {
+                        this.replaced = true;
+                        this.hide_token_field(window, cx);
+                    }
+                    Err(error) => this.token_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn token(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let state = div()
+            .id("api-token-state")
+            .test_support()
+            .aria_label(if self.replaced { "replaced" } else { "saved" })
+            .flex_1()
+            .min_w_0()
+            .text_xs()
+            .text_color(muted)
+            .child(if self.replaced {
+                "The new API token is saved in the Keychain"
+            } else {
+                "The API token is saved in the Keychain"
+            });
+        if !self.replacing {
+            return div().flex().items_center().gap_2p5().child(state).child(
+                Button::new("replace-token")
+                    .outline()
+                    .small()
+                    .label("Replace token")
+                    .on_click(cx.listener(|this, _, window, cx| this.replace_token(window, cx))),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(state)
+            .child(
+                Input::new(&self.api_token)
+                    .id("new-jira-token")
+                    .aria_label("New API token"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Create one at id.atlassian.com/manage-profile/security/api-tokens"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("save-jira-token")
+                            .primary()
+                            .small()
+                            .label("Save token")
+                            .loading(self.saving_token.is_some())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.save_token(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("cancel-jira-token")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.hide_token_field(window, cx)
+                                }),
+                            ),
+                    ),
+            )
+            .children(self.token_error.clone().map(|error| {
+                div()
+                    .id("jira-token-error")
+                    .role(Role::Alert)
+                    .test_support()
+                    .aria_label(error.clone())
+                    .text_color(cx.theme().danger)
+                    .child(error)
+            }))
     }
 
     /// Signs out at once, unless that would discard changes Jira has not
@@ -148,7 +302,7 @@ impl Render for Account {
             Some(_) => format!("{email} · {site}").into(),
             None => site,
         };
-        div()
+        let row = div()
             .flex()
             .items_center()
             .gap_2p5()
@@ -176,7 +330,14 @@ impl Render for Account {
                             .child(about),
                     ),
             )
-            .child(sign_out.outline().small())
+            .child(sign_out.outline().small());
+        div()
+            .track_focus(&self.focus)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(row)
+            .child(self.token(cx))
     }
 }
 
@@ -184,7 +345,7 @@ impl Render for Account {
 mod tests {
     use crate::{
         harness::{in_window, launch, tab_to, tokio_runtime, wait_until},
-        issue_list::tests::{issue, rows, synced},
+        issue_list::tests::{issue, rows, synced, synced_on},
         runtime::Core,
         sign_in::tests::{fill_in_and_submit, jira},
     };
@@ -374,5 +535,114 @@ mod tests {
 
         wait_for(cx, window, "site-url");
         assert!(!credentials_are_saved(data_dir.path()));
+    }
+
+    /// The settings of the app signed in as the account 5b10a, on a Jira that
+    /// answers `myself` when a token is checked.
+    fn settings_on_jira(
+        cx: &mut TestAppContext,
+        tokio: &tokio::runtime::Runtime,
+        myself: ResponseTemplate,
+    ) -> (MockServer, tempfile::TempDir, AnyWindowHandle) {
+        let server = jira(tokio, myself);
+        let data_dir = synced_on(tokio, &server.uri(), &[issue(1, "Fix login")]);
+        let window = launch(cx, tokio, data_dir.path());
+        open_settings(cx, window);
+        (server, data_dir, window)
+    }
+
+    fn replace_token(cx: &mut TestAppContext, window: AnyWindowHandle, token: &str) {
+        in_window(cx, window, |window, cx| {
+            assert!(window.try_find("new-jira-token").is_none());
+            window.click("replace-token", cx);
+        });
+        in_window(cx, window, |window, cx| {
+            window.click("new-jira-token", cx);
+            window.input(token, cx);
+            window.click("save-jira-token", cx);
+        });
+    }
+
+    fn saved_token(data_dir: &Path) -> String {
+        std::fs::read_to_string(data_dir.join("api-token")).unwrap()
+    }
+
+    fn a_refused_token_shows_the_reason_and_stays_unsaved(
+        cx: &mut TestAppContext,
+        myself: ResponseTemplate,
+        reason: &str,
+    ) {
+        let tokio = tokio_runtime();
+        let (_server, data_dir, window) = settings_on_jira(cx, &tokio, myself);
+
+        replace_token(cx, window, "refused");
+
+        wait_for(cx, window, "jira-token-error");
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("jira-token-error").label(), Some(reason));
+            assert!(window.try_find("new-jira-token").is_some());
+            assert_eq!(window.find("api-token-state").label(), Some("saved"));
+        });
+        assert_eq!(saved_token(data_dir.path()), "secret-token");
+    }
+
+    #[gpui_kit::test]
+    fn a_new_token_jira_accepts_is_saved_and_the_account_stays_signed_in(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let myself = json!({ "accountId": "5b10a", "displayName": "Ada" });
+        let myself = ResponseTemplate::new(200).set_body_json(myself);
+        let (_server, data_dir, window) = settings_on_jira(cx, &tokio, myself);
+        in_window(cx, window, |window, _| {
+            assert_eq!(window.find("api-token-state").label(), Some("saved"));
+        });
+
+        replace_token(cx, window, "new-token");
+
+        wait_until(cx, window, |window| {
+            window.find("api-token-state").label() == Some("replaced")
+        });
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("new-jira-token").is_none());
+            assert!(window.try_find("replace-token").is_some());
+            assert!(window.try_find("settings").is_some());
+        });
+        assert_eq!(saved_token(data_dir.path()), "new-token");
+    }
+
+    #[gpui_kit::test]
+    fn a_new_token_jira_rejects_is_not_saved(cx: &mut TestAppContext) {
+        a_refused_token_shows_the_reason_and_stays_unsaved(
+            cx,
+            ResponseTemplate::new(401),
+            "Jira rejected the API token",
+        );
+    }
+
+    #[gpui_kit::test]
+    fn a_new_token_of_another_account_is_not_saved(cx: &mut TestAppContext) {
+        let grace = json!({ "accountId": "7c20b", "displayName": "Grace" });
+        a_refused_token_shows_the_reason_and_stays_unsaved(
+            cx,
+            ResponseTemplate::new(200).set_body_json(grace),
+            "This API token belongs to another Jira account",
+        );
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_a_new_token_hides_its_field_and_saves_nothing(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let (_server, data_dir, window) = settings_on_jira(cx, &tokio, ResponseTemplate::new(401));
+        in_window(cx, window, |window, cx| window.click("replace-token", cx));
+        in_window(cx, window, |window, cx| {
+            window.click("new-jira-token", cx);
+            window.input("mistyped", cx);
+            window.click("cancel-jira-token", cx);
+        });
+
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("new-jira-token").is_none());
+            assert_eq!(window.find("api-token-state").label(), Some("saved"));
+        });
+        assert_eq!(saved_token(data_dir.path()), "secret-token");
     }
 }
