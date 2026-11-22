@@ -225,7 +225,7 @@ mod tests {
     }
 
     fn pending(window: &Window) -> bool {
-        window.try_find("sync-badge").is_some()
+        rows(window).iter().any(|row| row.contains("(pending)"))
     }
 
     /// Opens the assignee menu and returns the names of its items.
@@ -300,8 +300,8 @@ mod tests {
             choose(window, cx, "Grace Hopper");
             // The frame of the click: the core has not stored anything yet
             assert_eq!(assignee(window), "Assignee: Grace Hopper");
-            assert!(pending(window));
         });
+        wait_until(cx, window, |window| pending(window));
         wait_until(cx, window, |window| {
             window.find("assignee-button").label() == Some("Grace Hopper")
         });

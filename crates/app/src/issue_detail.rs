@@ -498,18 +498,7 @@ fn body(
                 .grid_cols(2)
                 .gap_x_6()
                 .gap_y_1p5()
-                .child(
-                    field_line("detail-status", "Status", &issue.status, cx)
-                        .child(status)
-                        // The status is the user's own change and Jira does not have it yet
-                        .children((issue.sync_status == SyncStatus::Pending).then(|| {
-                            div()
-                                .id("sync-badge")
-                                .test_support()
-                                .aria_label("Pending")
-                                .child(badge("Pending", cx))
-                        })),
-                )
+                .child(field_line("detail-status", "Status", &issue.status, cx).child(status))
                 .child(
                     field_line("detail-assignee", "Assignee", assignee, cx).child(assignee_button),
                 )
