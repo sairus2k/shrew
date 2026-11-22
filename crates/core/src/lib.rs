@@ -123,7 +123,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join("missing").join("nested");
 
-        let (state, mut events) = start(&data_dir).await.unwrap();
+        let (state, mut events) = start_without_keychain(&data_dir).await.unwrap();
         assert!(data_dir.is_dir());
 
         state.events.send(SyncEvent::Started).unwrap();
@@ -134,7 +134,7 @@ mod tests {
     async fn start_creates_the_database_and_migrates_it_once() {
         let data_dir = tempfile::tempdir().unwrap();
 
-        let (state, _events) = start(data_dir.path()).await.unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert!(data_dir.path().join("shrew.db").is_file());
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master
@@ -147,7 +147,7 @@ mod tests {
         state.pool.close().await;
 
         // A second start must not run the applied migrations again
-        let (state, _events) = start(data_dir.path()).await.unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&state.pool)
             .await

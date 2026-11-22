@@ -205,11 +205,67 @@ pub(crate) async fn save_config(data_dir: &Path, config: &Config) -> anyhow::Res
 mod tests {
     use super::*;
 
+    type Items = std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>;
+
+    // keyring creates a new credential for every `Entry`, so the items have to
+    // live in a map of their own for a later `Entry` to find what an earlier one saved
+    static ITEMS: std::sync::LazyLock<Items> = std::sync::LazyLock::new(Default::default);
+
+    #[derive(Debug)]
+    struct FakeKeychain;
+
+    #[derive(Debug)]
+    struct FakeItem(String, String);
+
+    impl keyring::credential::CredentialBuilderApi for FakeKeychain {
+        fn build(
+            &self,
+            _target: Option<&str>,
+            service: &str,
+            user: &str,
+        ) -> keyring::Result<Box<keyring::credential::Credential>> {
+            Ok(Box::new(FakeItem(service.to_owned(), user.to_owned())))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl keyring::credential::CredentialApi for FakeItem {
+        fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
+            let key = (self.0.clone(), self.1.clone());
+            ITEMS.lock().unwrap().insert(key, secret.to_vec());
+            Ok(())
+        }
+
+        fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            let key = (self.0.clone(), self.1.clone());
+            let items = ITEMS.lock().unwrap();
+            items.get(&key).cloned().ok_or(keyring::Error::NoEntry)
+        }
+
+        fn delete_credential(&self) -> keyring::Result<()> {
+            let key = (self.0.clone(), self.1.clone());
+            let removed = ITEMS.lock().unwrap().remove(&key);
+            removed.map(drop).ok_or(keyring::Error::NoEntry)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Every test that reaches `Keychain` calls this first, so that none of
+    /// them touches the Keychain of the machine it runs on.
+    fn use_fake_keychain() {
+        keyring::set_default_credential_builder(Box::new(FakeKeychain));
+    }
+
     #[test]
     fn keychain_keeps_the_token_until_it_is_deleted() {
-        // A service of its own, so the token of the real app is never touched
+        use_fake_keychain();
         let keychain = Keychain("dev.shrew.app.test", KEYCHAIN_ACCOUNT);
-        keychain.entry().unwrap().delete_credential().ok();
         assert_eq!(keychain.load().unwrap(), None);
 
         keychain.save("first").unwrap();
@@ -220,6 +276,47 @@ mod tests {
         assert_eq!(keychain.load().unwrap(), None);
         // There is nothing left to delete
         keychain.delete().unwrap();
+    }
+
+    // The accounts are decided by what `start` wires in, so the test reads
+    // the items the app left, not the names of the constants
+    #[tokio::test]
+    async fn the_jira_and_the_tempo_token_are_saved_under_accounts_of_their_own() {
+        use_fake_keychain();
+        let data_dir = tempfile::tempdir().unwrap();
+        save_config(data_dir.path(), &account_config())
+            .await
+            .unwrap();
+        let (state, _events) = crate::start(data_dir.path()).await.unwrap();
+
+        let mut config = account_config();
+        config.api_token = "jira-secret".to_owned();
+        save(data_dir.path(), state.tokens.clone(), &config)
+            .await
+            .unwrap();
+        crate::api::save_tempo_token(&state, "tempo-secret")
+            .await
+            .unwrap();
+
+        let mut saved: Vec<_> = ITEMS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((service, _), _)| service == KEYCHAIN_SERVICE)
+            .map(|((_, account), token)| {
+                (account.clone(), String::from_utf8(token.clone()).unwrap())
+            })
+            .collect();
+        saved.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(saved.len(), 2, "two tokens, two items: {saved:?}");
+        assert_eq!(saved[0].1, "jira-secret");
+        assert_eq!(saved[1].1, "tempo-secret");
+        assert_ne!(saved[0].0, saved[1].0);
+
+        let (restarted, _events) = crate::start(data_dir.path()).await.unwrap();
+        let loaded = restarted.config.read().await.clone().unwrap();
+        assert_eq!(loaded.api_token, "jira-secret");
+        assert_eq!(loaded.tempo_api_token, "tempo-secret");
     }
 
     fn account_config() -> Config {
