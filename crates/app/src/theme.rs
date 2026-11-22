@@ -1,8 +1,9 @@
 //! The look of the app: its own light and dark palette over the GPUI Kit
 //! defaults, and the pieces of style several views share.
 
+use crate::runtime::Core;
 use app_core::models::StatusCategory;
-use gpui_kit::component::{ActiveTheme, Theme, ThemeSet};
+use gpui_kit::component::{ActiveTheme, Sizable, Theme, ThemeSet, spinner::Spinner};
 use gpui_kit::*;
 use std::{rc::Rc, sync::Arc};
 
@@ -39,7 +40,20 @@ pub fn status_dot(category: StatusCategory, cx: &App) -> Div {
     div().size(px(8.)).flex_none().rounded_full().bg(color)
 }
 
-/// A state of an entry that is not its content: "Pending", "Not sent".
+/// The mark of a change Jira does not have yet: an arrow while the change
+/// waits in the outbox, a spinner while a sync cycle is sending the outbox.
+// A change made offline can wait for hours, and a spinner that turns all
+// that time would say that something is going on
+pub fn pending_mark(cx: &App) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    if cx.global::<Core>().sync.read(cx).sending {
+        Spinner::new().xsmall().color(muted).into_any_element()
+    } else {
+        div().text_color(muted).child("↑").into_any_element()
+    }
+}
+
+/// A state of an entry that is not its content: "Not sent".
 pub fn badge(text: &'static str, cx: &App) -> Div {
     div()
         .px_1p5()

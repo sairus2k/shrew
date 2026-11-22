@@ -28,6 +28,8 @@ where
 
 /// Re-emits core events inside GPUI. Views subscribe to it and reload from SQLite.
 pub struct SyncBridge {
+    /// Whether a sync cycle is running, which is when the outbox is sent.
+    pub sending: bool,
     _pump: Task<()>,
 }
 
@@ -37,12 +39,29 @@ impl SyncBridge {
     pub fn new(mut events: UnboundedReceiver<SyncEvent>, cx: &mut Context<Self>) -> Self {
         let _pump = cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
-                if this.update(cx, |_, cx| cx.emit(event)).is_err() {
+                let emitted = this.update(cx, |this, cx| {
+                    let sending = match event {
+                        SyncEvent::Started => true,
+                        SyncEvent::Completed | SyncEvent::Error(_) | SyncEvent::TokenRejected => {
+                            false
+                        }
+                        _ => this.sending,
+                    };
+                    if this.sending != sending {
+                        this.sending = sending;
+                        cx.notify();
+                    }
+                    cx.emit(event)
+                });
+                if emitted.is_err() {
                     break;
                 }
             }
         });
-        Self { _pump }
+        Self {
+            sending: false,
+            _pump,
+        }
     }
 }
 

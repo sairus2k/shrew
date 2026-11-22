@@ -5,8 +5,8 @@ use crate::comment::{CommentForm, ReplyTarget};
 use crate::duration::{format_duration, local_minute};
 use crate::issue::IssueModel;
 use crate::keys;
-use crate::runtime::spawn;
-use crate::theme::{badge, tabular_digits};
+use crate::runtime::{Core, spawn};
+use crate::theme::{badge, pending_mark, tabular_digits};
 use crate::timer::{ActiveTimer, TimerControl};
 use crate::transition::StatusButton;
 use crate::worklog::WorklogForm;
@@ -38,6 +38,8 @@ pub struct DetailPane {
     // Where the comment form was painted last, to scroll it into view
     comment_bounds: Rc<Cell<Bounds<Pixels>>>,
     _issue_changed: Subscription,
+    // The marks of what Jira does not have yet differ during a sync cycle
+    _sync_changed: Subscription,
 }
 
 impl EventEmitter<DetailClosed> for DetailPane {}
@@ -50,6 +52,8 @@ impl DetailPane {
         cx: &mut Context<Self>,
     ) -> Self {
         let _issue_changed = cx.observe(&issue, |_, _, cx| cx.notify());
+        let sync = cx.global::<Core>().sync.clone();
+        let _sync_changed = cx.observe(&sync, |_, _, cx| cx.notify());
         let key = issue.read(cx).key.clone();
         Self {
             status: cx.new(|cx| StatusButton::new(issue.clone(), cx)),
@@ -61,6 +65,7 @@ impl DetailPane {
             comment_bounds: Rc::default(),
             issue,
             _issue_changed,
+            _sync_changed,
         }
     }
 
@@ -262,6 +267,7 @@ fn comment(
     }
     let heading = heading(format!("comment-{index}"), label, &comment.author_name);
     let heading = match state {
+        Some(_) if comment.pending => heading.child(pending_mark(cx)),
         Some(state) => heading.child(badge(state, cx)),
         None => heading.child(when(time, cx)),
     };
@@ -315,7 +321,10 @@ fn worklog(index: usize, worklog: &Worklog, cx: &App) -> impl IntoElement {
     }
     let heading = heading(format!("worklog-{index}"), label, &worklog.author_name)
         .child(when(started, cx))
-        .children(state.map(|state| badge(state, cx)))
+        .children(state.map(|state| match worklog.status {
+            SyncStatus::Pending => pending_mark(cx),
+            _ => badge(state, cx).into_any_element(),
+        }))
         .child(
             div()
                 .ml_auto()
@@ -498,18 +507,7 @@ fn body(
                 .grid_cols(2)
                 .gap_x_6()
                 .gap_y_1p5()
-                .child(
-                    field_line("detail-status", "Status", &issue.status, cx)
-                        .child(status)
-                        // The status is the user's own change and Jira does not have it yet
-                        .children(issue.status_pending.then(|| {
-                            div()
-                                .id("sync-badge")
-                                .test_support()
-                                .aria_label("Pending")
-                                .child(badge("Pending", cx))
-                        })),
-                )
+                .child(field_line("detail-status", "Status", &issue.status, cx).child(status))
                 .child(
                     field_line("detail-assignee", "Assignee", assignee, cx).child(assignee_button),
                 )

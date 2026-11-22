@@ -2,8 +2,8 @@
 
 use crate::issue::IssueModel;
 use crate::keys;
-use crate::runtime::spawn;
-use crate::theme::status_dot;
+use crate::runtime::{Core, spawn};
+use crate::theme::{pending_mark, status_dot};
 use app_core::{
     api,
     models::{RequiredField, Transition},
@@ -33,6 +33,8 @@ pub struct StatusButton {
     _form_events: Option<Subscription>,
     _load: Task<()>,
     _issue_changed: Subscription,
+    // The mark of a status Jira does not have yet differs during a sync cycle
+    _sync_changed: Subscription,
 }
 
 impl StatusButton {
@@ -41,6 +43,8 @@ impl StatusButton {
         // status of the model. After an optimistic transition they change
         // without waiting for Jira.
         let _issue_changed = cx.observe(&issue, |this, _, cx| this.load_transitions(cx));
+        let sync = cx.global::<Core>().sync.clone();
+        let _sync_changed = cx.observe(&sync, |_, _, cx| cx.notify());
         let mut this = Self {
             issue,
             transitions: Vec::new(),
@@ -51,6 +55,7 @@ impl StatusButton {
             _form_events: None,
             _load: Task::ready(()),
             _issue_changed,
+            _sync_changed,
         };
         this.load_transitions(cx);
         this
@@ -160,12 +165,23 @@ impl Render for StatusButton {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let transitions = self.transitions.clone();
+        let sending = cx.global::<Core>().sync.read(cx).sending;
         let issue = self.issue.read(cx);
         let status = issue.detail.as_ref().map(|detail| detail.status.clone());
-        let dot = issue
-            .detail
-            .as_ref()
-            .map(|detail| status_dot(detail.status_category, cx));
+        // A status that is the user's own change and that Jira does not have
+        // yet has the mark of that in place of its dot
+        let dot = issue.detail.as_ref().map(|detail| {
+            if detail.status_pending {
+                div()
+                    .id("sync-badge")
+                    .test_support()
+                    .aria_label(if sending { "Sending" } else { "Pending" })
+                    .child(pending_mark(cx))
+                    .into_any_element()
+            } else {
+                status_dot(detail.status_category, cx).into_any_element()
+            }
+        });
         let url = issue.detail.as_ref().map(|detail| detail.url.clone());
 
         div()
@@ -400,7 +416,7 @@ mod tests {
     use crate::harness::{in_window, launch, no_worklog_changes, tokio_runtime, wait_until};
     use crate::issue_list::tests::{issue, rows, synced_on};
     use crate::runtime::Core;
-    use app_core::AppState;
+    use app_core::{AppState, SyncEvent};
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::{TestEventExt, TestQueryExt, TestWindowExt};
     use gpui_kit::{AnyWindowHandle, App, MouseButton, Role, TestAppContext, Window};
@@ -582,6 +598,41 @@ mod tests {
         in_window(cx, window, |window, cx| {
             assert_eq!(status(window), "Status: In Progress");
             assert_eq!(open_menu(window, cx), ["Review", "Stop"]);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_status_jira_does_not_have_yet_is_marked_as_pending_and_as_sending_during_a_sync(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira(local_port()));
+        let data_dir = synced_on(&tokio, &server.uri(), &two_issues());
+        let window = launch(cx, &tokio, data_dir.path());
+        // WEB-2 is in the status WEB-1 is about to get: opening it fills the
+        // cache with what that status offers
+        open(cx, window, "WEB-2");
+        close(cx, window);
+        open(cx, window, "WEB-1");
+        let mark = |window: &Window| {
+            let mark = window.try_find("sync-badge")?;
+            mark.label().map(str::to_owned)
+        };
+        in_window(cx, window, |window, _| assert_eq!(mark(window), None));
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "Start");
+            assert_eq!(mark(window).as_deref(), Some("Pending"));
+        });
+
+        let state = core(cx);
+        state.emit(SyncEvent::Started);
+        wait_until(cx, window, |window| {
+            mark(window).as_deref() == Some("Sending")
+        });
+        state.emit(SyncEvent::Completed);
+        wait_until(cx, window, |window| {
+            mark(window).as_deref() == Some("Pending")
         });
     }
 
