@@ -64,6 +64,26 @@ cargo sqlx migrate run --source crates/core/migrations
 cargo sqlx prepare --workspace
 ```
 
+## Packaging
+
+GPUI has no bundler, so `scripts/package.sh` builds the release binary, assembles `target/package/Shrew.app` (`Info.plist` with `CFBundleName` Shrew, and `assets/icons/Shrew.icns`), signs it with the hardened runtime, wraps it in a `.dmg`, notarizes the `.dmg` and staples the ticket. Prerequisites: the Xcode Command Line Tools, a paid Apple Developer Program membership, a Developer ID Application certificate in the login keychain and a notary profile. Create the profile once; it stores an app-specific password in the Keychain:
+
+```sh
+# Lists the identity to pass as SHREW_SIGN_IDENTITY
+security find-identity -v -p codesigning
+
+# Creates the notary profile
+xcrun notarytool store-credentials "<profile>" --apple-id "<apple id>" --team-id "<team id>"
+```
+
+```sh
+SHREW_SIGN_IDENTITY="Developer ID Application: <name> (<team id>)" \
+SHREW_NOTARY_PROFILE="<profile>" \
+scripts/package.sh
+```
+
+The identity and the profile are only read from these two variables. A step whose variable is not set is skipped: without `SHREW_SIGN_IDENTITY` the bundle is not signed, without `SHREW_NOTARY_PROFILE` the `.dmg` is not notarized. The script then ends with a warning and names the file `Shrew-NOT-FOR-RELEASE.dmg`, which Gatekeeper blocks on other Macs; only a signed and notarized run writes `target/package/Shrew.dmg`. With no variables set it stops after the unsigned bundle and `.dmg`.
+
 ## License
 
 [MIT](LICENSE)
