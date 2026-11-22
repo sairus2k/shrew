@@ -4,7 +4,7 @@ use crate::{
     AppState, SyncEvent, auth, db,
     models::{
         Account, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow, Project,
-        RunningTimer, SetupStep, Transition, User, WorklogSettings, WorklogTarget,
+        RunningTimer, SetupStep, ThemeChoice, Transition, User, WorklogSettings, WorklogTarget,
     },
     sync::{
         assignable, inbound,
@@ -116,6 +116,7 @@ async fn sign_in_as(
         api_token: api_token.to_owned(),
         worklog_target: Default::default(),
         shortcut_hints: true,
+        theme: Default::default(),
         tempo_api_token: String::new(),
     };
     let account = Account {
@@ -233,6 +234,23 @@ pub async fn set_shortcut_hints(state: &AppState, shown: bool) -> anyhow::Result
     let mut saved = state.config.write().await;
     let current = saved.as_mut().context("Sign in first")?;
     current.shortcut_hints = shown;
+    auth::save_config(&state.data_dir, current).await
+}
+
+/// The look of the app the user chose. It is the one of the system until
+/// the user chooses another, and while nobody is signed in.
+pub async fn theme(state: &AppState) -> ThemeChoice {
+    let config = state.config.read().await;
+    config
+        .as_ref()
+        .map(|config| config.theme)
+        .unwrap_or_default()
+}
+
+pub async fn set_theme(state: &AppState, theme: ThemeChoice) -> anyhow::Result<()> {
+    let mut saved = state.config.write().await;
+    let current = saved.as_mut().context("Sign in first")?;
+    current.theme = theme;
     auth::save_config(&state.data_dir, current).await
 }
 
@@ -720,6 +738,7 @@ mod tests {
                 "display_name": "Ada",
                 "worklog_target": "jira",
                 "shortcut_hints": true,
+                "theme": "system",
             })
         );
         assert_eq!(
@@ -831,6 +850,27 @@ mod tests {
 
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert!(shortcut_hints(&state).await);
+    }
+
+    #[tokio::test]
+    async fn the_theme_is_the_one_of_the_system_until_chosen_and_the_choice_survives_a_restart() {
+        let server = jira(myself()).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        // Nobody is signed in, and there is no config to keep the choice
+        assert_eq!(theme(&state).await, ThemeChoice::System);
+        assert!(set_theme(&state, ThemeChoice::Dark).await.is_err());
+        sign_in(&state, &server.uri(), "ada@example.com", "secret-token")
+            .await
+            .unwrap();
+        assert_eq!(theme(&state).await, ThemeChoice::System);
+
+        set_theme(&state, ThemeChoice::Dark).await.unwrap();
+        assert_eq!(theme(&state).await, ThemeChoice::Dark);
+        state.pool.close().await;
+
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        assert_eq!(theme(&state).await, ThemeChoice::Dark);
     }
 
     fn project_list() -> ResponseTemplate {

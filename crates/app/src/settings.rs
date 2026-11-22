@@ -1,6 +1,6 @@
 //! The settings, one page: the account, the watched projects, where logged
-//! time goes, Jira or Tempo, with the Tempo API token, and whether the
-//! controls show the keys of their shortcuts.
+//! time goes, Jira or Tempo, with the Tempo API token, the theme, and whether
+//! the controls show the keys of their shortcuts.
 
 use crate::account::Account;
 use crate::keys::Hints;
@@ -8,7 +8,7 @@ use crate::projects::ProjectPicker;
 use crate::runtime::spawn;
 use app_core::{
     api,
-    models::{WorklogSettings, WorklogTarget},
+    models::{ThemeChoice, WorklogSettings, WorklogTarget},
 };
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
@@ -41,6 +41,7 @@ pub struct Settings {
     saving: Option<Task<()>>,
     _load: Task<()>,
     _hints: Task<()>,
+    _theme: Task<()>,
 }
 
 impl EventEmitter<SettingsClosed> for Settings {}
@@ -79,6 +80,7 @@ impl Settings {
             saving: None,
             _load: Task::ready(()),
             _hints: Task::ready(()),
+            _theme: Task::ready(()),
         };
         this._load = this.run(
             cx,
@@ -196,6 +198,55 @@ impl Settings {
             .ok();
         });
         cx.notify();
+    }
+
+    fn choose_theme(&mut self, choice: ThemeChoice, cx: &mut Context<Self>) {
+        self.error = None;
+        let saved = spawn(cx, move |state| async move {
+            api::set_theme(&state, choice).await
+        });
+        self._theme = cx.spawn(async move |this, cx| {
+            let result = saved.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => crate::theme::choose(choice, cx),
+                    Err(error) => this.error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    fn appearance(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let chosen = crate::theme::chosen(cx);
+        let choice = |id: &'static str, label: &'static str, this: ThemeChoice| {
+            let button = Button::new(id)
+                .small()
+                .label(label)
+                .on_click(cx.listener(move |this_view, _, _, cx| this_view.choose_theme(this, cx)));
+            if chosen == this {
+                button.primary()
+            } else {
+                button.outline()
+            }
+        };
+        div()
+            .id("theme")
+            .test_support()
+            .aria_label(match chosen {
+                ThemeChoice::System => "System",
+                ThemeChoice::Light => "Light",
+                ThemeChoice::Dark => "Dark",
+            })
+            .flex()
+            .child(
+                ButtonGroup::new("themes")
+                    .child(choice("theme-system", "System", ThemeChoice::System))
+                    .child(choice("theme-light", "Light", ThemeChoice::Light))
+                    .child(choice("theme-dark", "Dark", ThemeChoice::Dark)),
+            )
     }
 
     fn time_tracking(&self, cx: &mut Context<Self>) -> Div {
@@ -409,6 +460,12 @@ impl Render for Settings {
                 self.time_tracking(cx),
                 cx,
             ))
+            .child(section(
+                "Appearance",
+                "System follows the appearance of macOS",
+                self.appearance(cx),
+                cx,
+            ))
             .child(
                 section(
                     "Keyboard shortcuts",
@@ -440,13 +497,15 @@ impl Render for Settings {
 #[cfg(test)]
 mod tests {
     use crate::{
-        harness::{in_window, launch_on_jira, wait_until},
+        harness::{in_window, launch, launch_on_jira, tokio_runtime, wait_until},
+        issue_list::tests::synced_on,
         runtime::Core,
     };
-    use app_core::SyncEvent;
-    use gpui_kit::TestAppContext;
+    use app_core::{SyncEvent, models::ThemeChoice};
+    use gpui_kit::component::ActiveTheme as _;
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, WindowAppearance};
 
     fn open(cx: &mut TestAppContext, app: &crate::harness::TestApp) {
         wait_until(cx, app.window, |window| {
@@ -510,6 +569,83 @@ mod tests {
         in_window(cx, app.window, |window, _| {
             assert!(window.try_find("tempo-token").is_some());
         });
+    }
+
+    fn dark(cx: &mut TestAppContext) -> bool {
+        cx.read(|cx| cx.theme().is_dark())
+    }
+
+    // What the window does when the appearance of the system changes
+    fn system_turns(cx: &mut TestAppContext, appearance: WindowAppearance) {
+        cx.update(|cx| crate::theme::follow(appearance, cx));
+    }
+
+    fn choose_theme(
+        cx: &mut TestAppContext,
+        app: &crate::harness::TestApp,
+        button: &'static str,
+        label: &'static str,
+    ) {
+        in_window(cx, app.window, |window, cx| window.click(button, cx));
+        wait_until(cx, app.window, |window| {
+            window.find("theme").label() == Some(label)
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_chosen_theme_applies_at_once_and_only_system_follows_the_system(cx: &mut TestAppContext) {
+        let app = launch_on_jira(cx, &[]);
+        open(cx, &app);
+        in_window(cx, app.window, |window, _| {
+            assert_eq!(window.find("theme").label(), Some("System"));
+        });
+        assert!(!dark(cx));
+        system_turns(cx, WindowAppearance::Dark);
+        assert!(dark(cx));
+
+        choose_theme(cx, &app, "theme-light", "Light");
+        assert!(!dark(cx));
+        system_turns(cx, WindowAppearance::Light);
+        system_turns(cx, WindowAppearance::Dark);
+        assert!(!dark(cx));
+
+        choose_theme(cx, &app, "theme-dark", "Dark");
+        assert!(dark(cx));
+        // The core has it, and the next start reads it from there
+        let (state, tokio) = cx.read(|cx| {
+            let core = cx.global::<Core>();
+            (core.state.clone(), core.tokio.clone())
+        });
+        assert_eq!(
+            tokio.block_on(app_core::api::theme(&state)),
+            ThemeChoice::Dark
+        );
+        system_turns(cx, WindowAppearance::Light);
+        assert!(dark(cx));
+
+        choose_theme(cx, &app, "theme-system", "System");
+        assert!(!dark(cx));
+        system_turns(cx, WindowAppearance::Dark);
+        assert!(dark(cx));
+    }
+
+    #[gpui_kit::test]
+    fn an_app_started_with_the_dark_theme_chosen_is_dark(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_on(&tokio, "https://127.0.0.1:1", &[]);
+        tokio.block_on(async {
+            let (state, _events) = app_core::start_without_keychain(data_dir.path())
+                .await
+                .unwrap();
+            app_core::api::set_theme(&state, ThemeChoice::Dark)
+                .await
+                .unwrap();
+        });
+
+        let window = launch(cx, &tokio, data_dir.path());
+
+        wait_until(cx, window, |window| window.try_find("home").is_some());
+        assert!(dark(cx));
     }
 
     #[gpui_kit::test]

@@ -55,6 +55,9 @@ pub(crate) fn launch(
     cx.update(crate::keys::init);
     cx.update(crate::tray::init);
     let step = init_core(cx, tokio, data_dir);
+    let state = cx.update(|cx| cx.global::<crate::runtime::Core>().state.clone());
+    let theme = tokio.block_on(app_core::api::theme(&state));
+    cx.update(|cx| crate::theme::choose(theme, cx));
     // The tokio side is outside GPUI's deterministic scheduler
     cx.executor().allow_parking();
     cx.update(|cx| {

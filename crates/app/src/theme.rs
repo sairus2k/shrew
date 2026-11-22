@@ -2,10 +2,20 @@
 //! defaults, and the pieces of style several views share.
 
 use crate::runtime::Core;
-use app_core::models::StatusCategory;
-use gpui_kit::component::{ActiveTheme, Sizable, Theme, ThemeSet, spinner::Spinner};
+use app_core::models::{StatusCategory, ThemeChoice};
+use gpui_kit::component::{ActiveTheme, Sizable, Theme, ThemeMode, ThemeSet, spinner::Spinner};
 use gpui_kit::*;
 use std::{rc::Rc, sync::Arc};
+
+/// The theme the user chose. A render cannot wait for the core, so the app
+/// holds a copy.
+struct Chosen(ThemeChoice);
+
+impl Global for Chosen {}
+
+pub fn chosen(cx: &App) -> ThemeChoice {
+    cx.global::<Chosen>().0
+}
 
 /// Installs the palette for both modes and takes the mode of the system.
 pub fn init(cx: &mut App) {
@@ -20,7 +30,30 @@ pub fn init(cx: &mut App) {
             }
         }
     });
-    Theme::sync_system_appearance(None, cx);
+    choose(ThemeChoice::System, cx);
+}
+
+/// Makes `choice` the theme of the app, at once.
+pub fn choose(choice: ThemeChoice, cx: &mut App) {
+    cx.set_global(Chosen(choice));
+    // The title bar is drawn by macOS, which has to be told as well
+    cx.set_window_appearance(match choice {
+        ThemeChoice::System => None,
+        ThemeChoice::Light => Some(WindowAppearance::Light),
+        ThemeChoice::Dark => Some(WindowAppearance::Dark),
+    });
+    follow(cx.window_appearance(), cx);
+}
+
+/// Takes the mode of `appearance`, which is the one of the system, unless
+/// the user chose a mode.
+pub fn follow(appearance: WindowAppearance, cx: &mut App) {
+    let mode = match chosen(cx) {
+        ThemeChoice::System => appearance.into(),
+        ThemeChoice::Light => ThemeMode::Light,
+        ThemeChoice::Dark => ThemeMode::Dark,
+    };
+    Theme::change(mode, None, cx);
 }
 
 /// Digits of one width, so that a number that changes does not move what is

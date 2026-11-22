@@ -256,6 +256,17 @@ pub enum WorklogTarget {
     Tempo,
 }
 
+/// The look of the app the user chose: the one of the system, or always
+/// light or dark.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorklogSettings {
     pub target: WorklogTarget,

@@ -1,4 +1,7 @@
-use crate::{db::sync_state::SyncState, models::WorklogTarget};
+use crate::{
+    db::sync_state::SyncState,
+    models::{ThemeChoice, WorklogTarget},
+};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 
@@ -23,6 +26,8 @@ pub(crate) struct Config {
     pub worklog_target: WorklogTarget,
     #[serde(default = "shown")]
     pub shortcut_hints: bool,
+    #[serde(default)]
+    pub theme: ThemeChoice,
     // Lives in the token store, never in the config file
     #[serde(skip)]
     pub api_token: String,

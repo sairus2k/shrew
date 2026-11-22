@@ -431,6 +431,7 @@ mod tests {
             display_name: None,
             worklog_target: Default::default(),
             shortcut_hints: true,
+            theme: Default::default(),
             api_token: TOKEN.to_owned(),
             tempo_api_token: String::new(),
         }

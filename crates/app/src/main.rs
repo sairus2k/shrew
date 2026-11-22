@@ -4,7 +4,7 @@ use app_core::{
     models::{IssueKey, SetupStep},
 };
 use gpui_kit::component::{
-    ActiveTheme, Sizable, Theme, WindowExt as _,
+    ActiveTheme, Sizable, WindowExt as _,
     button::{Button, ButtonVariants},
     notification::Notification,
 };
@@ -99,7 +99,7 @@ impl Root {
         let sync = cx.global::<Core>().sync.clone();
         cx.subscribe_in(&sync, window, Self::on_sync_event).detach();
         cx.observe_window_appearance(window, |_, window, cx| {
-            Theme::sync_system_appearance(Some(window), cx)
+            theme::follow(window.appearance(), cx)
         })
         .detach();
         cx.global::<Core>()
@@ -265,6 +265,7 @@ impl Root {
             tray::forget(cx);
             // The choice went with the config of the account
             cx.set_global(keys::Hints(true));
+            theme::choose(Default::default(), cx);
             drafts::Drafts::clear(cx);
             this.show(SetupStep::SignIn, window, cx)
         })
@@ -577,10 +578,12 @@ fn main() -> anyhow::Result<()> {
     let (state, events) = tokio.block_on(app_core::start(&data_dir))?;
     let step = tokio.block_on(app_core::api::setup_step(&state))?;
     let hints = tokio.block_on(app_core::api::shortcut_hints(&state));
+    let theme = tokio.block_on(app_core::api::theme(&state));
 
     application().with_assets(assets::Assets).run(move |cx| {
         init(cx);
         theme::init(cx);
+        theme::choose(theme, cx);
         menu::init(cx);
         keys::init(cx);
         tray::init(cx);
