@@ -133,9 +133,13 @@ fn menu_items(
         menu = menu.item(
             PopupMenuItem::new(choice.label.clone())
                 .checked(choice.chosen)
-                .on_click(
-                    window.listener_for(view, move |this, _, _, cx| this.pick(pick.clone(), cx)),
-                ),
+                .on_click(window.listener_for(view, move |this, _, window, cx| {
+                    this.pick(pick.clone(), cx);
+                    // A menu gives the focus back only when it had it, so a pick
+                    // in a submenu leaves it on the closed submenu, where the
+                    // keys of the list do nothing
+                    this.focus.focus(window, cx);
+                })),
         );
     }
     menu
@@ -1892,6 +1896,29 @@ pub(crate) mod tests {
         in_window(cx, window, |window, _| {
             assert!(!window.find_all_by_role(Role::MenuItem).is_empty());
         });
+    }
+
+    #[gpui_kit::test]
+    fn the_keys_of_the_list_work_after_a_pick_in_a_submenu(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_project_filter(cx, window);
+        in_window(cx, window, |window, cx| window.press("enter", cx));
+        wait_until(cx, window, |window| window.try_find("filters").is_some());
+
+        // Beside an open issue the menu holds Project, Assignee and Status,
+        // each a submenu that Enter opens on its first item: Me after Any
+        // assignee, WEB after All projects
+        for key in ["shift-s", "down", "down", "enter", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[API_MINE, MINE]);
+        for key in ["shift-s", "down", "enter", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[MINE]);
     }
 
     #[gpui_kit::test]
