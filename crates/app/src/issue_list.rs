@@ -10,7 +10,7 @@ use app_core::{
     SyncEvent, api,
     models::{
         AssigneeFilter, FilterOptions, IssueFilter, IssueKey, IssueRow, SprintFilter,
-        StatusCategory, SyncStatus,
+        StatusCategory, StatusFilter, SyncStatus,
     },
 };
 use gpui_kit::assets::IconName;
@@ -60,7 +60,10 @@ impl PartialEq for InSprint {
 enum Pick {
     Project(Option<String>),
     Assignee(Option<Assignee>),
+    /// Shows only the issues in the status.
     Status(Option<String>),
+    /// Puts the status into the excluded ones, or takes it out.
+    Exclude(String),
     Sprint(Option<InSprint>),
     /// Takes every filter off. The search text is not one of them.
     Clear,
@@ -83,6 +86,9 @@ struct Filter {
     value: Option<String>,
     /// The first one takes the filter off.
     choices: Vec<Choice>,
+    /// The values that can be left out, each a toggle. Empty for a filter
+    /// that cannot leave values out.
+    exclude: Vec<Choice>,
     /// Of the button, for the shortcut that opens its menu.
     focus: FocusHandle,
     /// The action of that shortcut.
@@ -118,14 +124,17 @@ fn choices<T: Clone + PartialEq>(
 fn menu_items(
     mut menu: PopupMenu,
     choices: &[Choice],
+    exclude: &[Choice],
     view: &Entity<IssueList>,
     window: &mut Window,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     // A scrollable menu draws a scrollbar, so only one that has more items
     // than the window has room for under the row of the search is scrollable
     let room = window.viewport_size().height - px(96.);
     let item = rems(1.75).to_pixels(window.rem_size());
-    if item * (choices.len() + 1) as f32 > room {
+    let items = choices.len() + if exclude.is_empty() { 0 } else { 2 };
+    if item * (items + 1) as f32 > room {
         menu = menu.scrollable(true).max_h(room);
     }
     for choice in choices {
@@ -142,7 +151,17 @@ fn menu_items(
                 })),
         );
     }
-    menu
+    if exclude.is_empty() {
+        return menu;
+    }
+    // A menu closes on a click, so a submenu of toggles costs a trip to the
+    // menu for every value, where one item per value in this menu would
+    // double its length
+    let (exclude, view) = (exclude.to_vec(), view.clone());
+    menu.separator()
+        .submenu("Exclude", window, cx, move |menu, window, cx| {
+            menu_items(menu, &exclude, &[], &view, window, cx)
+        })
 }
 
 /// The frame of a filter that is set: the accent, as on the open issue's row.
@@ -168,7 +187,7 @@ pub struct IssueList {
     // The filters; `None` does not narrow the list
     project: Option<String>,
     assignee: Option<Assignee>,
-    status: Option<String>,
+    status: Option<StatusFilter>,
     sprint: Option<InSprint>,
     issues: Vec<IssueRow>,
     // The issue shown beside the list
@@ -284,7 +303,18 @@ impl IssueList {
         match pick {
             Pick::Project(project) => self.project = project,
             Pick::Assignee(assignee) => self.assignee = assignee,
-            Pick::Status(status) => self.status = status,
+            Pick::Status(status) => self.status = status.map(StatusFilter::Is),
+            Pick::Exclude(status) => {
+                let mut excluded = match self.status.take() {
+                    Some(StatusFilter::Not(excluded)) => excluded,
+                    _ => Vec::new(),
+                };
+                match excluded.iter().position(|name| *name == status) {
+                    Some(at) => drop(excluded.remove(at)),
+                    None => excluded.push(status),
+                }
+                self.status = (!excluded.is_empty()).then_some(StatusFilter::Not(excluded));
+            }
             Pick::Sprint(sprint) => self.sprint = sprint,
             Pick::Clear => {
                 self.project = None;
@@ -314,6 +344,7 @@ impl IssueList {
                     String::clone,
                     Pick::Project,
                 ),
+                exclude: Vec::new(),
                 focus: self.filter_focus.clone(),
                 key: Box::new(FilterByProject),
             });
@@ -348,27 +379,58 @@ impl IssueList {
                 |assignee| assignee.label.clone(),
                 Pick::Assignee,
             ),
+            exclude: Vec::new(),
             focus: self.assignee_focus.clone(),
             key: Box::new(FilterByAssignee),
         });
-        filters.push(Filter {
+        filters.push(self.status_filter());
+        filters.extend(self.sprint_filter());
+        filters
+    }
+
+    /// The status filter: one status to show, or the statuses to leave out.
+    fn status_filter(&self) -> Filter {
+        let statuses = &self.options.statuses;
+        let (shown, excluded) = match &self.status {
+            None => (None, &[][..]),
+            Some(StatusFilter::Is(status)) => (Some(status), &[][..]),
+            Some(StatusFilter::Not(excluded)) => (None, &excluded[..]),
+        };
+        let mut choices = choices(
+            "Any status",
+            statuses.clone(),
+            shown,
+            String::clone,
+            Pick::Status,
+        );
+        choices[0].chosen = self.status.is_none();
+        // As in `choices`: an excluded status no cached issue has any more
+        // stays in the menu, so that it can be taken off
+        let left_cache = excluded.iter().filter(|name| !statuses.contains(name));
+        let exclude = statuses.iter().chain(left_cache).map(|name| Choice {
+            label: name.clone(),
+            pick: Pick::Exclude(name.clone()),
+            chosen: excluded.contains(name),
+        });
+        // Two names fit beside the search; the menu shows the rest
+        let value = self.status.as_ref().map(|status| match status {
+            StatusFilter::Is(status) => status.clone(),
+            StatusFilter::Not(excluded) if excluded.len() > 2 => {
+                format!("not {} +{}", excluded[..2].join(", "), excluded.len() - 2)
+            }
+            StatusFilter::Not(excluded) => format!("not {}", excluded.join(", ")),
+        });
+        Filter {
             id: "status-filter",
             clear_id: "status-filter-clear",
             name: "Status",
             unset: "Status",
-            value: self.status.clone(),
-            choices: choices(
-                "Any status",
-                self.options.statuses.clone(),
-                self.status.as_ref(),
-                String::clone,
-                Pick::Status,
-            ),
+            value,
+            choices,
+            exclude: exclude.collect(),
             focus: self.status_focus.clone(),
             key: Box::new(FilterByStatus),
-        });
-        filters.extend(self.sprint_filter());
-        filters
+        }
     }
 
     /// The sprint filter: the running sprints, the planned ones and the
@@ -407,6 +469,7 @@ impl IssueList {
                 |sprint| sprint.label.clone(),
                 Pick::Sprint,
             ),
+            exclude: Vec::new(),
             focus: self.sprint_focus.clone(),
             key: Box::new(FilterBySprint),
         })
@@ -699,6 +762,7 @@ impl IssueList {
             unset,
             value,
             choices,
+            exclude,
             focus,
             key,
         } = filter;
@@ -712,8 +776,8 @@ impl IssueList {
             .track_focus(&focus)
             .children(keys::hint(key.as_ref(), cx));
         let clear = choices[0].pick.clone();
-        let menu = move |menu: PopupMenu, window: &mut Window, _: &mut Context<PopupMenu>| {
-            menu_items(menu, &choices, &view, window)
+        let menu = move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            menu_items(menu, &choices, &exclude, &view, window, cx)
         };
         if value.is_none() {
             return button
@@ -762,8 +826,9 @@ impl IssueList {
                     None => filter.name.to_owned(),
                 };
                 let (choices, view) = (filter.choices.clone(), view.clone());
-                menu = menu.submenu(label, window, cx, move |menu, window, _| {
-                    menu_items(menu, &choices, &view, window)
+                let exclude = filter.exclude.clone();
+                menu = menu.submenu(label, window, cx, move |menu, window, cx| {
+                    menu_items(menu, &choices, &exclude, &view, window, cx)
                 });
             }
             menu.separator().item(
@@ -1312,12 +1377,19 @@ pub(crate) mod tests {
     /// Opens the menu all the filters collapse into, enters the submenu
     /// `filter` and clicks its item `name`.
     fn choose_collapsed(window: &mut Window, cx: &mut gpui_kit::App, filter: &str, name: &str) {
-        window.click("filters", cx);
+        choose_in(window, cx, "filters", &[filter, name])
+    }
+
+    /// Opens the menu of `button` and clicks the items of `path` in turn,
+    /// each in the submenu the one before opened.
+    fn choose_in(window: &mut Window, cx: &mut gpui_kit::App, button: &'static str, path: &[&str]) {
+        window.click(button, cx);
         window.render_frame(cx);
-        for label in [filter, name] {
+        for &label in path {
             let items = window.find_all_by_role(Role::MenuItem);
             let labels: Vec<_> = items.iter().map(|item| item.label()).collect();
-            let item = items.iter().find(|item| item.label() == Some(label));
+            // A submenu can repeat a label of its parent, and comes after it
+            let item = items.iter().rev().find(|item| item.label() == Some(label));
             let item = item.unwrap_or_else(|| panic!("no item {label} among {labels:?}"));
             let middle = item.bounds().center();
             window.pointer_down(middle, MouseButton::Left, cx);
@@ -1420,7 +1492,7 @@ pub(crate) mod tests {
             cx,
             window,
             "status-filter",
-            &["Any status", "To Do", "In Progress"],
+            &["Any status", "To Do", "In Progress", "Exclude"],
         );
 
         in_window(cx, window, |window, cx| {
@@ -1451,7 +1523,7 @@ pub(crate) mod tests {
             cx,
             window,
             "status-filter",
-            &["Any status", "To Do", "In Progress"],
+            &["Any status", "To Do", "In Progress", "Exclude"],
         );
 
         in_window(cx, window, |window, cx| {
@@ -1486,6 +1558,295 @@ pub(crate) mod tests {
             assert_eq!(label(window, "assignee-filter"), "Assignee");
             assert_eq!(label(window, "status-filter"), "Status");
             assert!(window.try_find("clear-filters").is_none());
+        });
+    }
+
+    const SHIPPED: &str = "WEB-4: Ship the docs, Done, Unassigned";
+    const DROPPED: &str = "WEB-5: Log in by fax, Won't Do, Unassigned";
+
+    /// `team_work` with WEB-4 in Done and WEB-5 in Won't Do, both finished.
+    fn finished_work() -> Vec<Value> {
+        let mut issues = team_work();
+        issues.push(in_status(issue(4, "Ship the docs"), "Done", "done"));
+        issues.push(in_status(issue(5, "Log in by fax"), "Won't Do", "done"));
+        issues
+    }
+
+    /// Opens the menu of the status filter and clicks `name` in its submenu Exclude.
+    fn exclude(window: &mut Window, cx: &mut gpui_kit::App, name: &str) {
+        choose_in(window, cx, "status-filter", &["Exclude", name])
+    }
+
+    /// The statuses checked in the submenu Exclude of the status filter.
+    /// Leaves the menu closed.
+    fn excluded(window: &mut Window, cx: &mut gpui_kit::App) -> Vec<String> {
+        choose_in(window, cx, "status-filter", &["Exclude"]);
+        let items = window.find_all_by_role(Role::MenuItem);
+        // The submenu comes after its parent, whose chosen item is checked too
+        let submenu = items
+            .iter()
+            .skip_while(|item| item.label() != Some("Exclude"));
+        let checked = submenu.skip(1).filter(|item| item.checked() == Some(true));
+        let labels = checked
+            .filter_map(|item| item.label().map(str::to_owned))
+            .collect();
+        window.press("escape", cx);
+        window.render_frame(cx);
+        labels
+    }
+
+    #[gpui_kit::test]
+    fn statuses_are_excluded_one_by_one_and_taken_off_at_once(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &finished_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        let all = [API_MINE, DROPPED, SHIPPED, NOBODYS, GRACES, MINE];
+        wait_for_rows(cx, window, &all);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &[
+                "Any status",
+                "To Do",
+                "In Progress",
+                "Done",
+                "Won't Do",
+                "Exclude",
+            ],
+        );
+
+        in_window(cx, window, |window, cx| exclude(window, cx, "Done"));
+        wait_for_rows(cx, window, &[API_MINE, DROPPED, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status: not Done");
+            assert_eq!(label(window, "issue-count"), "5 issues");
+        });
+
+        in_window(cx, window, |window, cx| exclude(window, cx, "Won't Do"));
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "status-filter"), "Status: not Done, Won't Do");
+            assert_eq!(label(window, "issue-count"), "4 issues");
+            assert_eq!(excluded(window, cx), ["Done", "Won't Do"]);
+        });
+        // Showing one status and leaving out others are one filter, so no
+        // status to show is checked, and Any status is not either
+        in_window(cx, window, |window, cx| {
+            window.click("status-filter", cx);
+            window.render_frame(cx);
+            let items = window.find_all_by_role(Role::MenuItem);
+            assert!(items.iter().all(|item| item.checked() != Some(true)));
+            window.press("escape", cx);
+        });
+
+        // Past two names the button counts the rest, and the menu names them
+        in_window(cx, window, |window, cx| exclude(window, cx, "To Do"));
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, MINE]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(
+                label(window, "status-filter"),
+                "Status: not Done, Won't Do +1"
+            );
+            assert_eq!(excluded(window, cx), ["To Do", "Done", "Won't Do"]);
+        });
+
+        // A checked status is taken out of the exclusion again
+        in_window(cx, window, |window, cx| exclude(window, cx, "Won't Do"));
+        wait_for_rows(cx, window, &[API_MINE, DROPPED, NOBODYS, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status: not Done, To Do");
+        });
+
+        in_window(cx, window, |window, cx| {
+            window.click("status-filter-clear", cx)
+        });
+        wait_for_rows(cx, window, &all);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "status-filter"), "Status");
+            assert!(excluded(window, cx).is_empty());
+        });
+
+        // The last status taken out of the exclusion takes the filter off
+        in_window(cx, window, |window, cx| exclude(window, cx, "Done"));
+        wait_for_rows(cx, window, &[API_MINE, DROPPED, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, cx| exclude(window, cx, "Done"));
+        wait_for_rows(cx, window, &all);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status");
+            assert!(window.try_find("clear-filters").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn one_status_to_show_replaces_the_excluded_ones_and_the_reverse(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &finished_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(
+            cx,
+            window,
+            &[API_MINE, DROPPED, SHIPPED, NOBODYS, GRACES, MINE],
+        );
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &[
+                "Any status",
+                "To Do",
+                "In Progress",
+                "Done",
+                "Won't Do",
+                "Exclude",
+            ],
+        );
+
+        in_window(cx, window, |window, cx| exclude(window, cx, "Done"));
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "status-filter", "Won't Do")
+        });
+        wait_for_rows(cx, window, &[DROPPED]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "status-filter"), "Status: Won't Do");
+            assert!(excluded(window, cx).is_empty());
+        });
+        in_window(cx, window, |window, cx| exclude(window, cx, "To Do"));
+        wait_for_rows(cx, window, &[API_MINE, DROPPED, SHIPPED, NOBODYS, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status: not To Do");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_exclusion_combines_with_the_other_filters_and_the_search(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let mut issues = finished_work();
+        issues.push(assigned_to(
+            in_status(issue(6, "Fix signup"), "Done", "done"),
+            ADA,
+        ));
+        let data_dir = synced_two_projects(&tokio, &issues);
+        let window = launch(cx, &tokio, data_dir.path());
+        const SIGNUP: &str = "WEB-6: Fix signup, Done, Ada Lovelace";
+        wait_until(cx, window, |window| rows(window).len() == 7);
+        wait_for_project_filter(cx, window);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &[
+                "Any status",
+                "To Do",
+                "In Progress",
+                "Done",
+                "Won't Do",
+                "Exclude",
+            ],
+        );
+
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Me");
+        });
+        wait_for_rows(cx, window, &[API_MINE, SIGNUP, MINE]);
+        in_window(cx, window, |window, cx| exclude(window, cx, "Done"));
+        wait_for_rows(cx, window, &[API_MINE, MINE]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "issue-count"), "2 issues");
+            choose_project(window, cx, "WEB");
+        });
+        wait_for_rows(cx, window, &[MINE]);
+
+        // The search looks only among the issues the exclusion lets through
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Any assignee");
+            window.click("search", cx);
+            window.input("fix", cx);
+        });
+        wait_until(cx, window, |window| {
+            let mut found = rows(window);
+            found.sort();
+            found == [MINE, GRACES]
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "issue-count"), "2 issues");
+        });
+
+        // Beside an open issue the exclusion is a submenu of the status
+        in_window(cx, window, |window, cx| window.click("issue-WEB-1", cx));
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "filters"), "Filters · 2");
+            choose_in(
+                window,
+                cx,
+                "filters",
+                &["Status: not Done", "Exclude", "To Do"],
+            );
+        });
+        wait_for_rows(cx, window, &[MINE]);
+        in_window(cx, window, |window, cx| {
+            assert_eq!(
+                menu_of(window, cx, "filters"),
+                [
+                    "Project: WEB",
+                    "Assignee",
+                    "Status: not Done, To Do",
+                    "Clear filters"
+                ]
+            );
+        });
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "filters", "Clear filters")
+        });
+        wait_until(cx, window, |window| {
+            let mut found = rows(window);
+            found.sort();
+            found == [MINE, GRACES, SIGNUP]
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_excluded_status_that_left_the_cache_hides_nothing_and_can_be_taken_off(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &team_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "In Progress", "Exclude"],
+        );
+        in_window(cx, window, |window, cx| exclude(window, cx, "To Do"));
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, MINE]);
+
+        // The only issue in To Do is done now
+        let mut done = in_status(assigned_to(issue(2, "Fix logout"), GRACE), "Done", "done");
+        done["fields"]["updated"] = json!("2026-03-30T00:00:00.000+0000");
+        sync_brings(cx, &tokio, done);
+
+        const GRACES_DONE: &str = "WEB-2: Fix logout, Done, Grace Hopper";
+        wait_for_rows(cx, window, &[GRACES_DONE, API_MINE, NOBODYS, MINE]);
+        // To Do is no longer one to show, but stays checked among the excluded
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "In Progress", "Done", "Exclude"],
+        );
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "status-filter"), "Status: not To Do");
+            assert_eq!(excluded(window, cx), ["To Do"]);
+        });
+        in_window(cx, window, |window, cx| exclude(window, cx, "To Do"));
+        in_window(cx, window, |window, cx| {
+            assert_eq!(label(window, "status-filter"), "Status");
+            choose_in(window, cx, "status-filter", &["Exclude"]);
+            let items = window.find_all_by_role(Role::MenuItem);
+            let labels: Vec<_> = items.iter().filter_map(|item| item.label()).collect();
+            assert!(!labels.contains(&"To Do"), "{labels:?}");
         });
     }
 
@@ -1623,7 +1984,12 @@ pub(crate) mod tests {
         let window = launch(cx, &tokio, data_dir.path());
         wait_for_rows(cx, window, &[ENDPOINT, DOCS, LOGOUT, LOGIN]);
         wait_for_project_filter(cx, window);
-        wait_for_menu(cx, window, "status-filter", &["Any status", "To Do"]);
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &["Any status", "To Do", "Exclude"],
+        );
 
         // A site without sprints: no button, and the key opens nothing
         in_window(cx, window, |window, cx| {
@@ -1689,7 +2055,7 @@ pub(crate) mod tests {
             cx,
             window,
             "status-filter",
-            &["Any status", "To Do", "In Progress"],
+            &["Any status", "To Do", "In Progress", "Exclude"],
         );
         in_window(cx, window, |window, cx| {
             choose(window, cx, "status-filter", "To Do")
@@ -1710,7 +2076,7 @@ pub(crate) mod tests {
             cx,
             window,
             "status-filter",
-            &["Any status", "In Progress", "Done", "To Do"],
+            &["Any status", "In Progress", "Done", "To Do", "Exclude"],
         );
         in_window(cx, window, |window, cx| {
             assert_eq!(label(window, "no-matches"), "No issues match the filters");
@@ -1756,7 +2122,7 @@ pub(crate) mod tests {
             cx,
             window,
             "status-filter",
-            &["Any status", "To Do", "In Progress"],
+            &["Any status", "To Do", "In Progress", "Exclude"],
         );
         in_window(cx, window, |window, cx| {
             assert!(window.try_find("filters").is_none());
@@ -1865,7 +2231,7 @@ pub(crate) mod tests {
             cx,
             window,
             "status-filter",
-            &["Any status", "To Do", "In Progress"],
+            &["Any status", "To Do", "In Progress", "Exclude"],
         );
 
         // The menu holds Any assignee, Me, Unassigned and Grace Hopper
@@ -1895,6 +2261,59 @@ pub(crate) mod tests {
         }
         in_window(cx, window, |window, _| {
             assert!(!window.find_all_by_role(Role::MenuItem).is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn statuses_are_excluded_from_the_keyboard(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced_two_projects(&tokio, &finished_work());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(
+            cx,
+            window,
+            &[API_MINE, DROPPED, SHIPPED, NOBODYS, GRACES, MINE],
+        );
+        wait_for_menu(
+            cx,
+            window,
+            "status-filter",
+            &[
+                "Any status",
+                "To Do",
+                "In Progress",
+                "Done",
+                "Won't Do",
+                "Exclude",
+            ],
+        );
+
+        // Exclude is the last item. Enter opens its submenu on its first
+        // item, on whichever side there is room for it; the submenu holds To
+        // Do, In Progress, Done and Won't Do
+        for key in ["shift-s", "up", "enter", "down", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[API_MINE, DROPPED, NOBODYS, GRACES, MINE]);
+        for key in ["shift-s", "up", "enter", "down", "down", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(cx, window, &[API_MINE, NOBODYS, GRACES, MINE]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status: not Done, Won't Do");
+        });
+
+        // Any status, first in the menu, takes the exclusion off
+        for key in ["shift-s", "down", "enter"] {
+            in_window(cx, window, |window, cx| window.press(key, cx));
+        }
+        wait_for_rows(
+            cx,
+            window,
+            &[API_MINE, DROPPED, SHIPPED, NOBODYS, GRACES, MINE],
+        );
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "status-filter"), "Status");
         });
     }
 

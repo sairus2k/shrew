@@ -7,7 +7,8 @@ use crate::{
     },
     models::{
         AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
-        RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
+        RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, StatusFilter, SyncStatus,
+        User,
     },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -568,10 +569,21 @@ fn sprint_binds(filter: &IssueFilter) -> (bool, Option<i64>) {
     }
 }
 
+// The same for `IssueFilter::status`: the status that has to match, and the
+// statuses that must not, as a JSON array for json_each
+fn status_binds(filter: &IssueFilter) -> (Option<&str>, Option<String>) {
+    match &filter.status {
+        None => (None, None),
+        Some(StatusFilter::Is(name)) => (Some(name), None),
+        Some(StatusFilter::Not(names)) => (None, Some(serde_json::json!(names).to_string())),
+    }
+}
+
 /// The cached issues that pass `filter`, the one Jira changed last first.
 pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Result<Vec<IssueRow>> {
     let (unassigned, assignee_id) = assignee_binds(filter);
     let (backlog, sprint_id) = sprint_binds(filter);
+    let (status, excluded) = status_binds(filter);
     sqlx::query_as!(
         IssueRow,
         r#"
@@ -582,6 +594,7 @@ pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Resul
         FROM issues
         WHERE (? IS NULL OR project_key = ?)
           AND (? IS NULL OR status = ?)
+          AND (? IS NULL OR status NOT IN (SELECT value FROM json_each(?)))
           AND (NOT ? OR assignee_id IS NULL)
           AND (? IS NULL OR assignee_id = ?)
           AND (NOT ? OR (sprint_id IS NULL AND status_category <> 'done'))
@@ -591,8 +604,10 @@ pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Resul
         "#,
         filter.project,
         filter.project,
-        filter.status,
-        filter.status,
+        status,
+        status,
+        excluded,
+        excluded,
         unassigned,
         assignee_id,
         assignee_id,
@@ -618,6 +633,7 @@ pub(crate) async fn search(
     };
     let (unassigned, assignee_id) = assignee_binds(filter);
     let (backlog, sprint_id) = sprint_binds(filter);
+    let (status, excluded) = status_binds(filter);
 
     sqlx::query_as!(
         IssueRow,
@@ -631,6 +647,7 @@ pub(crate) async fn search(
         WHERE issues_fts MATCH ?
           AND (? IS NULL OR i.project_key = ?)
           AND (? IS NULL OR i.status = ?)
+          AND (? IS NULL OR i.status NOT IN (SELECT value FROM json_each(?)))
           AND (NOT ? OR i.assignee_id IS NULL)
           AND (? IS NULL OR i.assignee_id = ?)
           AND (NOT ? OR (i.sprint_id IS NULL AND i.status_category <> 'done'))
@@ -641,8 +658,10 @@ pub(crate) async fn search(
         fts_query,
         filter.project,
         filter.project,
-        filter.status,
-        filter.status,
+        status,
+        status,
+        excluded,
+        excluded,
         unassigned,
         assignee_id,
         assignee_id,
@@ -832,13 +851,88 @@ mod tests {
         seed_assigned(&pool).await;
 
         let in_progress = IssueFilter {
-            status: Some("In Progress".to_owned()),
+            status: Some(StatusFilter::Is("In Progress".to_owned())),
             ..Default::default()
         };
         assert_eq!(
             passing(&pool, in_progress).await,
             ["OTHER-1", "PROJ-1", "PROJ-3"]
         );
+    }
+
+    fn not_in(statuses: &[&str]) -> IssueFilter {
+        IssueFilter {
+            status: Some(StatusFilter::Not(
+                statuses.iter().map(|&name| name.to_owned()).collect(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[sqlx::test]
+    async fn an_excluded_status_hides_its_issues_from_the_list_and_the_search(pool: SqlitePool) {
+        seed_assigned(&pool).await;
+
+        assert_eq!(
+            passing(&pool, not_in(&["Done"])).await,
+            ["OTHER-1", "PROJ-1", "PROJ-3"]
+        );
+        assert_eq!(passing(&pool, not_in(&["In Progress"])).await, ["PROJ-2"]);
+    }
+
+    #[sqlx::test]
+    async fn several_statuses_can_be_excluded_at_once(pool: SqlitePool) {
+        seed_assigned(&pool).await;
+        let dropped = IssueRecord {
+            status: "Won't Do".to_owned(),
+            status_category: StatusCategory::Done,
+            ..issue("id-4", "PROJ-4", T1, "Login by fax")
+        };
+        upsert(&pool, &dropped).await.unwrap();
+
+        assert_eq!(
+            passing(&pool, not_in(&["Done", "Won't Do"])).await,
+            ["OTHER-1", "PROJ-1", "PROJ-3"]
+        );
+        assert_eq!(
+            passing(&pool, not_in(&["Won't Do", "In Progress"])).await,
+            ["PROJ-2"]
+        );
+        let every = ["Done", "Won't Do", "In Progress"];
+        assert!(passing(&pool, not_in(&every)).await.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn excluding_a_status_no_issue_has_hides_nothing(pool: SqlitePool) {
+        seed_assigned(&pool).await;
+        let all = ["OTHER-1", "PROJ-1", "PROJ-2", "PROJ-3"];
+
+        assert_eq!(passing(&pool, not_in(&["Gone"])).await, all);
+        assert_eq!(passing(&pool, not_in(&[])).await, all);
+        // A name is matched whole, not as a pattern
+        assert_eq!(passing(&pool, not_in(&["%"])).await, all);
+    }
+
+    #[sqlx::test]
+    async fn the_exclusion_holds_together_with_the_other_filters(pool: SqlitePool) {
+        seed_in_sprints(&pool).await;
+
+        let filter = IssueFilter {
+            project: Some("PROJ".to_owned()),
+            assignee: of("5b10a"),
+            ..not_in(&["Done"])
+        };
+        assert_eq!(passing(&pool, filter).await, ["PROJ-1"]);
+        let filter = IssueFilter {
+            sprint: Some(SprintFilter::Sprint(7)),
+            ..not_in(&["In Progress"])
+        };
+        assert_eq!(passing(&pool, filter).await, ["PROJ-2"]);
+        let filter = IssueFilter {
+            assignee: Some(AssigneeFilter::Unassigned),
+            ..not_in(&["In Progress"])
+        };
+        assert!(passing(&pool, filter).await.is_empty());
     }
 
     #[sqlx::test]
@@ -848,7 +942,7 @@ mod tests {
         let filter = IssueFilter {
             project: Some("PROJ".to_owned()),
             assignee: of("5b10a"),
-            status: Some("In Progress".to_owned()),
+            status: Some(StatusFilter::Is("In Progress".to_owned())),
             sprint: None,
         };
         assert_eq!(passing(&pool, filter).await, ["PROJ-1"]);
@@ -925,7 +1019,7 @@ mod tests {
         let filter = IssueFilter {
             project: Some("PROJ".to_owned()),
             assignee: of("5b10a"),
-            status: Some("Done".to_owned()),
+            status: Some(StatusFilter::Is("Done".to_owned())),
             sprint: Some(SprintFilter::Sprint(7)),
         };
         assert_eq!(passing(&pool, filter).await, ["PROJ-2"]);

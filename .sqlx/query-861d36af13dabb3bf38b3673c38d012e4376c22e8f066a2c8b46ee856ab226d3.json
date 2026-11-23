@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id AS \"id!\", key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, priority, project_key,\n               sync_status AS \"sync_status: SyncStatus\"\n        FROM issues\n        WHERE (? IS NULL OR project_key = ?)\n          AND (? IS NULL OR status = ?)\n          AND (NOT ? OR assignee_id IS NULL)\n          AND (? IS NULL OR assignee_id = ?)\n          AND (NOT ? OR (sprint_id IS NULL AND status_category <> 'done'))\n          AND (? IS NULL OR sprint_id = ?)\n        -- Both columns come from idx_issues_updated, so nothing is sorted\n        ORDER BY remote_updated_at DESC, rowid DESC\n        ",
+  "query": "\n        SELECT id AS \"id!\", key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, priority, project_key,\n               sync_status AS \"sync_status: SyncStatus\"\n        FROM issues\n        WHERE (? IS NULL OR project_key = ?)\n          AND (? IS NULL OR status = ?)\n          AND (? IS NULL OR status NOT IN (SELECT value FROM json_each(?)))\n          AND (NOT ? OR assignee_id IS NULL)\n          AND (? IS NULL OR assignee_id = ?)\n          AND (NOT ? OR (sprint_id IS NULL AND status_category <> 'done'))\n          AND (? IS NULL OR sprint_id = ?)\n        -- Both columns come from idx_issues_updated, so nothing is sorted\n        ORDER BY remote_updated_at DESC, rowid DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -50,7 +50,7 @@
       }
     ],
     "parameters": {
-      "Right": 10
+      "Right": 12
     },
     "nullable": [
       false,
@@ -64,5 +64,5 @@
       false
     ]
   },
-  "hash": "eff704f5765fb65f3987e40f8bd10df2350d1f0c400ac8c5be1a022f77169c06"
+  "hash": "861d36af13dabb3bf38b3673c38d012e4376c22e8f066a2c8b46ee856ab226d3"
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT i.id AS \"id!\", i.key AS \"key: IssueKey\", i.summary, i.status,\n               i.status_category AS \"status_category: StatusCategory\",\n               i.assignee_name, i.priority, i.project_key,\n               i.sync_status AS \"sync_status: SyncStatus\"\n        FROM issues i\n        JOIN issues_fts ON i.rowid = issues_fts.rowid\n        WHERE issues_fts MATCH ?\n          AND (? IS NULL OR i.project_key = ?)\n          AND (? IS NULL OR i.status = ?)\n          AND (NOT ? OR i.assignee_id IS NULL)\n          AND (? IS NULL OR i.assignee_id = ?)\n          AND (NOT ? OR (i.sprint_id IS NULL AND i.status_category <> 'done'))\n          AND (? IS NULL OR i.sprint_id = ?)\n        ORDER BY issues_fts.rank\n        LIMIT ?\n        ",
+  "query": "\n        SELECT i.id AS \"id!\", i.key AS \"key: IssueKey\", i.summary, i.status,\n               i.status_category AS \"status_category: StatusCategory\",\n               i.assignee_name, i.priority, i.project_key,\n               i.sync_status AS \"sync_status: SyncStatus\"\n        FROM issues i\n        JOIN issues_fts ON i.rowid = issues_fts.rowid\n        WHERE issues_fts MATCH ?\n          AND (? IS NULL OR i.project_key = ?)\n          AND (? IS NULL OR i.status = ?)\n          AND (? IS NULL OR i.status NOT IN (SELECT value FROM json_each(?)))\n          AND (NOT ? OR i.assignee_id IS NULL)\n          AND (? IS NULL OR i.assignee_id = ?)\n          AND (NOT ? OR (i.sprint_id IS NULL AND i.status_category <> 'done'))\n          AND (? IS NULL OR i.sprint_id = ?)\n        ORDER BY issues_fts.rank\n        LIMIT ?\n        ",
   "describe": {
     "columns": [
       {
@@ -50,7 +50,7 @@
       }
     ],
     "parameters": {
-      "Right": 12
+      "Right": 14
     },
     "nullable": [
       false,
@@ -64,5 +64,5 @@
       false
     ]
   },
-  "hash": "20f3d4b398e84b02f66c944768f46138ecb628565359bfbc963d99de02206ea7"
+  "hash": "e10c405ac27cca7e3fbd01ac3104f72738f1026cc91ec1af90bcd68d22f63c5e"
 }

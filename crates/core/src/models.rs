@@ -56,9 +56,17 @@ pub struct IssueRow {
 pub struct IssueFilter {
     pub project: Option<String>,
     pub assignee: Option<AssigneeFilter>,
-    /// The name of a status. Projects that give a status the same name share it.
-    pub status: Option<String>,
+    pub status: Option<StatusFilter>,
     pub sprint: Option<SprintFilter>,
+}
+
+/// Statuses are matched by name: projects that give a status the same name share it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StatusFilter {
+    /// Only the issues in this status.
+    Is(String),
+    /// The issues in every status but these. An empty list excludes nothing.
+    Not(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
