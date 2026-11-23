@@ -593,6 +593,28 @@ fn open_main_window(step: SetupStep, cx: &mut App) {
     cx.activate(true);
 }
 
+// GPUI Kit embeds a part of the Lucide icons by default, and the priority
+// marks of the issue list need three more
+gpui_kit::assets::icon_assets!(PriorityIcons, [ChevronsUp, ChevronsDown, Equal]);
+
+/// The icons GPUI Kit embeds and the ones the app adds.
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match PriorityIcons.load(path)? {
+            Some(icon) => Ok(Some(icon)),
+            None => assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut paths = assets::Assets.list(path)?;
+        paths.extend(PriorityIcons.list(path)?);
+        Ok(paths)
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // sqlx and reqwest need a tokio runtime. GPUI drives the UI on its own executor,
     // so tokio runs beside it on two worker threads.
@@ -610,7 +632,7 @@ fn main() -> anyhow::Result<()> {
     let hints = tokio.block_on(app_core::api::shortcut_hints(&state));
     let theme = tokio.block_on(app_core::api::theme(&state));
 
-    application().with_assets(assets::Assets).run(move |cx| {
+    application().with_assets(AppAssets).run(move |cx| {
         init(cx);
         theme::init(cx);
         theme::choose(theme, cx);

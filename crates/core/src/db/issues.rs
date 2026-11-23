@@ -48,6 +48,7 @@ pub(crate) struct IssueRecord {
     pub assignee_name: Option<String>,
     pub project_key: String,
     pub issue_type: Option<String>,
+    pub priority: Option<String>,
     pub raw_json: String,
     pub remote_updated_at: JiraTimestamp,
 }
@@ -62,9 +63,9 @@ pub(crate) async fn upsert(
         r#"
         INSERT INTO issues
             (id, key, summary, description_text, status, status_category,
-             assignee_id, assignee_name, project_key, issue_type, raw_json,
-             remote_updated_at, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             assignee_id, assignee_name, project_key, issue_type, priority,
+             raw_json, remote_updated_at, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         -- Conflict on id, not key: a moved issue keeps its id but gets a new key
         ON CONFLICT(id) DO UPDATE SET
             key                = excluded.key,
@@ -94,6 +95,7 @@ pub(crate) async fn upsert(
                                        AND status IN ('pending', 'in_progress'))
                                  THEN issues.assignee_name ELSE excluded.assignee_name END,
             issue_type         = excluded.issue_type,
+            priority           = excluded.priority,
             raw_json           = excluded.raw_json,
             remote_updated_at  = excluded.remote_updated_at,
             sync_status        = CASE WHEN EXISTS (
@@ -115,6 +117,7 @@ pub(crate) async fn upsert(
         issue.assignee_name,
         issue.project_key,
         issue.issue_type,
+        issue.priority,
         issue.raw_json,
         issue.remote_updated_at,
     )
@@ -187,7 +190,7 @@ pub(crate) async fn get(pool: &SqlitePool, key: &IssueKey) -> sqlx::Result<Optio
         r#"
         SELECT id AS "id!", key AS "key: IssueKey", summary, status,
                status_category AS "status_category: StatusCategory",
-               assignee_name, project_key,
+               assignee_name, priority, project_key,
                sync_status AS "sync_status: SyncStatus"
         FROM issues
         WHERE key = ?
@@ -574,7 +577,7 @@ pub(crate) async fn list(pool: &SqlitePool, filter: &IssueFilter) -> sqlx::Resul
         r#"
         SELECT id AS "id!", key AS "key: IssueKey", summary, status,
                status_category AS "status_category: StatusCategory",
-               assignee_name, project_key,
+               assignee_name, priority, project_key,
                sync_status AS "sync_status: SyncStatus"
         FROM issues
         WHERE (? IS NULL OR project_key = ?)
@@ -621,7 +624,7 @@ pub(crate) async fn search(
         r#"
         SELECT i.id AS "id!", i.key AS "key: IssueKey", i.summary, i.status,
                i.status_category AS "status_category: StatusCategory",
-               i.assignee_name, i.project_key,
+               i.assignee_name, i.priority, i.project_key,
                i.sync_status AS "sync_status: SyncStatus"
         FROM issues i
         JOIN issues_fts ON i.rowid = issues_fts.rowid
@@ -736,6 +739,7 @@ mod tests {
             assignee_name: None,
             project_key: key.split('-').next().unwrap().to_owned(),
             issue_type: Some("Task".to_owned()),
+            priority: None,
             raw_json: "{}".to_owned(),
             remote_updated_at: JiraTimestamp::parse(updated_at).unwrap(),
         }
@@ -1017,6 +1021,83 @@ mod tests {
         assert_eq!(row.summary, "new title");
         assert_eq!(row.status_category, StatusCategory::Done);
         assert_eq!(row.sync_status, SyncStatus::Synced);
+    }
+
+    #[sqlx::test]
+    async fn the_rows_carry_the_priority_jira_sent_last(pool: SqlitePool) {
+        let high = IssueRecord {
+            priority: Some("High".to_owned()),
+            ..issue("1", "PROJ-1", T1, "Login fails")
+        };
+        upsert(&pool, &high).await.unwrap();
+        upsert(&pool, &issue("2", "PROJ-2", T1, "Login is slow"))
+            .await
+            .unwrap();
+        let priorities = |rows: Vec<IssueRow>| {
+            let mut found: Vec<_> = rows
+                .into_iter()
+                .map(|row| (row.key.to_string(), row.priority))
+                .collect();
+            found.sort();
+            found
+        };
+        let expected = [
+            ("PROJ-1".to_owned(), Some("High".to_owned())),
+            ("PROJ-2".to_owned(), None),
+        ];
+
+        let all = IssueFilter::default();
+        assert_eq!(priorities(list(&pool, &all).await.unwrap()), expected);
+        assert_eq!(
+            priorities(search(&pool, "login", &all, 10).await.unwrap()),
+            expected
+        );
+
+        let lowered = IssueRecord {
+            priority: Some("Low".to_owned()),
+            ..issue("1", "PROJ-1", T2, "Login fails")
+        };
+        upsert(&pool, &lowered).await.unwrap();
+        let row = get(&pool, &"PROJ-1".into()).await.unwrap().unwrap();
+        assert_eq!(row.priority.as_deref(), Some("Low"));
+    }
+
+    #[sqlx::test]
+    async fn priority_migration_takes_the_priority_of_a_cached_issue_from_its_json(
+        pool: SqlitePool,
+    ) {
+        // Written before the sync filled the column
+        for (id, key, raw_json) in [
+            (
+                "1",
+                "PROJ-1",
+                r#"{"fields":{"priority":{"name":"Highest"}}}"#,
+            ),
+            ("2", "PROJ-2", r#"{"fields":{"priority":null}}"#),
+            ("3", "PROJ-3", r#"{"fields":{}}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO issues (id, key, summary, status, status_category, project_key,
+                                     raw_json, remote_updated_at)
+                 VALUES (?, ?, 'Login', 'To Do', 'todo', 'PROJ', ?, '2026-01-01T10:00:00.000Z')",
+            )
+            .bind(id)
+            .bind(key)
+            .bind(raw_json)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::raw_sql(include_str!("../../migrations/0015_issue_priority.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let priority = async |key: &str| get(&pool, &key.into()).await.unwrap().unwrap().priority;
+        assert_eq!(priority("PROJ-1").await.as_deref(), Some("Highest"));
+        assert_eq!(priority("PROJ-2").await, None);
+        assert_eq!(priority("PROJ-3").await, None);
     }
 
     #[sqlx::test]

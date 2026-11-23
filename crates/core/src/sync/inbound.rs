@@ -2701,6 +2701,20 @@ mod tests {
     }
 
     #[test]
+    fn the_record_has_the_name_of_the_priority() {
+        let mut prioritized = issue(7, "WEB");
+        prioritized["fields"]["priority"] = json!({ "id": "2", "name": "High" });
+        let mut unprioritized = issue(8, "WEB");
+        unprioritized["fields"]["priority"] = Value::Null;
+
+        assert_eq!(
+            issue_record(&prioritized).unwrap().priority.as_deref(),
+            Some("High")
+        );
+        assert_eq!(issue_record(&unprioritized).unwrap().priority, None);
+    }
+
+    #[test]
     fn status_categories_follow_jira() {
         for (jira, ours) in [
             ("new", StatusCategory::Todo),

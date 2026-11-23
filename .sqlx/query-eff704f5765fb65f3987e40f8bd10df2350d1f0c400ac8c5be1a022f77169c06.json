@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id AS \"id!\", key AS \"key: IssueKey\", summary, status,\n               status_category AS \"status_category: StatusCategory\",\n               assignee_name, priority, project_key,\n               sync_status AS \"sync_status: SyncStatus\"\n        FROM issues\n        WHERE (? IS NULL OR project_key = ?)\n          AND (? IS NULL OR status = ?)\n          AND (NOT ? OR assignee_id IS NULL)\n          AND (? IS NULL OR assignee_id = ?)\n          AND (NOT ? OR (sprint_id IS NULL AND status_category <> 'done'))\n          AND (? IS NULL OR sprint_id = ?)\n        -- Both columns come from idx_issues_updated, so nothing is sorted\n        ORDER BY remote_updated_at DESC, rowid DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key: IssueKey",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "summary",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "status_category: StatusCategory",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "assignee_name",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "priority",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_key",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "sync_status: SyncStatus",
+        "ordinal": 8,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "eff704f5765fb65f3987e40f8bd10df2350d1f0c400ac8c5be1a022f77169c06"
+}

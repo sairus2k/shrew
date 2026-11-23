@@ -39,6 +39,7 @@ struct Fields {
     assignee: Option<User>,
     project: ProjectRef,
     issuetype: Option<IssueType>,
+    priority: Option<Priority>,
     updated: String,
 }
 
@@ -71,6 +72,11 @@ struct IssueType {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct Priority {
+    name: String,
+}
+
 /// `issue` is one element of a search page, fetched with `ISSUE_FIELDS`.
 pub(crate) fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
     let JiraIssue { id, key, fields } = JiraIssue::deserialize(issue)
@@ -91,6 +97,7 @@ pub(crate) fn issue_record(issue: &Value) -> anyhow::Result<IssueRecord> {
         assignee_name,
         project_key: fields.project.key,
         issue_type: fields.issuetype.map(|issue_type| issue_type.name),
+        priority: fields.priority.map(|priority| priority.name),
         raw_json: issue.to_string(),
         // chrono is built without `std`, so its error is not a `std::error::Error`
         remote_updated_at: JiraTimestamp::parse(&fields.updated)

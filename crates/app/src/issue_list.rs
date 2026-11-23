@@ -13,8 +13,9 @@ use app_core::{
         StatusCategory, SyncStatus,
     },
 };
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Sizable,
+    ActiveTheme, Icon, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
@@ -519,13 +520,16 @@ fn row(
     let assignee = issue.assignee_name.as_deref().unwrap_or("Unassigned");
     // The status is the user's own change and Jira does not have it yet
     let pending = issue.sync_status == SyncStatus::Pending;
-    let label = format!(
+    let mut label = format!(
         "{}: {}, {}{}, {assignee}",
         issue.key,
         issue.summary,
         issue.status,
         if pending { " (pending)" } else { "" }
     );
+    if let Some(priority) = &issue.priority {
+        label.push_str(&format!(", {priority} priority"));
+    }
     div()
         .id(SharedString::from(format!("issue-{}", issue.key)))
         .role(Role::ListItem)
@@ -574,10 +578,18 @@ fn row(
                 .when(done, |summary| summary.text_color(muted))
                 .child(issue.summary.clone()),
         )
-        // Beside an open issue the list is too narrow for these two, and the
+        // Beside an open issue the list is too narrow for these three, and the
         // issue itself shows them
         .when(opened.is_none(), |row| {
             row.child(
+                div()
+                    .w(px(PRIORITY_WIDTH))
+                    .flex_none()
+                    .when_some(issue.priority.as_deref(), |cell, name| {
+                        cell.child(priority(&issue.key, name, done, cx))
+                    }),
+            )
+            .child(
                 div()
                     .w(px(STATUS_WIDTH))
                     .flex_none()
@@ -601,8 +613,46 @@ fn row(
 }
 
 const KEY_WIDTH: f32 = 96.;
+const PRIORITY_WIDTH: f32 = 96.;
 const STATUS_WIDTH: f32 = 120.;
 const ASSIGNEE_WIDTH: f32 = 140.;
+const MARK_SIZE: f32 = 14.;
+
+/// The priority of an issue: a mark and the name. The five priorities Jira
+/// gives a site have marks of their own, so that they are told apart before
+/// they are read. A priority of another scheme has no mark, as its rank among
+/// the others is not known.
+fn priority(key: &IssueKey, name: &str, done: bool, cx: &App) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let mark = match name {
+        "Highest" => Some((IconName::ChevronsUp, theme.red)),
+        "High" => Some((IconName::ChevronUp, theme.red)),
+        "Medium" => Some((IconName::Equal, theme.yellow)),
+        "Low" => Some((IconName::ChevronDown, theme.blue)),
+        "Lowest" => Some((IconName::ChevronsDown, theme.blue)),
+        _ => None,
+    };
+    div()
+        .id(SharedString::from(format!("priority-{key}")))
+        .test_support()
+        .aria_label(name.to_owned())
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_color(theme.muted_foreground)
+        // The slot stays without a mark, so that every name starts in one place
+        .child(
+            div()
+                .size(px(MARK_SIZE))
+                .flex_none()
+                .children(mark.map(|(icon, color)| {
+                    // A done issue no longer asks for attention
+                    let color = if done { theme.muted_foreground } else { color };
+                    Icon::new(icon).with_size(px(MARK_SIZE)).text_color(color)
+                })),
+        )
+        .child(div().min_w_0().truncate().child(name.to_owned()))
+}
 
 /// The names of the columns, over a list wide enough to show them all.
 fn column_names(cx: &App) -> impl IntoElement {
@@ -621,6 +671,14 @@ fn column_names(cx: &App) -> impl IntoElement {
         .child(div().w(px(8.)).flex_none())
         .child(div().w(px(KEY_WIDTH)).flex_none().child("KEY"))
         .child(div().flex_1().min_w_0().child("SUMMARY"))
+        .child(
+            div()
+                .id("priority-column")
+                .test_support()
+                .w(px(PRIORITY_WIDTH))
+                .flex_none()
+                .child("PRIORITY"),
+        )
         .child(div().w(px(STATUS_WIDTH)).flex_none().child("STATUS"))
         .child(div().w(px(ASSIGNEE_WIDTH)).flex_none().child("ASSIGNEE"))
 }
@@ -1008,6 +1066,47 @@ pub(crate) mod tests {
         // Each row is as wide as the window, so the columns line up
         in_window(cx, window, |window, _| {
             assert_eq!(window.find("issue-WEB-1").bounds().size.width, px(800.));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn each_row_shows_the_priority_of_its_issue_under_the_column_name(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let mut high = issue(1, "Fix login");
+        high["fields"]["priority"] = json!({ "id": "2", "name": "High" });
+        let mut long = issue(3, &"Checkout breaks on a card that expired ".repeat(8));
+        long["fields"]["priority"] = json!({ "id": "10000", "name": "Blocker" });
+        let data_dir = synced(&tokio, &[high, issue(2, "Fix logout"), long]);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| rows(window).len() == 3);
+
+        in_window(cx, window, |window, _| {
+            assert_eq!(rows(window)[1], LOGOUT);
+            assert_eq!(rows(window)[2], format!("{LOGIN}, High priority"));
+            assert_eq!(window.find("priority-WEB-1").label(), Some("High"));
+            assert_eq!(window.find("priority-WEB-3").label(), Some("Blocker"));
+            assert!(window.try_find("priority-WEB-2").is_none());
+            // A long summary is cut off before the column
+            let column = window.find("priority-column").bounds().origin.x;
+            for cell in ["priority-WEB-1", "priority-WEB-3"] {
+                let left = window.find(cell).bounds().origin.x;
+                assert_eq!(left, column, "{cell} is out of line");
+            }
+        });
+
+        let mut lowered = issue(1, "Fix login");
+        lowered["fields"]["priority"] = json!({ "id": "4", "name": "Low" });
+        lowered["fields"]["updated"] = json!("2026-03-30T00:00:00.000+0000");
+        sync_brings(cx, &tokio, lowered);
+        wait_until(cx, window, |window| {
+            rows(window).first() == Some(&format!("{LOGIN}, Low priority"))
+        });
+
+        // The open issue shows the priority, and the list beside it has no room
+        in_window(cx, window, |window, cx| window.click("issue-WEB-1", cx));
+        in_window(cx, window, |window, _| {
+            assert!(window.try_find("priority-column").is_none());
+            assert!(window.try_find("priority-WEB-1").is_none());
         });
     }
 
@@ -1922,6 +2021,7 @@ pub(crate) mod tests {
             status: "To Do".to_owned(),
             status_category: StatusCategory::Todo,
             assignee_name: None,
+            priority: None,
             project_key: "WEB".to_owned(),
             sync_status: SyncStatus::Synced,
         }])

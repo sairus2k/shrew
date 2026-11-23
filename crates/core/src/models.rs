@@ -44,6 +44,8 @@ pub struct IssueRow {
     pub status: String,
     pub status_category: StatusCategory,
     pub assignee_name: Option<String>,
+    /// Its name in the priority scheme of the site: Highest to Lowest by default.
+    pub priority: Option<String>,
     pub project_key: String,
     pub sync_status: SyncStatus,
 }

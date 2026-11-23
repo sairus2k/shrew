@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT i.id AS \"id!\", i.key AS \"key: IssueKey\", i.summary, i.status,\n               i.status_category AS \"status_category: StatusCategory\",\n               i.assignee_name, i.priority, i.project_key,\n               i.sync_status AS \"sync_status: SyncStatus\"\n        FROM issues i\n        JOIN issues_fts ON i.rowid = issues_fts.rowid\n        WHERE issues_fts MATCH ?\n          AND (? IS NULL OR i.project_key = ?)\n          AND (? IS NULL OR i.status = ?)\n          AND (NOT ? OR i.assignee_id IS NULL)\n          AND (? IS NULL OR i.assignee_id = ?)\n          AND (NOT ? OR (i.sprint_id IS NULL AND i.status_category <> 'done'))\n          AND (? IS NULL OR i.sprint_id = ?)\n        ORDER BY issues_fts.rank\n        LIMIT ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "key: IssueKey",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "summary",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "status_category: StatusCategory",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "assignee_name",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "priority",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_key",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "sync_status: SyncStatus",
+        "ordinal": 8,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 12
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "20f3d4b398e84b02f66c944768f46138ecb628565359bfbc963d99de02206ea7"
+}

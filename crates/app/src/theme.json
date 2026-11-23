@@ -35,7 +35,8 @@
         "status_bar.border": "#e4e5ea",
         "base.blue": "#3b7de0",
         "base.green": "#3d9a63",
-        "base.red": "#d9483b"
+        "base.red": "#d9483b",
+        "base.yellow": "#c48a0e"
       }
     },
     {
@@ -72,7 +73,8 @@
         "status_bar.border": "#2a2c33",
         "base.blue": "#5c9bf2",
         "base.green": "#55b47c",
-        "base.red": "#f0685b"
+        "base.red": "#f0685b",
+        "base.yellow": "#e3b341"
       }
     }
   ]
