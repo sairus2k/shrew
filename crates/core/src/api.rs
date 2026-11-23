@@ -1,7 +1,11 @@
 //! The async functions the UI calls. They need the tokio runtime.
 
 use crate::{
-    AppState, SyncEvent, auth, db,
+    AppState, SyncEvent, auth,
+    db::{
+        self,
+        sync_queue::{AssigneeChange, Change, CommentChange, TransitionChange, TransitionId},
+    },
     models::{
         Account, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow, Project,
         RunningTimer, SetupStep, ThemeChoice, Transition, User, WorklogSettings, WorklogTarget,
@@ -13,7 +17,6 @@ use crate::{
     },
 };
 use anyhow::{Context, bail};
-use serde_json::json;
 
 /// The account the app is signed in to, or `None` when it has no credentials.
 pub async fn account(state: &AppState) -> Option<Account> {
@@ -429,7 +432,12 @@ pub async fn transition_issue(
     transition: &Transition,
     fields: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    let payload = json!({ "transition": { "id": transition.id }, "fields": fields });
+    let change = Change::Transition(TransitionChange {
+        transition: TransitionId {
+            id: transition.id.clone(),
+        },
+        fields: fields.clone(),
+    });
     // One transaction: a crash must not leave a status Jira will never hear
     // of, or an outbox entry for a status the user does not see
     let mut tx = crate::db::begin(&state.pool).await?;
@@ -443,7 +451,7 @@ pub async fn transition_issue(
     if !found {
         bail!("issue {key} not found");
     }
-    db::sync_queue::enqueue(&mut *tx, "transition", key, &payload.to_string()).await?;
+    db::sync_queue::enqueue(&mut *tx, key, &change).await?;
     tx.commit().await?;
 
     state
@@ -473,14 +481,16 @@ pub async fn assign_issue(
     key: &IssueKey,
     assignee: Option<&User>,
 ) -> anyhow::Result<()> {
-    let payload = json!({ "accountId": assignee.map(|user| &user.account_id) });
+    let change = Change::Assignee(AssigneeChange {
+        account_id: assignee.map(|user| user.account_id.clone()),
+    });
     // One transaction, as for a transition: the assignee shown and the entry
     // Jira will get must not part ways
     let mut tx = crate::db::begin(&state.pool).await?;
     if !db::issues::set_pending_assignee(&mut *tx, key, assignee).await? {
         bail!("issue {key} not found");
     }
-    db::sync_queue::enqueue(&mut *tx, "assignee", key, &payload.to_string()).await?;
+    db::sync_queue::enqueue(&mut *tx, key, &change).await?;
     tx.commit().await?;
 
     state
@@ -525,13 +535,15 @@ async fn queue_comment(
     if db::issues::get(&state.pool, key).await?.is_none() {
         bail!("issue {key} not found");
     }
-    let mut payload = json!({ "text": text });
-    if let Some(comment_id) = reply_to {
-        payload["parent_id"] = db::issues::top_of_thread(&state.pool, key, comment_id)
-            .await?
-            .into();
-    }
-    db::sync_queue::enqueue(&state.pool, "comment", key, &payload.to_string()).await?;
+    let parent_id = match reply_to {
+        Some(comment_id) => Some(db::issues::top_of_thread(&state.pool, key, comment_id).await?),
+        None => None,
+    };
+    let change = Change::Comment(CommentChange {
+        text: text.to_owned(),
+        parent_id,
+    });
+    db::sync_queue::enqueue(&state.pool, key, &change).await?;
 
     state
         .events

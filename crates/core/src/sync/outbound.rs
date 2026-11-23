@@ -5,7 +5,7 @@ use crate::{
     auth::Config,
     db::{
         assignable, issues,
-        sync_queue::{self, QueueEntry},
+        sync_queue::{self, Change, CommentChange, EntryKind, WorklogChange},
         transitions::{self, Position},
         worklogs,
     },
@@ -57,7 +57,13 @@ pub(crate) async fn process_queue(
     };
     // A retried entry is claimed again: it is still the oldest one
     while let Some(entry) = sync_queue::claim_next(&state.pool, tempo_rejected(state)).await? {
-        let error = match deliver(&client, state, config, &entry).await {
+        // An entry that cannot be read fails as one Jira refused: it is not
+        // claimed again, so the user is told once, and the entries behind it go on
+        let delivery = match &entry.change {
+            Ok(change) => deliver(&client, state, config, &entry.issue_key, change).await,
+            Err(unreadable) => Err(anyhow::anyhow!(unreadable.reason.clone())),
+        };
+        let error = match delivery {
             Ok(delivered_as) => {
                 // One transaction: an issue must not stay pending with nothing left to send,
                 // and a comment must not be missing from both the outbox and the cache
@@ -107,7 +113,8 @@ pub(crate) async fn process_queue(
             }
             Failure::Transient | Failure::Rejected => {
                 let mut later = Vec::new();
-                if matches!(entry.entity_type.as_str(), "transition" | "assignee") {
+                let kind = entry.kind();
+                if let Some(kind @ (EntryKind::Transition | EntryKind::Assignee)) = kind {
                     sync_queue::remove(&state.pool, entry.id).await?;
                     // The entry is gone whether or not the rollback works: with
                     // Jira out of reach the change stays as the user left it
@@ -118,31 +125,23 @@ pub(crate) async fn process_queue(
                     // A failed rollback leaves the issue `pending` with nothing in the
                     // outbox, which `roll_back_unconfirmed` looks for in every cycle:
                     // the issue row is the marker, not the entry
-                    later = roll_back(
-                        state,
-                        &client,
-                        &entry.issue_key,
-                        &entry.entity_type,
-                        refused,
-                    )
-                    .await
-                    .unwrap_or_default();
+                    later = roll_back(state, &client, &entry.issue_key, kind, refused)
+                        .await
+                        .unwrap_or_default();
                 } else {
                     sync_queue::mark_failed(&state.pool, entry.id, &message).await?;
-                    if entry.entity_type == "worklog" {
-                        let payload: Value = serde_json::from_str(&entry.payload)?;
-                        let local_id = payload["local_id"].as_str().unwrap_or_default();
+                    if let Ok(Change::Worklog(worklog)) = &entry.change
                         // After the project was unwatched no row is left to show the
                         // refusal on (the user is told by the event below)
-                        if !worklogs::mark_failed(&state.pool, local_id).await? {
-                            sync_queue::remove(&state.pool, entry.id).await?;
-                        }
+                        && !worklogs::mark_failed(&state.pool, &worklog.local_id).await?
+                    {
+                        sync_queue::remove(&state.pool, entry.id).await?;
                     }
                 }
                 // A refused comment moves from the pending ones to the refused ones
                 let updated = SyncEvent::IssuesUpdated(vec![entry.issue_key.clone()]);
                 state.events.send(updated).ok();
-                let event = rejection(&entry.issue_key, &entry.entity_type, &message);
+                let event = rejection(&entry.issue_key, kind, &message);
                 state.events.send(event).ok();
                 for event in later {
                     state.events.send(event).ok();
@@ -159,9 +158,10 @@ const EARLIER_REJECTED: &str = "an earlier status change of this issue did not r
 
 /// Reads the issue again and stores it as Jira has it, so that a change the
 /// user made and Jira refused does not stay on screen. Jira has not changed
-/// the issue, so its `updated` is no newer than the stored row's. `entity_type`
-/// is the type of the entry that failed: what the user changed by the other
-/// kind of entry, while it waits in the outbox, stays as it is (see `upsert`).
+/// the issue, so its `updated` is no newer than the stored row's. `kind` is the
+/// kind of the entry that failed, a transition or an assignee change: what the
+/// user changed by the other kind of entry, while it waits in the outbox, stays
+/// as it is (see `upsert`).
 ///
 /// With `refused` (Jira answered with a 4xx) what was cached to offer the
 /// change is dropped, because something the cache did not know about may be the
@@ -181,7 +181,7 @@ async fn roll_back(
     state: &AppState,
     client: &JiraClient,
     key: &IssueKey,
-    entity_type: &str,
+    kind: EntryKind,
     refused: bool,
 ) -> anyhow::Result<Vec<SyncEvent>> {
     let mut issue = client.issue(key, issue_record::ISSUE_FIELDS).await?;
@@ -193,7 +193,7 @@ async fn roll_back(
     if !issues::mark_stale(&mut *tx, &record.id).await? {
         return Ok(Vec::new());
     }
-    let status_change = entity_type == "transition";
+    let status_change = kind == EntryKind::Transition;
     let later = if status_change {
         sync_queue::drop_unsent_transitions(&mut *tx, key).await?
     } else {
@@ -223,7 +223,7 @@ async fn roll_back(
     Ok(moved_to
         .map(|key| SyncEvent::IssuesUpdated(vec![key]))
         .into_iter()
-        .chain((0..later).map(|_| rejection(key, "transition", EARLIER_REJECTED)))
+        .chain((0..later).map(|_| rejection(key, Some(EntryKind::Transition), EARLIER_REJECTED)))
         .collect())
 }
 
@@ -241,7 +241,7 @@ pub(crate) async fn roll_back_unconfirmed(
         return;
     };
     for key in keys {
-        let Ok(later) = roll_back(state, &client, &key, "transition", true).await else {
+        let Ok(later) = roll_back(state, &client, &key, EntryKind::Transition, true).await else {
             continue;
         };
         for event in later {
@@ -265,49 +265,42 @@ async fn deliver(
     client: &JiraClient,
     state: &AppState,
     config: &Config,
-    entry: &QueueEntry,
+    key: &IssueKey,
+    change: &Change,
 ) -> anyhow::Result<Delivered> {
-    let payload: Value = serde_json::from_str(&entry.payload)?;
-    match entry.entity_type.as_str() {
-        "transition" => {
-            client.transition_issue(&entry.issue_key, &payload).await?;
+    match change {
+        Change::Transition(transition) => {
+            client.transition_issue(key, &json!(transition)).await?;
             Ok(Delivered::Nothing)
         }
-        "assignee" => {
-            client.assign_issue(&entry.issue_key, &payload).await?;
+        Change::Assignee(assignee) => {
+            client.assign_issue(key, &json!(assignee)).await?;
             Ok(Delivered::Nothing)
         }
-        "comment" => {
-            let text = payload["text"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("a comment entry without text"))?;
+        Change::Comment(CommentChange { text, parent_id }) => {
             let mut body = json!({ "body": adf::from_plain_text(text) });
-            if let Some(parent) = payload["parent_id"].as_str() {
-                body["parentId"] = parent.into();
+            if let Some(parent) = parent_id {
+                body["parentId"] = parent.as_str().into();
             }
-            Ok(Delivered::Comment(
-                client.add_comment(&entry.issue_key, &body).await?,
-            ))
+            Ok(Delivered::Comment(client.add_comment(key, &body).await?))
         }
-        "worklog" => {
-            let local_id = payload["local_id"].as_str().unwrap_or_default().to_owned();
+        Change::Worklog(worklog) => {
+            let local_id = worklog.local_id.clone();
             if config.worklog_target == WorklogTarget::Tempo {
-                let tempo_id = post_to_tempo(client, state, config, entry, &payload).await?;
+                let tempo_id = post_to_tempo(client, state, config, key, worklog).await?;
                 return Ok(Delivered::TempoWorklog { local_id, tempo_id });
             }
-            let started =
-                worklogs::started_at_for_jira(payload["started_at"].as_str().unwrap_or_default())
-                    .map_err(|error| {
-                    anyhow::anyhow!("a worklog entry with an unreadable start: {error}")
-                })?;
+            let started = worklogs::started_at_for_jira(&worklog.started_at).map_err(|error| {
+                anyhow::anyhow!("a worklog entry with an unreadable start: {error}")
+            })?;
             let mut body = json!({
-                "timeSpentSeconds": payload["time_spent_seconds"],
+                "timeSpentSeconds": worklog.time_spent_seconds,
                 "started": started,
             });
-            if let Some(comment) = payload["comment"].as_str() {
+            if let Some(comment) = &worklog.comment {
                 body["comment"] = adf::from_plain_text(comment);
             }
-            let created = client.add_worklog(&entry.issue_key, &body).await?;
+            let created = client.add_worklog(key, &body).await?;
             let remote_id = created["id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Jira answered a worklog without an id"))?
@@ -317,7 +310,6 @@ async fn deliver(
                 remote_id,
             })
         }
-        other => anyhow::bail!("unknown outbox entry type `{other}`"),
     }
 }
 
@@ -338,19 +330,16 @@ async fn post_to_tempo(
     client: &JiraClient,
     state: &AppState,
     config: &Config,
-    entry: &QueueEntry,
-    payload: &Value,
+    key: &IssueKey,
+    worklog: &WorklogChange,
 ) -> anyhow::Result<i64> {
     // Tempo takes the numeric id of the issue, not its key
-    let issue_id: i64 = issues::id_of(&state.pool, &entry.issue_key)
+    let issue_id: i64 = issues::id_of(&state.pool, key)
         .await?
         .and_then(|id| id.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("{} is not in the cache", entry.issue_key))?;
-    let started =
-        chrono::DateTime::parse_from_rfc3339(payload["started_at"].as_str().unwrap_or_default())
-            .map_err(|error| {
-                anyhow::anyhow!("a worklog entry with an unreadable start: {error}")
-            })?;
+        .ok_or_else(|| anyhow::anyhow!("{key} is not in the cache"))?;
+    let started = chrono::DateTime::parse_from_rfc3339(&worklog.started_at)
+        .map_err(|error| anyhow::anyhow!("a worklog entry with an unreadable start: {error}"))?;
     // Tempo takes a date and a time without an offset and reads them in the
     // time zone of the author's Jira profile. Asked for each worklog: the
     // user can change the profile at any time.
@@ -364,12 +353,12 @@ async fn post_to_tempo(
     let mut body = json!({
         "issueId": issue_id,
         "authorAccountId": config.account_id,
-        "timeSpentSeconds": payload["time_spent_seconds"],
+        "timeSpentSeconds": worklog.time_spent_seconds,
         "startDate": started.format("%Y-%m-%d").to_string(),
         "startTime": started.format("%H:%M:%S").to_string(),
     });
-    if let Some(comment) = payload["comment"].as_str() {
-        body["description"] = comment.into();
+    if let Some(comment) = &worklog.comment {
+        body["description"] = comment.as_str().into();
     }
     Ok(TempoClient::new(&tempo_url(state), &config.tempo_api_token)
         .create_worklog(&body)
@@ -627,6 +616,67 @@ mod tests {
         process_queue(&state, &config(&server.uri()), &mut delivered)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_entry_that_cannot_be_read_is_announced_once_and_holds_up_nothing() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, mut events) = start_without_keychain(data_dir.path()).await.unwrap();
+        transition("WEB-2")
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A kind a newer version queued, and a damaged payload
+        let mut unreadable = Vec::new();
+        for (entity_type, payload) in [("label", r#"{"name":"urgent"}"#), ("worklog", "not json")] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO sync_queue (entity_type, issue_key, operation, payload)
+                 VALUES (?, 'WEB-1', 'create', ?) RETURNING id",
+            )
+            .bind(entity_type)
+            .bind(payload)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            unreadable.push(id);
+        }
+        let next = enqueue(&state, "WEB-2", "21").await;
+
+        let mut delivered = Vec::new();
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+
+        for id in unreadable {
+            assert_eq!(entry(&state, id).await.0, "failed");
+        }
+        assert_eq!(entry(&state, next).await.0, "synced");
+        assert_eq!(delivered, keys(&["WEB-2"]));
+        let updated = r#"IssuesUpdated([IssueKey("WEB-1")])"#.to_owned();
+        assert_eq!(
+            received(&mut events),
+            [
+                updated.clone(),
+                rejected(
+                    "WEB-1",
+                    "change",
+                    "this version of Shrew does not know the change `label`"
+                ),
+                updated,
+                rejected(
+                    "WEB-1",
+                    "worklog",
+                    "the stored change cannot be read: expected ident at line 1 column 2"
+                ),
+            ]
+        );
+
+        process_queue(&state, &config(&server.uri()), &mut delivered)
+            .await
+            .unwrap();
+        assert_eq!(received(&mut events), Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -2670,9 +2720,15 @@ mod tests {
             .unwrap();
         let client = JiraClient::new(&server.uri(), "ada@example.com", TOKEN);
 
-        roll_back(&state, &client, &"WEB-1".into(), "transition", true)
-            .await
-            .unwrap();
+        roll_back(
+            &state,
+            &client,
+            &"WEB-1".into(),
+            EntryKind::Transition,
+            true,
+        )
+        .await
+        .unwrap();
 
         // The status is Jira's, the assignee is still the user's, and the issue still waits
         assert_eq!(
@@ -2697,7 +2753,7 @@ mod tests {
         cache_transitions_of(&state, &["To Do"]).await;
         let client = JiraClient::new(&server.uri(), "ada@example.com", TOKEN);
 
-        let later = roll_back(&state, &client, &"WEB-1".into(), "assignee", true)
+        let later = roll_back(&state, &client, &"WEB-1".into(), EntryKind::Assignee, true)
             .await
             .unwrap();
 

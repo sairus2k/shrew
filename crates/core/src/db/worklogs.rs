@@ -1,5 +1,6 @@
 //! The worklogs of the cached issues: the ones logged here and the ones Jira has.
 
+use super::sync_queue::{Change, WorklogChange};
 use crate::models::{IssueKey, RejectedWorklog, SyncStatus, Worklog};
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -73,19 +74,13 @@ pub(crate) async fn log(
     let local_id = insert(&mut *conn, worklog).await?;
     // Which target it goes to is decided at delivery, so the entry holds only
     // what the user entered
-    let payload = serde_json::json!({
-        "local_id": local_id,
-        "time_spent_seconds": worklog.time_spent_sec,
-        "started_at": worklog.started_at,
-        "comment": worklog.comment,
+    let change = Change::Worklog(WorklogChange {
+        local_id,
+        time_spent_seconds: worklog.time_spent_sec,
+        started_at: worklog.started_at.clone(),
+        comment: worklog.comment.clone(),
     });
-    super::sync_queue::enqueue(
-        &mut *conn,
-        "worklog",
-        &worklog.issue_key,
-        &payload.to_string(),
-    )
-    .await
+    super::sync_queue::enqueue(&mut *conn, &worklog.issue_key, &change).await
 }
 
 /// Records Jira's id for a worklog that has been delivered.

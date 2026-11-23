@@ -1,6 +1,10 @@
 use crate::{
     adf,
-    db::{assignable, sync_queue, timer, worklogs},
+    db::{
+        assignable,
+        sync_queue::{self, CommentChange},
+        timer, worklogs,
+    },
     models::{
         AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
         RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, SyncStatus, User,
@@ -373,22 +377,25 @@ async fn pending_comments(
     Ok(entries
         .into_iter()
         .map(|(entry_id, payload, status, error)| {
-            let payload: Value = serde_json::from_str(&payload).unwrap_or_default();
-            let text = payload["text"].as_str().unwrap_or_default();
+            // A damaged entry is shown empty, with Retry and Discard once
+            // delivery has refused it
+            let change: Option<CommentChange> = serde_json::from_str(&payload).ok();
+            let (text, parent_id) =
+                change.map_or_else(Default::default, |change| (change.text, change.parent_id));
             let failed = status == "failed";
             let comment = Comment {
                 id: None,
                 reply_to: None,
                 author_name: me.to_owned(),
                 created: String::new(),
-                body_md: adf::to_markdown(Some(&adf::from_plain_text(text)), issue_url),
+                body_md: adf::to_markdown(Some(&adf::from_plain_text(&text)), issue_url),
                 pending: !failed,
                 rejected: failed.then(|| RejectedComment {
                     entry_id,
                     reason: error.unwrap_or_default(),
                 }),
             };
-            (comment, payload["parent_id"].as_str().map(str::to_owned))
+            (comment, parent_id)
         })
         .collect())
 }

@@ -6,7 +6,7 @@ use crate::{
     db::{
         issues::{self, IssueRecord},
         sprints::{self, SprintRecord},
-        sync_queue,
+        sync_queue::{self, EntryKind},
         sync_state::{self, Position},
         timer,
         worklogs::{self, RemoteWorklog},
@@ -552,12 +552,12 @@ pub(crate) async fn reconcile_removed_issues(
             // Nothing is left to send them to, and no view could show a refused
             // comment: the user is told about each one, the unsent comments included
             let entries = sync_queue::remove_for_issue(&mut *tx, &issue.key).await?;
-            rejected.extend(entries.iter().map(|entity_type| {
-                let reason = match entity_type.as_str() {
-                    "comment" => COMMENT_DISCARDED,
+            rejected.extend(entries.into_iter().map(|kind| {
+                let reason = match kind {
+                    Some(EntryKind::Comment) => COMMENT_DISCARDED,
                     _ => ISSUE_GONE,
                 };
-                rejection(&issue.key, entity_type, reason)
+                rejection(&issue.key, kind, reason)
             }));
             removed.push(issue.key);
         }
@@ -2517,25 +2517,32 @@ mod tests {
         let (state, mut events) = synced(&server, data_dir.path(), &stored).await;
         listing(ids(1..2)).with_priority(1).mount(&server).await;
         let (gone, kept) = (IssueKey::from("WEB-2"), IssueKey::from("WEB-1"));
-        let payload = json!({ "transition": { "id": "11" }, "fields": {} }).to_string();
-        let comment = json!({ "text": "Seen on staging" }).to_string();
+        use crate::db::sync_queue::{
+            Change, CommentChange, TransitionChange, TransitionId, enqueue,
+        };
+        let comment = |text: &str| {
+            Change::Comment(CommentChange {
+                text: text.to_owned(),
+                parent_id: None,
+            })
+        };
+        let transition = Change::Transition(TransitionChange {
+            transition: TransitionId { id: "11".into() },
+            fields: json!({}),
+        });
         let refused = json!({ "text": "Refused before" }).to_string();
-        crate::db::sync_queue::enqueue(&state.pool, "transition", &gone, &payload)
-            .await
-            .unwrap();
-        crate::db::sync_queue::enqueue(&state.pool, "comment", &gone, &comment)
+        let kept_comment = json!({ "text": "Kept" }).to_string();
+        enqueue(&state.pool, &gone, &transition).await.unwrap();
+        enqueue(&state.pool, &gone, &comment("Seen on staging"))
             .await
             .unwrap();
         // Jira refused this one while the issue still existed: it was shown with
         // Retry and Discard, which the removal takes away
-        crate::db::sync_queue::enqueue(&state.pool, "comment", &gone, &refused)
+        enqueue(&state.pool, &gone, &comment("Refused before"))
             .await
             .unwrap();
         // The issue that still exists keeps its refused comment
-        let kept_comment = json!({ "text": "Kept" }).to_string();
-        crate::db::sync_queue::enqueue(&state.pool, "comment", &kept, &kept_comment)
-            .await
-            .unwrap();
+        enqueue(&state.pool, &kept, &comment("Kept")).await.unwrap();
         sqlx::query("UPDATE sync_queue SET status = 'failed' WHERE payload = ? OR payload = ?")
             .bind(&refused)
             .bind(&kept_comment)

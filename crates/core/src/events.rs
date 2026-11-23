@@ -1,4 +1,4 @@
-use crate::models::IssueKey;
+use crate::{db::sync_queue::EntryKind, models::IssueKey};
 
 #[derive(Clone, Debug)]
 pub enum SyncEvent {
@@ -34,12 +34,15 @@ pub enum SyncEvent {
     Error(String),
 }
 
-/// What the user is told about an entry that will not reach Jira.
-pub(crate) fn rejection(key: &IssueKey, entity_type: &str, reason: &str) -> SyncEvent {
-    let action = match entity_type {
-        "transition" => "status change",
-        "assignee" => "assignee change",
-        other => other,
+/// What the user is told about an entry that will not reach Jira. `kind` is
+/// `None` for an entry of a kind this version does not know.
+pub(crate) fn rejection(key: &IssueKey, kind: Option<EntryKind>, reason: &str) -> SyncEvent {
+    let action = match kind {
+        Some(EntryKind::Transition) => "status change",
+        Some(EntryKind::Assignee) => "assignee change",
+        Some(EntryKind::Comment) => "comment",
+        Some(EntryKind::Worklog) => "worklog",
+        None => "change",
     };
     SyncEvent::ChangeRejected {
         key: key.clone(),
