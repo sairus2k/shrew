@@ -21,6 +21,17 @@ cargo run -p app
 cargo test --workspace
 ```
 
+### Dev and packaged profiles
+
+The dev build and the installed app keep their data and tokens apart, so that a sign-out, a schema experiment or a wiped database in the dev build never touches the app in daily use, and both can run at the same time:
+
+| Build | Data (`shrew.db`, `config.json`) | Keychain service |
+| --- | --- | --- |
+| `cargo run -p app`, or any build not made by `scripts/package.sh` | `~/Library/Application Support/dev.shrew.app.dev` | `dev.shrew.app.dev` |
+| `Shrew.app` from `scripts/package.sh` | `~/Library/Application Support/dev.shrew.app` | `dev.shrew.app` |
+
+The tokens are the items `jira-api-token` and `tempo-api-token` of that service. The profile is fixed at compile time: `scripts/package.sh` builds with `SHREW_PACKAGED=1` (`app_core::APP_ID`). Deleting the dev data directory and its two Keychain items resets the dev build to a fresh install.
+
 ### Keychain prompt on every launch
 
 The API tokens live in the Keychain. The Keychain ties "Always Allow" to the partition of the code that asked, and for a build the linker signed ad hoc, or one signed with a self-signed certificate, the partition is the code hash, so every rebuild asks for the login password again. For a certificate Apple issued the partition is the team, which all builds share. A free Apple Development certificate is enough; create it once:

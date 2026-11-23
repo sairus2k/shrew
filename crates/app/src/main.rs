@@ -51,9 +51,6 @@ mod transition;
 mod tray;
 mod worklog;
 
-// Names the data directory: ~/Library/Application Support/<APP_ID>
-const APP_ID: &str = "dev.shrew.app";
-
 enum Screen {
     SignIn(Entity<SignIn>),
     // The account is known and the Keychain did not give its token. The account
@@ -605,7 +602,9 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let handle = tokio.handle().clone();
 
-    let data_dir = dirs::data_dir().expect("no data dir").join(APP_ID);
+    let data_dir = dirs::data_dir()
+        .expect("no data dir")
+        .join(app_core::APP_ID);
     let (state, events) = tokio.block_on(app_core::start(&data_dir))?;
     let step = tokio.block_on(app_core::api::setup_step(&state))?;
     let hints = tokio.block_on(app_core::api::shortcut_hints(&state));

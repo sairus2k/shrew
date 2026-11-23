@@ -13,6 +13,15 @@ mod sync; // or the Jira client
 pub use events::SyncEvent;
 pub use state::AppState; // an opaque handle: its fields are pub(crate)
 
+/// Names the data directory, ~/Library/Application Support/<APP_ID>, and the
+/// Keychain service of the tokens. Only `scripts/package.sh` sets
+/// SHREW_PACKAGED; every other build is a dev build with a profile of its own,
+/// so that a sign-out or a broken database there never reaches the installed app.
+pub const APP_ID: &str = match option_env!("SHREW_PACKAGED") {
+    Some(_) => "dev.shrew.app",
+    None => "dev.shrew.app.dev",
+};
+
 // Must be called inside the tokio runtime: it spawns the sync engine
 pub async fn start(
     data_dir: &Path,
@@ -128,6 +137,11 @@ mod tests {
 
         state.events.send(SyncEvent::Started).unwrap();
         assert!(matches!(events.recv().await, Some(SyncEvent::Started)));
+    }
+
+    #[test]
+    fn a_build_the_package_script_did_not_make_keeps_off_the_installed_app() {
+        assert_ne!(APP_ID, "dev.shrew.app");
     }
 
     #[tokio::test]

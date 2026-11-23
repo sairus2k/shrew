@@ -37,7 +37,8 @@ out=target/package
 app=$out/Shrew.app
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/app/Cargo.toml | head -n 1)
 
-cargo build --release --locked -p app
+# Gives the build the profile of the installed app (app_core::APP_ID)
+SHREW_PACKAGED=1 cargo build --release --locked -p app
 
 rm -rf "$out"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"

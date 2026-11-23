@@ -7,7 +7,7 @@ use std::{path::Path, sync::Arc};
 
 const CONFIG_FILE: &str = "config.json";
 const NEW_CONFIG_FILE: &str = "config.json.new";
-const KEYCHAIN_SERVICE: &str = "dev.shrew.app";
+const KEYCHAIN_SERVICE: &str = crate::APP_ID;
 const KEYCHAIN_ACCOUNT: &str = "jira-api-token";
 const TEMPO_KEYCHAIN_ACCOUNT: &str = "tempo-api-token";
 pub(crate) const TEMPO_URL: &str = "https://api.tempo.io/4";
