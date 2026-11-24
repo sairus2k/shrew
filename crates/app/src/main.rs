@@ -639,7 +639,14 @@ fn rejection_message(key: &IssueKey, action: &str, reason: &str) -> String {
 }
 
 fn open_main_window(step: SetupStep, cx: &mut App) {
-    open_window(WindowOptions::default(), cx, |window, cx| {
+    // The default of GPUI is as tall as a small screen, and Windows puts the
+    // title bar above that, out of the screen
+    let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        ..Default::default()
+    };
+    open_window(options, cx, |window, cx| {
         cx.new(|cx| Root::new(step, window, cx))
     })
     .expect("failed to open window");
