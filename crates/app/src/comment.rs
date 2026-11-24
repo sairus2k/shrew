@@ -799,7 +799,7 @@ mod tests {
         cx.run_until_parked();
         in_window(cx, window, |window, cx| {
             assert!(window.try_find("comment-30").is_none());
-            window.press("cmd-enter", cx);
+            window.press("secondary-enter", cx);
         });
 
         wait_until(cx, window, |window| {

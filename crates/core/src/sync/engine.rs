@@ -35,11 +35,13 @@ pub(crate) fn poll_interval(window_focused: bool, idle_for: Duration) -> Duratio
     }
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
 }
 
+#[cfg(target_os = "macos")]
 fn system_idle_time() -> Duration {
     const COMBINED_SESSION_STATE: i32 = 0;
     const ANY_INPUT_EVENT: u32 = u32::MAX;
@@ -47,6 +49,45 @@ fn system_idle_time() -> Duration {
     let seconds =
         unsafe { CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, ANY_INPUT_EVENT) };
     Duration::try_from_secs_f64(seconds).unwrap_or_default()
+}
+
+/// LASTINPUTINFO of the Windows API.
+#[cfg(windows)]
+#[repr(C)]
+struct LastInputInfo {
+    size: u32,
+    // In the milliseconds of GetTickCount
+    tick: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetLastInputInfo(info: *mut LastInputInfo) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetTickCount() -> u32;
+}
+
+#[cfg(windows)]
+fn system_idle_time() -> Duration {
+    let mut info = LastInputInfo {
+        size: size_of::<LastInputInfo>() as u32,
+        tick: 0,
+    };
+    // SAFETY: `info` is a valid LASTINPUTINFO with its size set, and
+    // GetTickCount takes nothing
+    let now = unsafe {
+        if GetLastInputInfo(&mut info) == 0 {
+            return Duration::ZERO;
+        }
+        GetTickCount()
+    };
+    // The tick count starts anew from zero after 49.7 days
+    Duration::from_millis(now.wrapping_sub(info.tick).into())
 }
 
 /// Tests set the idle time through the state: the real one depends on who

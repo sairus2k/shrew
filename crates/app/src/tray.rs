@@ -59,14 +59,29 @@ pub fn init(cx: &mut App) {
 
 /// Puts the item into the menu bar.
 pub fn install(cx: &mut App) -> gpui_tray::Result<()> {
-    let image = Image::from_bytes(
-        ImageFormat::Png,
-        include_bytes!("../../../assets/icons/menuBarIconTemplate@2x.png").to_vec(),
-    );
-    let icon = Icon::from_gpui(&image, cx)
-        .scale_factor(2.0)
-        .template(true)
-        .build()?;
+    // A template image, which macOS colors for the menu bar it is in
+    #[cfg(target_os = "macos")]
+    let icon = Icon::from_gpui(
+        &Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../../../assets/icons/menuBarIconTemplate@2x.png").to_vec(),
+        ),
+        cx,
+    )
+    .scale_factor(2.0)
+    .template(true)
+    .build()?;
+    // No other system colors an icon, and the black template cannot be seen
+    // on a dark taskbar
+    #[cfg(not(target_os = "macos"))]
+    let icon = Icon::from_gpui(
+        &Image::from_bytes(
+            ImageFormat::Svg,
+            include_bytes!("../../../assets/icons/app-icon.svg").to_vec(),
+        ),
+        cx,
+    )
+    .build()?;
     let native = Tray::builder()
         .icon(icon)
         .tooltip("Shrew")

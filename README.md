@@ -21,6 +21,17 @@ cargo run -p app
 cargo test --workspace
 ```
 
+### Windows
+
+Requirements: Windows 10 or later (x86_64), Rust 1.92+ with the `x86_64-pc-windows-msvc` toolchain, and the Build Tools for Visual Studio with the workload "Desktop development with C++", which brings the MSVC linker and the Windows SDK. The SDK is needed for more than linking: GPUI embeds its manifest with `rc.exe`, and a release build of GPUI compiles its shaders with `fxc.exe`. A build that cannot find `fxc.exe` takes its path from `GPUI_FXC_PATH`.
+
+```sh
+cargo run -p app
+cargo build --release --locked -p app
+```
+
+A release build opens no console window; a dev build keeps it, as a panic is printed there. The data is in `%APPDATA%\<profile>` and the tokens are the generic credentials `jira-api-token.<profile>` and `tempo-api-token.<profile>` of the Credential Manager, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Windows the release binary is `target\release\app.exe` and nothing packages it yet.
+
 ### Dev and packaged profiles
 
 The dev build and the installed app keep their data and tokens apart, so that a sign-out, a schema experiment or a wiped database in the dev build never touches the app in daily use, and both can run at the same time:
@@ -49,7 +60,7 @@ The cargo runner (`scripts/dev-run.sh`, set in `.cargo/config.toml`) signs each 
 
 ### UI integration tests
 
-The tests of the `app` crate run the real views in a headless GPUI window on a fresh SQLite file, with a [wiremock](https://docs.rs/wiremock) server as the Jira site. They need macOS, as the app itself does, so CI needs a macOS runner. They touch neither the Keychain nor the network.
+The tests of the `app` crate run the real views in a headless GPUI window on a fresh SQLite file, with a [wiremock](https://docs.rs/wiremock) server as the Jira site. They pass on macOS and on Windows and touch neither the Keychain, the Credential Manager nor the network.
 
 ```sh
 # All of them; they are part of `cargo test --workspace` as well

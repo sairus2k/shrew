@@ -1,0 +1,2 @@
+// GPUI takes the icon of its windows from the resource 1 of the binary
+1 ICON "../../../assets/icons/Shrew.ico"

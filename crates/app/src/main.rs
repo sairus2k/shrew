@@ -1,3 +1,7 @@
+// A GUI program of Windows: without this a console window opens beside the
+// app. A dev build keeps the console, which is where a panic is printed
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use account::{Account, SignedOut, TokenReplaced};
 use app_core::{
     SyncEvent,

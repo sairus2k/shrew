@@ -199,8 +199,11 @@ pub(crate) async fn save_config(data_dir: &Path, config: &Config) -> anyhow::Res
         // The content has to be on the disk before the name points at it
         file.sync_all()?;
         std::fs::rename(&new_file, data_dir.join(CONFIG_FILE))?;
-        // The rename is a change of the directory
-        std::fs::File::open(&data_dir)?.sync_all()
+        // The rename is a change of the directory. Windows opens no directory
+        // as a file and has no call to flush one
+        #[cfg(unix)]
+        std::fs::File::open(&data_dir)?.sync_all()?;
+        Ok(())
     })
     .await??;
     Ok(())
