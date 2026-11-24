@@ -1,5 +1,6 @@
 //! The running timer. It lives in SQLite; this entity holds a copy for
-//! rendering and sends every start and stop to the core.
+//! rendering and sends every start and stop to the core. It may run without
+//! an issue: the user chooses one at the stop or while it runs.
 
 use crate::keys;
 use crate::runtime::spawn;
@@ -19,12 +20,21 @@ use tokio::sync::mpsc;
 
 enum Write {
     Start(RunningTimer),
-    // The moment of the click, not of the write
-    Stop(i64),
+    Stop {
+        // The moment of the click, not of the write
+        at: i64,
+        // The issue the user chose for a timer without one
+        issue: Option<IssueKey>,
+    },
+    Choose(IssueKey),
+    Discard,
 }
 
 pub struct ActiveTimer {
     running: Option<RunningTimer>,
+    // The moment the user stopped a timer without an issue, while the issue
+    // the time belongs to is being chosen. The timer runs on until then.
+    stopping: Option<i64>,
     // A click is newer than the initial load, which must not overwrite it
     clicked: bool,
     writes: mpsc::UnboundedSender<Write>,
@@ -38,7 +48,19 @@ pub struct ActiveTimer {
 /// The core could not save a start or a stop; the text is for the user.
 pub struct TimerWriteFailed(pub String);
 
+/// What only the user can answer about a timer without an issue.
+pub enum TimerQuestion {
+    /// Which issue gets the time of the timer stopped at `stopped_at`.
+    IssueForStop { stopped_at: i64 },
+    /// Which issue the running timer goes on for.
+    IssueForRunning,
+    /// A start on the issue would end the timer without an issue: whether it
+    /// gets that time or the time is discarded.
+    StartOver(IssueKey),
+}
+
 impl EventEmitter<TimerWriteFailed> for ActiveTimer {}
+impl EventEmitter<TimerQuestion> for ActiveTimer {}
 
 impl ActiveTimer {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -50,7 +72,11 @@ impl ActiveTimer {
                     spawn(cx, |state| async move {
                         match write {
                             Write::Start(timer) => api::start_timer(&state, &timer).await,
-                            Write::Stop(stopped_at) => api::stop_timer(&state, stopped_at).await,
+                            Write::Stop { at, issue } => {
+                                api::stop_timer(&state, at, issue.as_ref()).await
+                            }
+                            Write::Choose(key) => api::choose_timer_issue(&state, &key).await,
+                            Write::Discard => api::discard_timer(&state).await,
                         }
                     })
                 });
@@ -87,6 +113,7 @@ impl ActiveTimer {
         });
         Self {
             running: None,
+            stopping: None,
             clicked: false,
             writes,
             _tick: Task::ready(()),
@@ -95,47 +122,154 @@ impl ActiveTimer {
         }
     }
 
-    /// A timer that is already running is replaced and its time is not logged.
+    /// Starts the timer on `issue_key`. A timer of another issue is replaced
+    /// and its time is not logged; over a timer without an issue the user is
+    /// asked first, as its time has no other way to be logged.
     pub fn start(&mut self, issue_key: IssueKey, cx: &mut Context<Self>) {
+        if self.runs_without_issue() {
+            cx.emit(TimerQuestion::StartOver(issue_key));
+            return;
+        }
+        self.start_anew(Some(issue_key), cx);
+    }
+
+    /// Starts the timer on `issue_key`, or without an issue, replacing any
+    /// timer that runs without logging its time.
+    pub fn start_anew(&mut self, issue_key: Option<IssueKey>, cx: &mut Context<Self>) {
         let timer = RunningTimer {
             issue_key,
             started_at: unix_now(),
         };
         self.clicked = true;
+        self.stopping = None;
         self.writes.send(Write::Start(timer.clone())).ok();
         self.set_running(Some(timer), cx);
     }
 
+    /// Stops the timer. A timer without an issue with time to log asks for
+    /// the issue first and runs on until it is chosen or the time discarded.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some(running) = &self.running else {
+            return;
+        };
+        let now = unix_now();
+        if running.issue_key.is_none() && running.loggable_at(now) {
+            // A second stop, as from the menu bar, finds the question open
+            // and keeps the moment of the first
+            if self.stopping.is_none() {
+                self.stopping = Some(now);
+                cx.emit(TimerQuestion::IssueForStop { stopped_at: now });
+                cx.notify();
+            }
+            return;
+        }
+        self.write_stop(now, None, cx);
+    }
+
+    /// Logs the time up to `stopped_at`, the stop that asked for the issue,
+    /// to `issue_key`.
+    pub fn stop_on(&mut self, issue_key: IssueKey, stopped_at: i64, cx: &mut Context<Self>) {
+        if self.runs_without_issue() {
+            self.write_stop(stopped_at, Some(issue_key), cx);
+        }
+    }
+
+    fn write_stop(&mut self, at: i64, issue: Option<IssueKey>, cx: &mut Context<Self>) {
+        self.clicked = true;
+        self.stopping = None;
+        self.writes.send(Write::Stop { at, issue }).ok();
+        self.set_running(None, cx);
+    }
+
+    /// The user left the question about the issue of the stop without
+    /// answering it: the timer runs on.
+    pub fn keep_running(&mut self, cx: &mut Context<Self>) {
+        if self.stopping.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Stops the timer without logging its time.
+    pub fn discard(&mut self, cx: &mut Context<Self>) {
         if self.running.is_none() {
             return;
         }
         self.clicked = true;
-        self.writes.send(Write::Stop(unix_now())).ok();
+        self.stopping = None;
+        self.writes.send(Write::Discard).ok();
         self.set_running(None, cx);
+    }
+
+    /// Gives the timer without an issue the issue `issue_key`; it goes on
+    /// from its first start.
+    pub fn choose_issue(&mut self, issue_key: IssueKey, cx: &mut Context<Self>) {
+        let Some(running) = self.running.as_mut().filter(|t| t.issue_key.is_none()) else {
+            return;
+        };
+        running.issue_key = Some(issue_key.clone());
+        self.clicked = true;
+        self.stopping = None;
+        self.writes.send(Write::Choose(issue_key)).ok();
+        cx.notify();
+    }
+
+    /// Asks the user for the issue of the timer that runs without one.
+    pub fn ask_for_issue(&mut self, cx: &mut Context<Self>) {
+        if self.runs_without_issue() {
+            cx.emit(TimerQuestion::IssueForRunning);
+        }
     }
 
     /// Stops the timer when it runs on `issue_key`, and starts it there otherwise.
     pub fn toggle(&mut self, issue_key: IssueKey, cx: &mut Context<Self>) {
         match &self.running {
-            Some(timer) if timer.issue_key == issue_key => self.stop(cx),
+            Some(timer) if timer.issue_key.as_ref() == Some(&issue_key) => self.stop(cx),
             _ => self.start(issue_key, cx),
         }
     }
 
+    /// Stops the running timer, or starts one without an issue.
+    pub fn toggle_without_issue(&mut self, cx: &mut Context<Self>) {
+        match self.running {
+            Some(_) => self.stop(cx),
+            None => self.start_anew(None, cx),
+        }
+    }
+
+    pub fn running(&self) -> Option<&RunningTimer> {
+        self.running.as_ref()
+    }
+
+    /// The moment of a stop that waits for the issue to be chosen.
+    pub fn stopping(&self) -> Option<i64> {
+        self.stopping
+    }
+
+    /// Moves the start of the shown timer `secs` back, as if it had run that
+    /// long; the saved one keeps its start.
+    #[cfg(test)]
+    pub fn backdate(&mut self, secs: i64) {
+        if let Some(running) = &mut self.running {
+            running.started_at -= secs;
+        }
+    }
+
+    fn runs_without_issue(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|timer| timer.issue_key.is_none())
+    }
+
     /// The issue the timer runs on.
     pub fn issue(&self) -> Option<&IssueKey> {
-        self.running.as_ref().map(|timer| &timer.issue_key)
+        self.running.as_ref()?.issue_key.as_ref()
     }
 
     /// The timer in one line that stays the same while it runs: "WEB-1 since 14:05".
     pub fn caption(&self) -> Option<String> {
         self.running.as_ref().map(|timer| {
-            let started = Local
-                .timestamp_opt(timer.started_at, 0)
-                .single()
-                .map_or_else(String::new, |at| at.format("%H:%M").to_string());
-            format!("{} since {started}", timer.issue_key)
+            let started = local_time(timer.started_at);
+            format!("{} since {started}", issue_name(timer))
         })
     }
 
@@ -153,19 +287,45 @@ impl ActiveTimer {
             }),
             None => Task::ready(()),
         };
+        // A stop waits for its issue only while a timer without one runs: the
+        // timer saved after a failed write may be another
+        if running
+            .as_ref()
+            .is_none_or(|timer| timer.issue_key.is_some())
+        {
+            self.stopping = None;
+        }
         self.running = running;
         cx.notify();
     }
 }
 
-fn unix_now() -> i64 {
+/// What names a timer that runs without an issue in place of its key.
+pub const NO_ISSUE: &str = "No issue chosen";
+
+fn issue_name(timer: &RunningTimer) -> String {
+    timer
+        .issue_key
+        .as_ref()
+        .map_or_else(|| NO_ISSUE.to_owned(), ToString::to_string)
+}
+
+/// "14:05".
+pub fn local_time(unix: i64) -> String {
+    Local
+        .timestamp_opt(unix, 0)
+        .single()
+        .map_or_else(String::new, |at| at.format("%H:%M").to_string())
+}
+
+pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs() as i64)
 }
 
 /// "1:02:03", or "2:03" under an hour.
-fn clock(seconds: u64) -> String {
+pub fn clock(seconds: u64) -> String {
     let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
     if hours == 0 {
         format!("{minutes}:{seconds:02}")
@@ -195,8 +355,12 @@ impl TimerControl {
 impl Render for TimerControl {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.timer.read(cx).running.clone();
-        let here = running.as_ref().filter(|timer| timer.issue_key == self.key);
-        let elsewhere = running.as_ref().filter(|timer| timer.issue_key != self.key);
+        let here = running
+            .as_ref()
+            .filter(|timer| timer.issue_key.as_ref() == Some(&self.key));
+        let elsewhere = running
+            .as_ref()
+            .filter(|timer| timer.issue_key.as_ref() != Some(&self.key));
         let line = |id: &'static str, text: String| {
             div()
                 .id(id)
@@ -231,10 +395,11 @@ impl Render for TimerControl {
                 here.map(|timer| line("timer-elapsed", clock(timer.elapsed_secs(unix_now())))),
             )
             .children(elsewhere.map(|timer| {
-                line(
-                    "timer-elsewhere",
-                    format!("Timer running on {}", timer.issue_key),
-                )
+                let text = match &timer.issue_key {
+                    Some(key) => format!("Timer running on {key}"),
+                    None => "Timer running without an issue".to_owned(),
+                };
+                line("timer-elsewhere", text)
             }))
             .child(button)
     }
@@ -244,7 +409,8 @@ impl Render for TimerControl {
 pub struct TimerIssueClicked(pub IssueKey);
 
 /// The running timer in the status bar, so that it is seen with any issue
-/// open or none: its issue, the time elapsed and a stop.
+/// open or none: its issue, the time elapsed and a stop. With none running,
+/// the start of a timer without an issue.
 pub struct TimerStatus {
     timer: Entity<ActiveTimer>,
     _timer_changed: Subscription,
@@ -264,12 +430,22 @@ impl TimerStatus {
 
 impl Render for TimerStatus {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(running) = self.timer.read(cx).running.clone() else {
-            return div();
-        };
-        let key = SharedString::from(running.issue_key.to_string());
-        let elapsed = SharedString::from(clock(running.elapsed_secs(unix_now())));
         let timer = self.timer.clone();
+        let Some(running) = self.timer.read(cx).running.clone() else {
+            return div().child(
+                Button::new("start-timer-without-issue")
+                    .ghost()
+                    .xsmall()
+                    .label("Start timer")
+                    .children(keys::hint(&keys::StartOrStopTimer, cx))
+                    .on_click(move |_, _, cx| {
+                        timer.update(cx, |timer, cx| timer.toggle_without_issue(cx))
+                    }),
+            );
+        };
+        let name = SharedString::from(issue_name(&running));
+        let elapsed = SharedString::from(clock(running.elapsed_secs(unix_now())));
+        let ask = self.timer.clone();
         div()
             .flex()
             .items_center()
@@ -285,13 +461,17 @@ impl Render for TimerStatus {
                 div()
                     .id("running-timer-issue")
                     .test_support()
-                    .aria_label(key.clone())
+                    .aria_label(name.clone())
                     .cursor_pointer()
-                    .text_color(cx.theme().foreground)
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(TimerIssueClicked(running.issue_key.clone()))
+                    .text_color(match running.issue_key {
+                        Some(_) => cx.theme().foreground,
+                        None => cx.theme().muted_foreground,
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| match &running.issue_key {
+                        Some(key) => cx.emit(TimerIssueClicked(key.clone())),
+                        None => ask.update(cx, |timer, cx| timer.ask_for_issue(cx)),
                     }))
-                    .child(key),
+                    .child(name),
             )
             .children(keys::hint(&keys::OpenTimerIssue, cx))
             .child(
@@ -308,6 +488,7 @@ impl Render for TimerStatus {
                     .ghost()
                     .xsmall()
                     .label("Stop")
+                    .children(keys::hint(&keys::StartOrStopTimer, cx))
                     .on_click(move |_, _, cx| timer.update(cx, |timer, cx| timer.stop(cx))),
             )
     }
@@ -360,7 +541,7 @@ mod tests {
         tokio.block_on(async {
             let (state, _events) = app_core::start_without_keychain(data_dir).await.unwrap();
             let timer = RunningTimer {
-                issue_key: "WEB-1".into(),
+                issue_key: Some("WEB-1".into()),
                 started_at,
             };
             api::start_timer(&state, &timer).await.unwrap();
@@ -434,7 +615,7 @@ mod tests {
         });
         let state = state(cx);
         wait_until(cx, window, |_| {
-            running(&tokio, &state).is_some_and(|timer| timer.issue_key == "WEB-1".into())
+            running(&tokio, &state).is_some_and(|timer| timer.issue_key == Some("WEB-1".into()))
         });
 
         // The repaint is on GPUI's clock and the elapsed time on the wall clock
@@ -507,7 +688,7 @@ mod tests {
 
         let state = state(cx);
         wait_until(cx, window, |_| {
-            running(&tokio, &state).is_some_and(|timer| timer.issue_key == "WEB-2".into())
+            running(&tokio, &state).is_some_and(|timer| timer.issue_key == Some("WEB-2".into()))
         });
         let key: IssueKey = "WEB-1".into();
         let first = tokio.block_on(api::get_issue(&state, &key)).unwrap();
@@ -649,7 +830,7 @@ mod tests {
             let shown = timer.read_with(cx, |timer, _| timer.running.clone());
             if saved
                 .as_ref()
-                .is_some_and(|t| t.issue_key == "WEB-2".into())
+                .is_some_and(|t| t.issue_key == Some("WEB-2".into()))
             {
                 assert_eq!(shown, saved);
                 break;
@@ -667,7 +848,7 @@ mod tests {
         }
         let shown = timer.read_with(cx, |timer, _| timer.running.clone());
         assert_eq!(shown, running(&tokio, &state));
-        assert_eq!(shown.unwrap().issue_key, "WEB-2".into());
+        assert_eq!(shown.unwrap().issue_key, Some("WEB-2".into()));
     }
 
     fn status_bar_timer(window: &Window) -> Option<(String, String)> {
@@ -752,5 +933,384 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         launch(cx, tokio, data_dir)
+    }
+
+    /// The timer without an issue the previous run of the app left running.
+    fn running_without_issue_since(tokio: &Runtime, data_dir: &std::path::Path, started_at: i64) {
+        tokio.block_on(async {
+            let (state, _events) = app_core::start_without_keychain(data_dir).await.unwrap();
+            let timer = RunningTimer {
+                issue_key: None,
+                started_at,
+            };
+            api::start_timer(&state, &timer).await.unwrap();
+        });
+    }
+
+    fn launched_with_two_issues() -> (Runtime, MockServer, tempfile::TempDir) {
+        let tokio = tokio_runtime();
+        let server = tokio.block_on(jira());
+        let data_dir = synced_on(
+            &tokio,
+            &server.uri(),
+            &[issue(1, "Fix login"), issue(2, "Broken checkout")],
+        );
+        (tokio, server, data_dir)
+    }
+
+    fn worklogs_of(tokio: &Runtime, state: &AppState, key: &str) -> Vec<(i64, i64)> {
+        let key: IssueKey = key.into();
+        tokio
+            .block_on(api::get_issue(state, &key))
+            .unwrap()
+            .worklogs
+            .iter()
+            .map(|worklog| (worklog.time_spent_secs as i64, worklog.started_at))
+            .collect()
+    }
+
+    fn search_picker(cx: &mut TestAppContext, window: AnyWindowHandle, text: &str) {
+        wait_until(cx, window, |window| {
+            window.try_find("issue-picker-search").is_some()
+        });
+        in_window(cx, window, |window, cx| {
+            window.click("issue-picker-search", cx);
+            window.input(text, cx);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_timer_without_an_issue_starts_from_the_status_bar_and_says_no_issue_is_chosen(
+        cx: &mut TestAppContext,
+    ) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            window.try_find("start-timer-without-issue").is_some()
+        });
+
+        click(cx, window, "start-timer-without-issue");
+
+        wait_until(cx, window, |window| {
+            status_bar_timer(window)
+                .is_some_and(|(issue, elapsed)| issue == "No issue chosen" && elapsed == "0:00")
+        });
+        let state = state(cx);
+        wait_until(cx, window, |_| {
+            running(&tokio, &state).is_some_and(|timer| timer.issue_key.is_none())
+        });
+        // An open issue says the timer is not its own
+        open(cx, window, "WEB-1");
+        in_window(cx, window, |window, _| {
+            assert_eq!(
+                window.find("timer-elsewhere").label(),
+                Some("Timer running without an issue")
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn n_starts_a_timer_without_an_issue_with_an_issue_open_and_stops_it(cx: &mut TestAppContext) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let window = launch(cx, &tokio, data_dir.path());
+        open(cx, window, "WEB-1");
+        // The keys go to the list, as after a click on a row
+        in_window(cx, window, |window, cx| window.press("n", cx));
+
+        let state = state(cx);
+        wait_until(cx, window, |_| {
+            running(&tokio, &state).is_some_and(|timer| timer.issue_key.is_none())
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(status_bar_timer(window).unwrap().0, "No issue chosen");
+            // Its own timer is still to start
+            assert!(window.try_find("start-timer").is_some());
+        });
+
+        // Within its first minute there is no time to give to an issue
+        in_window(cx, window, |window, cx| window.press("n", cx));
+        wait_until(cx, window, |_| running(&tokio, &state).is_none());
+        in_window(cx, window, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn stopping_a_timer_without_an_issue_logs_the_time_up_to_the_stop_to_the_issue_chosen(
+        cx: &mut TestAppContext,
+    ) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let started_at = unix_now() - 6_000;
+        running_without_issue_since(&tokio, data_dir.path(), started_at);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+
+        click(cx, window, "stop-running-timer");
+
+        wait_until(cx, window, |window| {
+            window
+                .try_find("picked-time")
+                .and_then(|time| time.label().map(|label| label.starts_with("1:40:0")))
+                == Some(true)
+        });
+        // The issue is found by the words of its summary
+        search_picker(cx, window, "checkout");
+        wait_until(cx, window, |window| {
+            window.try_find("pick-WEB-2").is_some() && window.try_find("pick-WEB-1").is_none()
+        });
+        // The time is the time up to the stop, not up to the choice
+        std::thread::sleep(Duration::from_millis(2100));
+        click(cx, window, "pick-WEB-2");
+
+        let state = state(cx);
+        wait_until(cx, window, |_| {
+            !worklogs_of(&tokio, &state, "WEB-2").is_empty()
+        });
+        let logged = worklogs_of(&tokio, &state, "WEB-2");
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].1, started_at);
+        assert!((6_000..=6_001).contains(&logged[0].0), "{logged:?}");
+        assert_eq!(running(&tokio, &state), None);
+        in_window(cx, window, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert!(status_bar_timer(window).is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_issue_is_found_by_its_key_and_enter_picks_it(cx: &mut TestAppContext) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        running_without_issue_since(&tokio, data_dir.path(), unix_now() - 600);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+        click(cx, window, "stop-running-timer");
+
+        search_picker(cx, window, "WEB-1");
+        wait_until(cx, window, |window| {
+            window.try_find("pick-WEB-1").is_some() && window.try_find("pick-WEB-2").is_none()
+        });
+        in_window(cx, window, |window, cx| window.press("enter", cx));
+
+        let state = state(cx);
+        wait_until(cx, window, |_| {
+            worklogs_of(&tokio, &state, "WEB-1").len() == 1
+        });
+    }
+
+    #[gpui_kit::test]
+    fn leaving_the_choice_keeps_the_timer_running_or_discards_its_time_as_the_user_says(
+        cx: &mut TestAppContext,
+    ) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let started_at = unix_now() - 6_000;
+        running_without_issue_since(&tokio, data_dir.path(), started_at);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+        let state = state(cx);
+        let without_issue = Some(RunningTimer {
+            issue_key: None,
+            started_at,
+        });
+
+        click(cx, window, "stop-running-timer");
+        wait_until(cx, window, |window| {
+            window.try_find("keep-timer-running").is_some()
+        });
+        click(cx, window, "keep-timer-running");
+
+        wait_until(cx, window, |window| {
+            window.try_find("issue-picker").is_none()
+        });
+        in_window(cx, window, |window, _| {
+            assert_eq!(status_bar_timer(window).unwrap().0, "No issue chosen");
+        });
+        assert_eq!(running(&tokio, &state), without_issue);
+
+        // Escape leaves it as the button does: nothing is lost
+        click(cx, window, "stop-running-timer");
+        wait_until(cx, window, |window| {
+            window.try_find("issue-picker").is_some()
+        });
+        in_window(cx, window, |window, cx| window.press("escape", cx));
+        wait_until(cx, window, |window| {
+            window.try_find("issue-picker").is_none()
+        });
+        assert_eq!(running(&tokio, &state), without_issue);
+
+        click(cx, window, "stop-running-timer");
+        wait_until(cx, window, |window| {
+            window.try_find("discard-timer").is_some()
+        });
+        click(cx, window, "discard-timer");
+
+        wait_until(cx, window, |_| running(&tokio, &state).is_none());
+        in_window(cx, window, |window, _| {
+            assert!(status_bar_timer(window).is_none());
+        });
+        assert!(worklogs_of(&tokio, &state, "WEB-1").is_empty());
+        assert!(worklogs_of(&tokio, &state, "WEB-2").is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn the_issue_is_chosen_for_a_running_timer_and_it_goes_on_from_its_first_start(
+        cx: &mut TestAppContext,
+    ) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let started_at = unix_now() - 6_000;
+        running_without_issue_since(&tokio, data_dir.path(), started_at);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+
+        click(cx, window, "running-timer-issue");
+        wait_until(cx, window, |window| window.try_find("pick-WEB-1").is_some());
+        in_window(cx, window, |window, _| {
+            // Nothing is stopped, so there is no time to discard
+            assert!(window.try_find("discard-timer").is_none());
+            assert!(window.try_find("picked-time").is_none());
+        });
+        click(cx, window, "pick-WEB-1");
+
+        let state = state(cx);
+        wait_until(cx, window, |_| {
+            running(&tokio, &state)
+                == Some(RunningTimer {
+                    issue_key: Some("WEB-1".into()),
+                    started_at,
+                })
+        });
+        wait_until(cx, window, |window| {
+            status_bar_timer(window).is_some_and(|(issue, _)| issue == "WEB-1")
+        });
+        assert!(worklogs_of(&tokio, &state, "WEB-1").is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn a_timer_without_an_issue_is_still_running_after_a_restart(cx: &mut TestAppContext) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| {
+            window.try_find("start-timer-without-issue").is_some()
+        });
+        click(cx, window, "start-timer-without-issue");
+        let first_state = state(cx);
+        wait_until(cx, window, |_| running(&tokio, &first_state).is_some());
+        let started = running(&tokio, &first_state).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+
+        let window = reopen(cx, window, &tokio, data_dir.path());
+
+        wait_until(cx, window, |window| {
+            status_bar_timer(window).is_some_and(|(issue, elapsed)| {
+                issue == "No issue chosen" && !["0:00", "0:01"].contains(&elapsed.as_str())
+            })
+        });
+        let state = state(cx);
+        assert_eq!(running(&tokio, &state), Some(started));
+    }
+
+    fn start_over_web_2(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        open(cx, window, "WEB-2");
+        click(cx, window, "start-timer");
+        wait_until(cx, window, |window| {
+            window
+                .try_find("start-over-question")
+                .is_some_and(|question| {
+                    question
+                        .label()
+                        .unwrap()
+                        .starts_with("It has run for 1:40:")
+                })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_start_on_an_issue_over_a_timer_without_one_asks_what_becomes_of_its_time(
+        cx: &mut TestAppContext,
+    ) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let started_at = unix_now() - 6_000;
+        running_without_issue_since(&tokio, data_dir.path(), started_at);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+        let state = state(cx);
+        let without_issue = Some(RunningTimer {
+            issue_key: None,
+            started_at,
+        });
+
+        start_over_web_2(cx, window);
+        click(cx, window, "cancel-start-over");
+        wait_until(cx, window, |window| {
+            window.try_find("start-over-question").is_none()
+        });
+        assert_eq!(running(&tokio, &state), without_issue);
+
+        // The time goes to the issue, and the timer on with it
+        start_over_web_2(cx, window);
+        click(cx, window, "give-time-to-issue");
+        wait_until(cx, window, |_| {
+            running(&tokio, &state)
+                == Some(RunningTimer {
+                    issue_key: Some("WEB-2".into()),
+                    started_at,
+                })
+        });
+        wait_until(cx, window, |window| {
+            window.try_find("stop-timer").is_some()
+                && elapsed(window).is_some_and(|shown| shown.starts_with("1:40:"))
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_start_on_an_issue_over_a_timer_without_one_discards_its_time_when_told_so(
+        cx: &mut TestAppContext,
+    ) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        running_without_issue_since(&tokio, data_dir.path(), unix_now() - 6_000);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+        let state = state(cx);
+
+        start_over_web_2(cx, window);
+        click(cx, window, "start-over");
+
+        wait_until(cx, window, |_| {
+            running(&tokio, &state).is_some_and(|timer| {
+                timer.issue_key == Some("WEB-2".into()) && timer.elapsed_secs(unix_now()) < 60
+            })
+        });
+        assert!(worklogs_of(&tokio, &state, "WEB-2").is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn an_issue_the_cache_no_longer_has_is_reported_and_the_timer_runs_on(cx: &mut TestAppContext) {
+        let (tokio, _server, data_dir) = launched_with_two_issues();
+        let started_at = unix_now() - 6_000;
+        running_without_issue_since(&tokio, data_dir.path(), started_at);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| status_bar_timer(window).is_some());
+        click(cx, window, "stop-running-timer");
+        wait_until(cx, window, |window| window.try_find("pick-WEB-2").is_some());
+        let state = state(cx);
+        // Gone from the cache while the picker shows it
+        tokio
+            .block_on(state.execute("DELETE FROM issues WHERE key = 'WEB-2'"))
+            .unwrap();
+
+        click(cx, window, "pick-WEB-2");
+
+        wait_until(cx, window, |window| {
+            window.try_find("notification").is_some()
+        });
+        wait_until(cx, window, |window| {
+            status_bar_timer(window).is_some_and(|(issue, _)| issue == "No issue chosen")
+        });
+        assert_eq!(
+            running(&tokio, &state),
+            Some(RunningTimer {
+                issue_key: None,
+                started_at,
+            })
+        );
     }
 }

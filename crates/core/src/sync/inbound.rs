@@ -1017,7 +1017,7 @@ mod tests {
             .unwrap();
         assert_eq!(worklogs, ["API-9"]);
         let running = timer::get(&state.pool).await.unwrap().unwrap();
-        assert_eq!(running.issue_key, "API-9".into());
+        assert_eq!(running.issue_key, Some("API-9".into()));
         let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
             .fetch_all(&state.pool)
             .await
@@ -2300,7 +2300,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "API-9");
         let running = timer::get(&state.pool).await.unwrap().unwrap();
-        assert_eq!(running.issue_key, "API-9".into());
+        assert_eq!(running.issue_key, Some("API-9".into()));
         assert_eq!(running.started_at, 1_774_771_200);
         let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
             .fetch_all(&state.pool)

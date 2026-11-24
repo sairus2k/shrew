@@ -1,12 +1,24 @@
 //! The item in the macOS menu bar: an icon whose menu has the running timer
-//! with its issue and its start, a stop for it and the way back to the window.
+//! with its issue and its start, a stop for it or the start of a timer
+//! without an issue, and the way back to the window.
 
 use crate::{menu::Quit, runtime::spawn, timer::ActiveTimer};
 use app_core::api;
 use gpui_kit::*;
 use gpui_tray::{Icon, Tray};
 
-actions!(tray, [StopTimer, ShowWindow]);
+actions!(tray, [StartTimer, StopTimer, ShowWindow]);
+
+/// What the menu says about the timer.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum TimerLine {
+    /// No account is signed in, so no timer can run.
+    #[default]
+    Absent,
+    Stopped,
+    /// The line of the running timer.
+    Running(String),
+}
 
 #[derive(Default)]
 struct MenuBarItem {
@@ -16,7 +28,7 @@ struct MenuBarItem {
     // shows another screen or is closed
     timer: Option<Entity<ActiveTimer>>,
     // The line of the timer the menu was last built with
-    caption: Option<String>,
+    line: TimerLine,
     _timer_changed: Option<Subscription>,
 }
 
@@ -24,9 +36,22 @@ impl Global for MenuBarItem {}
 
 /// Installs what the items of the menu do.
 pub fn init(cx: &mut App) {
+    cx.on_action(|_: &StartTimer, cx| {
+        if let Some(timer) = timer(cx) {
+            timer.update(cx, |timer, cx| {
+                if timer.running().is_none() {
+                    timer.start_anew(None, cx)
+                }
+            });
+        }
+    });
     cx.on_action(|_: &StopTimer, cx| {
-        if let Some(timer) = cx.default_global::<MenuBarItem>().timer.clone() {
+        if let Some(timer) = timer(cx) {
             timer.update(cx, |timer, cx| timer.stop(cx));
+            // A timer without an issue asks for one in the window
+            if timer.read(cx).stopping().is_some() {
+                show_window(cx);
+            }
         }
     });
     cx.on_action(|_: &ShowWindow, cx| show_window(cx));
@@ -45,10 +70,15 @@ pub fn install(cx: &mut App) -> gpui_tray::Result<()> {
     let native = Tray::builder()
         .icon(icon)
         .tooltip("Shrew")
-        .menu(|cx| items(cx.default_global::<MenuBarItem>().caption.clone()))
+        .menu(|cx| items(cx.default_global::<MenuBarItem>().line.clone()))
         .build(cx)?;
     cx.default_global::<MenuBarItem>().native = Some(native);
     Ok(())
+}
+
+/// The timer the menu bar shows: a window opened anew takes it over.
+pub fn timer(cx: &mut App) -> Option<Entity<ActiveTimer>> {
+    cx.default_global::<MenuBarItem>().timer.clone()
 }
 
 /// Shows `timer` in the menu bar from now on, in place of the one before.
@@ -69,13 +99,18 @@ pub fn forget(cx: &mut App) {
 }
 
 fn refresh(cx: &mut App) {
-    let timer = cx.default_global::<MenuBarItem>().timer.clone();
-    let caption = timer.and_then(|timer| timer.read(cx).caption());
+    let line = match timer(cx) {
+        None => TimerLine::Absent,
+        Some(timer) => timer
+            .read(cx)
+            .caption()
+            .map_or(TimerLine::Stopped, TimerLine::Running),
+    };
     let item = cx.default_global::<MenuBarItem>();
-    if item.caption == caption {
+    if item.line == line {
         return;
     }
-    item.caption = caption;
+    item.line = line;
     // Only on a start and a stop, which is why the line names the start and
     // not the time elapsed: gpui-tray drops a click on a menu that was rebuilt
     // while it was open, so a menu rebuilt every second cannot be clicked.
@@ -87,12 +122,19 @@ fn refresh(cx: &mut App) {
 // The time is not beside the icon: the menu bar gives a title digits of
 // different widths, so a clock there moves its neighbours every second, and
 // with the issue key it is wider than the space a crowded menu bar has.
-fn items(timer: Option<String>) -> Vec<MenuItem> {
+fn items(timer: TimerLine) -> Vec<MenuItem> {
     let mut items = Vec::new();
-    if let Some(caption) = timer {
-        items.push(MenuItem::action(caption, ShowWindow).disabled(true));
-        items.push(MenuItem::action("Stop Timer", StopTimer));
-        items.push(MenuItem::separator());
+    match timer {
+        TimerLine::Absent => {}
+        TimerLine::Stopped => {
+            items.push(MenuItem::action("Start Timer", StartTimer));
+            items.push(MenuItem::separator());
+        }
+        TimerLine::Running(caption) => {
+            items.push(MenuItem::action(caption, ShowWindow).disabled(true));
+            items.push(MenuItem::action("Stop Timer", StopTimer));
+            items.push(MenuItem::separator());
+        }
     }
     items.extend([
         MenuItem::action("Open Shrew", ShowWindow),
@@ -128,7 +170,7 @@ fn show_window(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MenuBarItem, ShowWindow, StopTimer, items};
+    use super::{MenuBarItem, ShowWindow, StartTimer, StopTimer, TimerLine, items};
     use crate::harness::{in_window, launch_on_jira, wait_until};
     use crate::issue_list::tests::issue;
     use crate::menu::Quit;
@@ -148,10 +190,22 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_offers_a_stop_only_while_the_timer_runs() {
-        assert_eq!(names(&items(None)), ["Open Shrew", "-", "Quit Shrew"]);
+    fn the_menu_offers_a_start_while_no_timer_runs_and_a_stop_while_one_does() {
+        // Signed out
+        assert_eq!(
+            names(&items(TimerLine::Absent)),
+            ["Open Shrew", "-", "Quit Shrew"]
+        );
+        let stopped = items(TimerLine::Stopped);
+        assert_eq!(
+            names(&stopped),
+            ["Start Timer", "-", "Open Shrew", "-", "Quit Shrew"]
+        );
+        assert!(
+            matches!(&stopped[0], MenuItem::Action { action, .. } if action.partial_eq(&StartTimer))
+        );
 
-        let running = items(Some("WEB-1 since 14:05".to_owned()));
+        let running = items(TimerLine::Running("WEB-1 since 14:05".to_owned()));
 
         assert_eq!(
             names(&running),
@@ -190,7 +244,10 @@ mod tests {
 
     // The line of the timer in the menu of the item
     fn shown(cx: &mut TestAppContext) -> Option<String> {
-        cx.update(|cx| cx.default_global::<MenuBarItem>().caption.clone())
+        cx.update(|cx| match &cx.default_global::<MenuBarItem>().line {
+            TimerLine::Running(caption) => Some(caption.clone()),
+            _ => None,
+        })
     }
 
     #[gpui_kit::test]
@@ -249,5 +306,81 @@ mod tests {
         }
         let window = cx.update(|cx| cx.windows()[0]);
         wait_until(cx, window, |window| window.try_find("home").is_some());
+    }
+
+    fn start_without_issue_from_the_menu(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        wait_until(cx, window, |window| {
+            window.try_find("start-timer-without-issue").is_some()
+        });
+        cx.update(|cx| cx.dispatch_action(&StartTimer));
+        cx.run_until_parked();
+    }
+
+    // A timer of a minute and more has time to give to an issue; the menu
+    // has no clock to wait on
+    fn backdate_the_running_timer(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let timer = cx.default_global::<MenuBarItem>().timer.clone().unwrap();
+            timer.update(cx, |timer, _| timer.backdate(600));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_menu_starts_a_timer_without_an_issue(cx: &mut TestAppContext) {
+        let app = launch_on_jira(cx, &[issue(1, "Fix login")]);
+
+        start_without_issue_from_the_menu(cx, app.window);
+
+        assert!(shown(cx).unwrap().starts_with("No issue chosen since "));
+        wait_until(cx, app.window, |window| {
+            window
+                .try_find("running-timer-issue")
+                .is_some_and(|issue| issue.label() == Some("No issue chosen"))
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_stop_from_the_menu_asks_for_the_issue_in_the_window(cx: &mut TestAppContext) {
+        let app = launch_on_jira(cx, &[issue(1, "Fix login")]);
+        start_without_issue_from_the_menu(cx, app.window);
+        backdate_the_running_timer(cx);
+
+        cx.update(|cx| cx.dispatch_action(&StopTimer));
+
+        wait_until(cx, app.window, |window| {
+            window.try_find("pick-WEB-1").is_some()
+        });
+        // Still running until the issue is chosen
+        assert!(shown(cx).is_some());
+    }
+
+    #[gpui_kit::test]
+    fn a_stop_from_the_menu_with_the_window_closed_opens_it_with_the_question(
+        cx: &mut TestAppContext,
+    ) {
+        let app = launch_on_jira(cx, &[issue(1, "Fix login")]);
+        start_without_issue_from_the_menu(cx, app.window);
+        backdate_the_running_timer(cx);
+        VisualTestContext::from_window(app.window, cx).deactivate_window();
+        cx.update_window(app.window, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| cx.dispatch_action(&StopTimer));
+
+        let started = std::time::Instant::now();
+        while cx.update(|cx| cx.windows().is_empty()) {
+            assert!(started.elapsed().as_secs() < 5, "no window was opened");
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let window = cx.update(|cx| cx.windows()[0]);
+        wait_until(cx, window, |window| window.try_find("pick-WEB-1").is_some());
+        in_window(cx, window, |window, cx| window.click("pick-WEB-1", cx));
+        cx.run_until_parked();
+        wait_until(cx, window, |window| {
+            window.try_find("start-timer-without-issue").is_some()
+        });
+        assert_eq!(shown(cx), None);
     }
 }

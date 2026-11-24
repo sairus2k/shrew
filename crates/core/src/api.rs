@@ -608,23 +608,51 @@ pub async fn running_timer(state: &AppState) -> anyhow::Result<Option<RunningTim
 }
 
 /// Replaces a timer that is already running; its time is not logged. An issue
-/// the cache does not have is refused.
+/// the cache does not have is refused; a timer without an issue gets one later.
 pub async fn start_timer(state: &AppState, timer: &RunningTimer) -> anyhow::Result<()> {
-    if db::issues::get(&state.pool, &timer.issue_key)
-        .await?
-        .is_none()
-    {
-        bail!("issue {} not found", timer.issue_key);
+    if let Some(key) = &timer.issue_key {
+        ensure_cached(state, key).await?;
     }
     Ok(db::timer::start(&state.pool, timer).await?)
 }
 
+/// Gives the timer that runs without an issue the issue `key`. It goes on as
+/// one started from that issue, from its first start.
+pub async fn choose_timer_issue(state: &AppState, key: &IssueKey) -> anyhow::Result<()> {
+    ensure_cached(state, key).await?;
+    if !db::timer::choose_issue(&state.pool, key).await? {
+        bail!("no timer without an issue is running");
+    }
+    Ok(())
+}
+
 /// Logs the time since the timer started as a worklog and stops the timer.
 /// `stopped_at` is Unix seconds: the moment of the click, not of this write.
-pub async fn stop_timer(state: &AppState, stopped_at: i64) -> anyhow::Result<()> {
-    if let Some(key) = db::timer::stop(&state.pool, stopped_at).await? {
+/// `chosen` is the issue the user picked for a timer that runs without one;
+/// with time to log and no issue the timer is refused and goes on running.
+pub async fn stop_timer(
+    state: &AppState,
+    stopped_at: i64,
+    chosen: Option<&IssueKey>,
+) -> anyhow::Result<()> {
+    if let Some(key) = chosen {
+        ensure_cached(state, key).await?;
+    }
+    if let Some(key) = db::timer::stop(&state.pool, stopped_at, chosen).await? {
         state.events.send(SyncEvent::IssuesUpdated(vec![key])).ok();
         state.sync_waker.send(()).ok();
+    }
+    Ok(())
+}
+
+/// Stops the timer without logging its time: the user said to discard it.
+pub async fn discard_timer(state: &AppState) -> anyhow::Result<()> {
+    Ok(db::timer::discard(&state.pool).await?)
+}
+
+async fn ensure_cached(state: &AppState, key: &IssueKey) -> anyhow::Result<()> {
+    if db::issues::get(&state.pool, key).await?.is_none() {
+        bail!("issue {key} not found");
     }
     Ok(())
 }
@@ -1204,13 +1232,15 @@ mod tests {
         }))
         .await;
         let timer = RunningTimer {
-            issue_key: "WEB-1".into(),
+            issue_key: Some("WEB-1".into()),
             started_at: 1_774_771_200,
         };
         start_timer(&state, &timer).await.unwrap();
         assert_eq!(running_timer(&state).await.unwrap(), Some(timer));
 
-        stop_timer(&state, 1_774_771_200 + 3_725).await.unwrap();
+        stop_timer(&state, 1_774_771_200 + 3_725, None)
+            .await
+            .unwrap();
 
         assert_eq!(running_timer(&state).await.unwrap(), None);
         let worklogs = get_issue(&state, &"WEB-1".into()).await.unwrap().worklogs;
@@ -1234,12 +1264,110 @@ mod tests {
         }))
         .await;
         let timer = RunningTimer {
-            issue_key: "WEB-9".into(),
+            issue_key: Some("WEB-9".into()),
             started_at: 1_774_771_200,
         };
 
         assert!(start_timer(&state, &timer).await.is_err());
         assert_eq!(running_timer(&state).await.unwrap(), None);
+    }
+
+    fn web_1() -> serde_json::Value {
+        json!({
+            "id": "10001",
+            "key": "WEB-1",
+            "fields": {
+                "summary": "Fix login",
+                "status": { "name": "To Do", "statusCategory": { "key": "new" } },
+                "project": { "key": "WEB" },
+                "updated": "2026-03-29T01:30:00.000+0100",
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_timer_without_an_issue_logs_the_time_up_to_the_stop_to_the_issue_chosen() {
+        let (_data_dir, state) = core_with(web_1()).await;
+        let timer = RunningTimer {
+            issue_key: None,
+            started_at: 1_774_771_200,
+        };
+        start_timer(&state, &timer).await.unwrap();
+        assert_eq!(running_timer(&state).await.unwrap(), Some(timer));
+
+        stop_timer(&state, 1_774_771_200 + 3_725, Some(&"WEB-1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(running_timer(&state).await.unwrap(), None);
+        let worklogs = get_issue(&state, &"WEB-1".into()).await.unwrap().worklogs;
+        assert_eq!(worklogs.len(), 1);
+        assert_eq!(worklogs[0].time_spent_secs, 3_725);
+        assert_eq!(worklogs[0].started_at, 1_774_771_200);
+        assert_eq!(worklogs[0].status, SyncStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn the_time_of_a_timer_without_an_issue_goes_to_no_issue_the_cache_does_not_have() {
+        let (_data_dir, state) = core_with(web_1()).await;
+        let timer = RunningTimer {
+            issue_key: None,
+            started_at: 1_774_771_200,
+        };
+        start_timer(&state, &timer).await.unwrap();
+
+        assert!(
+            stop_timer(&state, 1_774_771_200 + 3_725, Some(&"WEB-9".into()))
+                .await
+                .is_err()
+        );
+        assert!(choose_timer_issue(&state, &"WEB-9".into()).await.is_err());
+
+        assert_eq!(running_timer(&state).await.unwrap(), Some(timer));
+    }
+
+    #[tokio::test]
+    async fn an_issue_chosen_for_a_running_timer_takes_it_from_its_first_start() {
+        let (_data_dir, state) = core_with(web_1()).await;
+        start_timer(
+            &state,
+            &RunningTimer {
+                issue_key: None,
+                started_at: 1_774_771_200,
+            },
+        )
+        .await
+        .unwrap();
+
+        choose_timer_issue(&state, &"WEB-1".into()).await.unwrap();
+
+        assert_eq!(
+            running_timer(&state).await.unwrap(),
+            Some(RunningTimer {
+                issue_key: Some("WEB-1".into()),
+                started_at: 1_774_771_200,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discarded_timer_logs_nothing() {
+        let (_data_dir, state) = core_with(web_1()).await;
+        start_timer(
+            &state,
+            &RunningTimer {
+                issue_key: None,
+                started_at: 1_774_771_200,
+            },
+        )
+        .await
+        .unwrap();
+
+        discard_timer(&state).await.unwrap();
+
+        assert_eq!(running_timer(&state).await.unwrap(), None);
+        let worklogs = get_issue(&state, &"WEB-1".into()).await.unwrap().worklogs;
+        assert!(worklogs.is_empty());
     }
 
     #[tokio::test]
@@ -1773,7 +1901,7 @@ mod tests {
 
     fn timer_on_web_1() -> RunningTimer {
         RunningTimer {
-            issue_key: "WEB-1".into(),
+            issue_key: Some("WEB-1".into()),
             started_at: 1_700_000_000,
         }
     }

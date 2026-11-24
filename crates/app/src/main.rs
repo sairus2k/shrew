@@ -16,7 +16,7 @@ use issue_detail::{DetailClosed, DetailPane};
 use issue_list::{IssueList, IssueOpened};
 use keys::{
     Back, ChangeAssignee, ChangeStatus, EditUserSettings, LogTime, OpenInJira, OpenTimerIssue,
-    ShowShortcuts, SyncNow, ToggleTimer, WriteComment,
+    ShowShortcuts, StartOrStopTimer, SyncNow, ToggleTimer, WriteComment,
 };
 use new_token::{NewToken, TokenRenewed};
 use projects::{ProjectPicker, ProjectsChosen};
@@ -24,7 +24,7 @@ use runtime::{Core, SyncBridge};
 use settings::Settings;
 use sign_in::{SignIn, SignedIn};
 use sync_status::SyncStatus;
-use timer::{ActiveTimer, TimerIssueClicked, TimerStatus, TimerWriteFailed};
+use timer::{ActiveTimer, TimerIssueClicked, TimerQuestion, TimerStatus, TimerWriteFailed};
 
 mod account;
 mod assignee;
@@ -47,6 +47,7 @@ mod sign_in;
 mod sync_status;
 mod theme;
 mod timer;
+mod timer_issue;
 mod transition;
 mod tray;
 mod worklog;
@@ -72,6 +73,9 @@ enum Screen {
         status: Entity<SyncStatus>,
         timer: Entity<ActiveTimer>,
         timer_status: Entity<TimerStatus>,
+        // Kept with the screen, not detached: the timer outlives it, and a
+        // screen built anew subscribes anew
+        _timer_events: [Subscription; 2],
         // Shown from the moment Jira rejects the API token until it accepts a new one
         new_token: Option<Entity<NewToken>>,
     },
@@ -231,15 +235,27 @@ impl Root {
             SetupStep::Ready => {
                 let list = cx.new(|cx| IssueList::new(window, cx));
                 cx.subscribe_in(&list, window, Self::open_issue).detach();
-                let timer = cx.new(ActiveTimer::new);
-                cx.subscribe_in(
-                    &timer,
-                    window,
-                    |_, _, failed: &TimerWriteFailed, window, cx| {
-                        window.push_notification(Notification::error(failed.0.clone()), cx)
-                    },
-                )
-                .detach();
+                // The one in the menu bar goes on while the window is closed,
+                // and a stop from there may wait for its issue to be chosen
+                let timer = tray::timer(cx).unwrap_or_else(|| cx.new(ActiveTimer::new));
+                let _timer_events = [
+                    cx.subscribe_in(
+                        &timer,
+                        window,
+                        |_, _, failed: &TimerWriteFailed, window, cx| {
+                            window.push_notification(Notification::error(failed.0.clone()), cx)
+                        },
+                    ),
+                    cx.subscribe_in(&timer, window, Self::answer_timer),
+                ];
+                if let Some(stopped_at) = timer.read(cx).stopping() {
+                    let timer = timer.clone();
+                    // Root may still be under construction, and the dialog
+                    // opens over it
+                    window.defer(cx, move |window, cx| {
+                        timer_issue::choose_issue(timer, Some(stopped_at), window, cx)
+                    });
+                }
                 tray::follow(timer.clone(), cx);
                 let timer_status = cx.new(|cx| TimerStatus::new(timer.clone(), cx));
                 let opening = list.clone();
@@ -257,6 +273,7 @@ impl Root {
                     status: cx.new(SyncStatus::new),
                     timer,
                     timer_status,
+                    _timer_events,
                     new_token: None,
                 }
             }
@@ -384,12 +401,43 @@ impl Root {
         }
     }
 
+    fn start_or_stop_timer(
+        &mut self,
+        _: &StartOrStopTimer,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Screen::Home { timer, .. } = &self.screen {
+            timer.update(cx, |timer, cx| timer.toggle_without_issue(cx));
+        }
+    }
+
     fn open_timer_issue(&mut self, _: &OpenTimerIssue, _: &mut Window, cx: &mut Context<Self>) {
         let Screen::Home { list, timer, .. } = &self.screen else {
             return;
         };
-        if let Some(key) = timer.read(cx).issue().cloned() {
-            list.update(cx, |list, cx| list.open(key, cx));
+        match timer.read(cx).issue().cloned() {
+            Some(key) => list.update(cx, |list, cx| list.open(key, cx)),
+            None => timer.update(cx, |timer, cx| timer.ask_for_issue(cx)),
+        }
+    }
+
+    fn answer_timer(
+        &mut self,
+        timer: &Entity<ActiveTimer>,
+        question: &TimerQuestion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let timer = timer.clone();
+        match question {
+            TimerQuestion::IssueForStop { stopped_at } => {
+                timer_issue::choose_issue(timer, Some(*stopped_at), window, cx)
+            }
+            TimerQuestion::IssueForRunning => timer_issue::choose_issue(timer, None, window, cx),
+            TimerQuestion::StartOver(key) => {
+                timer_issue::ask_start_over(timer, key.clone(), window, cx)
+            }
         }
     }
 
@@ -496,6 +544,7 @@ impl Render for Root {
                     this.in_detail(window, cx, DetailPane::open_in_jira)
                 }))
                 .on_action(cx.listener(Self::toggle_timer))
+                .on_action(cx.listener(Self::start_or_stop_timer))
                 .on_action(cx.listener(Self::open_timer_issue))
                 .on_action(|_: &SyncNow, _, cx| {
                     let core = cx.global::<Core>();

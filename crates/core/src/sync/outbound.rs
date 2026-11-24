@@ -2246,7 +2246,7 @@ mod tests {
         api::start_timer(
             &state,
             &RunningTimer {
-                issue_key: "WEB-1".into(),
+                issue_key: Some("WEB-1".into()),
                 started_at: STARTED,
             },
         )
@@ -2268,6 +2268,23 @@ mod tests {
         assert_eq!(delivered, keys(&["WEB-1"]));
         assert_eq!(worklog_entries(&state).await, ["synced"]);
         assert_eq!(worklogs_of(&state, "WEB-1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn unwatching_a_project_keeps_a_timer_without_an_issue() {
+        let server = MockServer::start().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
+        store_issue(&state).await;
+        let timer = RunningTimer {
+            issue_key: None,
+            started_at: STARTED,
+        };
+        api::start_timer(&state, &timer).await.unwrap();
+
+        unwatch_web(&state, &server).await;
+
+        assert_eq!(api::running_timer(&state).await.unwrap(), Some(timer));
     }
 
     #[tokio::test]
@@ -3611,7 +3628,7 @@ mod tests {
             .unwrap();
         assert_eq!(worklogs, ["API-9"]);
         let running = timer::get(&state.pool).await.unwrap().unwrap();
-        assert_eq!(running.issue_key, "API-9".into());
+        assert_eq!(running.issue_key, Some("API-9".into()));
         let queued: Vec<String> = sqlx::query_scalar("SELECT issue_key FROM sync_queue")
             .fetch_all(&state.pool)
             .await

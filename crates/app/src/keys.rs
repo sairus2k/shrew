@@ -20,6 +20,7 @@ actions!(
         WriteComment,
         LogTime,
         ToggleTimer,
+        StartOrStopTimer,
         OpenTimerIssue,
         OpenInJira,
         SyncNow,
@@ -61,6 +62,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("c", WriteComment, Some(LIST)),
         KeyBinding::new("w", LogTime, Some(LIST)),
         KeyBinding::new("t", ToggleTimer, Some(LIST)),
+        KeyBinding::new("n", StartOrStopTimer, Some(LIST)),
         KeyBinding::new("shift-t", OpenTimerIssue, Some(LIST)),
         KeyBinding::new("b", OpenInJira, Some(LIST)),
         KeyBinding::new("r", SyncNow, Some(LIST)),
@@ -72,7 +74,7 @@ pub fn init(cx: &mut App) {
 
 /// What the help view lists, in its order. The keys are read from the keymap,
 /// so the view cannot name a key that is not bound.
-fn listed() -> [(Box<dyn Action>, &'static str); 19] {
+fn listed() -> [(Box<dyn Action>, &'static str); 20] {
     [
         (Box::new(SelectNext), "Next issue"),
         (Box::new(SelectPrevious), "Previous issue"),
@@ -92,8 +94,12 @@ fn listed() -> [(Box<dyn Action>, &'static str); 19] {
         (Box::new(LogTime), "Log time"),
         (Box::new(ToggleTimer), "Start or stop the timer"),
         (
+            Box::new(StartOrStopTimer),
+            "Start a timer without an issue, or stop the running one",
+        ),
+        (
             Box::new(OpenTimerIssue),
-            "Open the issue of the running timer",
+            "Open or choose the issue of the running timer",
         ),
         (Box::new(OpenInJira), "Open in Jira"),
         (Box::new(SyncNow), "Sync now"),
@@ -664,6 +670,7 @@ mod tests {
             ("LogTime", "W"),
             ("OpenInJira", "B"),
             ("OpenTimerIssue", "⇧T"),
+            ("StartOrStopTimer", "N"),
             ("ToggleTimer", "T"),
             ("WriteComment", "C"),
         ];
@@ -794,7 +801,8 @@ mod tests {
             "C: Write a comment",
             "W: Log time",
             "T: Start or stop the timer",
-            "⇧T: Open the issue of the running timer",
+            "N: Start a timer without an issue, or stop the running one",
+            "⇧T: Open or choose the issue of the running timer",
             "B: Open in Jira",
             "R: Sync now",
             "⌘,: Settings",

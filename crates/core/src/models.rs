@@ -226,7 +226,8 @@ pub struct RejectedWorklog {
 /// derived from it, so a restart or a sleep does not skew it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunningTimer {
-    pub issue_key: IssueKey,
+    /// `None` until the user chooses the issue, at the stop or while it runs.
+    pub issue_key: Option<IssueKey>,
     /// Unix seconds.
     pub started_at: i64,
 }
@@ -235,6 +236,12 @@ impl RunningTimer {
     /// The system clock can be set back while the timer runs.
     pub fn elapsed_secs(&self, now: i64) -> u64 {
         (now - self.started_at).max(0) as u64
+    }
+
+    /// Whether stopping at `now` makes a worklog: a shorter time logs nothing,
+    /// so a timer without an issue needs no issue then.
+    pub fn loggable_at(&self, now: i64) -> bool {
+        self.elapsed_secs(now) >= crate::db::worklogs::MIN_TIME_SPENT_SEC as u64
     }
 }
 
