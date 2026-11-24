@@ -9,8 +9,8 @@ use crate::theme::{status_dot, tabular_digits};
 use app_core::{
     SyncEvent, api,
     models::{
-        AssigneeFilter, FilterOptions, IssueFilter, IssueKey, IssueRow, SprintFilter,
-        StatusCategory, StatusFilter, SyncStatus,
+        AssigneeFilter, FilterOptions, IssueFilter, IssueKey, IssueOrder, IssueRow, SortColumn,
+        SprintFilter, StatusCategory, StatusFilter, SyncStatus,
     },
 };
 use gpui_kit::assets::IconName;
@@ -26,6 +26,15 @@ use std::ops::Range;
 
 /// Emitted when the user picks an issue to read.
 pub struct IssueOpened(pub IssueKey);
+
+/// The order the user chose for the list; `None` is the one changed last
+/// first, or for a search the best match first.
+// Outside the list, which Root builds anew when the projects are saved in
+// the settings
+#[derive(Default)]
+struct ListOrder(Option<IssueOrder>);
+
+impl Global for ListOrder {}
 
 /// Whose issues the list shows, under the name the filter has for them.
 #[derive(Clone)]
@@ -194,6 +203,8 @@ pub struct IssueList {
     opened: Option<IssueKey>,
     // The issue the keyboard is on
     selected: Option<IssueKey>,
+    // The order has changed, and the rows in it are to show the selected issue
+    reveal: bool,
     // Rests here while the user types nowhere, which is when the shortcuts apply
     focus: FocusHandle,
     // Of the project filter, and of the button all the filters collapse into
@@ -250,6 +261,7 @@ impl IssueList {
             issues: Vec::new(),
             opened: None,
             selected: None,
+            reveal: false,
             focus: cx.focus_handle(),
             filter_focus: cx.focus_handle(),
             assignee_focus: cx.focus_handle(),
@@ -531,9 +543,30 @@ impl IssueList {
         cx.notify();
     }
 
+    /// A click on the name of `column`: sorts by it, then the other way,
+    /// then returns to the order without a column.
+    fn sort_by(&mut self, column: SortColumn, cx: &mut Context<Self>) {
+        let order = &mut cx.default_global::<ListOrder>().0;
+        *order = match *order {
+            Some(sorted) if sorted.column == column && !sorted.descending => Some(IssueOrder {
+                column,
+                descending: true,
+            }),
+            Some(sorted) if sorted.column == column => None,
+            _ => Some(IssueOrder {
+                column,
+                descending: false,
+            }),
+        };
+        self.reveal = true;
+        self.reload(cx);
+        cx.notify();
+    }
+
     // No debounce: an FTS5 query takes a few milliseconds and there is no IPC hop
     fn reload(&mut self, cx: &mut Context<Self>) {
         let query = self.searched(cx);
+        let order = cx.try_global::<ListOrder>().and_then(|order| order.0);
         let filter = IssueFilter {
             project: self.project.clone(),
             assignee: self.assignee.as_ref().map(|chosen| chosen.filter.clone()),
@@ -542,8 +575,8 @@ impl IssueList {
         };
         let load = spawn(cx, move |state| async move {
             match query {
-                None => api::list_issues(&state, &filter).await,
-                Some(query) => api::search_issues(&state, &query, &filter).await,
+                None => api::list_issues(&state, &filter, order).await,
+                Some(query) => api::search_issues(&state, &query, &filter, order).await,
             }
         });
         self.show(load, cx);
@@ -556,6 +589,18 @@ impl IssueList {
             if let Ok(issues) = load.await {
                 this.update(cx, |this, cx| {
                     this.issues = issues;
+                    // A flag rather than an argument: a sync may reload the
+                    // list before the rows of the new order arrive
+                    if std::mem::take(&mut this.reveal) {
+                        let selected = this.selected.as_ref();
+                        let at = this
+                            .issues
+                            .iter()
+                            .position(|issue| Some(&issue.key) == selected);
+                        if let Some(at) = at {
+                            this.scroll.scroll_to_item(at, ScrollStrategy::Nearest);
+                        }
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -721,33 +766,93 @@ fn priority(key: &IssueKey, name: &str, done: bool, cx: &App) -> impl IntoElemen
         .child(div().min_w_0().truncate().child(name.to_owned()))
 }
 
-/// The names of the columns, over a list wide enough to show them all.
-fn column_names(cx: &App) -> impl IntoElement {
-    div()
-        .h(px(24.))
-        .flex_none()
-        .px_4()
-        .flex()
-        .items_center()
-        .gap_3()
-        .border_b_1()
-        .border_color(cx.theme().border)
-        .text_size(px(11.))
-        .text_color(cx.theme().muted_foreground)
-        // The dot of the status stands before the key
-        .child(div().w(px(8.)).flex_none())
-        .child(div().w(px(KEY_WIDTH)).flex_none().child("KEY"))
-        .child(div().flex_1().min_w_0().child("SUMMARY"))
-        .child(
-            div()
-                .id("priority-column")
-                .test_support()
-                .w(px(PRIORITY_WIDTH))
-                .flex_none()
-                .child("PRIORITY"),
-        )
-        .child(div().w(px(STATUS_WIDTH)).flex_none().child("STATUS"))
-        .child(div().w(px(ASSIGNEE_WIDTH)).flex_none().child("ASSIGNEE"))
+impl IssueList {
+    /// The names of the columns, over a list wide enough to show them all.
+    fn column_names(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .h(px(24.))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .text_size(px(11.))
+            .text_color(cx.theme().muted_foreground)
+            // The dot of the status stands before the key
+            .child(div().w(px(8.)).flex_none())
+            .child(
+                self.column_name("key-column", "KEY", SortColumn::Key, cx)
+                    .w(px(KEY_WIDTH))
+                    .flex_none(),
+            )
+            .child(
+                self.column_name("summary-column", "SUMMARY", SortColumn::Summary, cx)
+                    .flex_1()
+                    .min_w_0(),
+            )
+            .child(
+                self.column_name("priority-column", "PRIORITY", SortColumn::Priority, cx)
+                    .w(px(PRIORITY_WIDTH))
+                    .flex_none(),
+            )
+            .child(
+                self.column_name("status-column", "STATUS", SortColumn::Status, cx)
+                    .w(px(STATUS_WIDTH))
+                    .flex_none(),
+            )
+            .child(
+                self.column_name("assignee-column", "ASSIGNEE", SortColumn::Assignee, cx)
+                    .w(px(ASSIGNEE_WIDTH))
+                    .flex_none(),
+            )
+    }
+
+    /// The name of a column, which sorts the list by it. The one the list is
+    /// sorted by has an arrow of the direction.
+    fn column_name(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        column: SortColumn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + Styled + use<> {
+        let order = cx.try_global::<ListOrder>().and_then(|order| order.0);
+        let descending = order
+            .filter(|order| order.column == column)
+            .map(|order| order.descending);
+        let label = match descending {
+            None => name.to_owned(),
+            Some(false) => format!("{name}, ascending"),
+            Some(true) => format!("{name}, descending"),
+        };
+        let hover = cx.theme().foreground;
+        div()
+            .id(id)
+            .test_support()
+            .role(Role::Button)
+            .aria_label(label)
+            .flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .hover(move |name| name.text_color(hover))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                // The keys follow the mouse to the list
+                this.focus.focus(window, cx);
+                this.sort_by(column, cx)
+            }))
+            .child(name)
+            .children(descending.map(|descending| {
+                let arrow = if descending {
+                    IconName::ArrowDown
+                } else {
+                    IconName::ArrowUp
+                };
+                Icon::new(arrow).with_size(px(10.))
+            }))
+    }
 }
 
 impl IssueList {
@@ -920,7 +1025,7 @@ impl Render for IssueList {
             .flex_col()
             .child(bar)
             .children((!narrow).then(|| self.count(filtered, cx)))
-            .children((!narrow).then(|| column_names(cx)))
+            .children((!narrow).then(|| self.column_names(cx)))
             // Without this an empty list under a filter looks like an empty cache
             .children((filtered && self.issues.is_empty()).then(|| {
                 div()
@@ -2360,6 +2465,185 @@ pub(crate) mod tests {
 
         in_window(cx, window, |window, _| {
             let row = window.find("issue-WEB-21");
+            assert_eq!(row.selected(), Some(true));
+            let list = window.find("home").bounds();
+            assert!(row.bounds().top() >= list.top() && row.bounds().bottom() <= list.bottom());
+        });
+    }
+
+    const ADD: &str = "WEB-3: Add logout, To Do, Unassigned";
+    const BROKEN: &str = "WEB-1: Broken checkout, To Do, Unassigned";
+    const FIX: &str = "WEB-2: Fix login, To Do, Unassigned";
+
+    /// Three issues whose summaries are in neither the order they were
+    /// changed in nor its reverse.
+    fn unsorted() -> [Value; 3] {
+        [
+            issue(1, "Broken checkout"),
+            issue(2, "Fix login"),
+            issue(3, "Add logout"),
+        ]
+    }
+
+    const COLUMNS: [&str; 5] = [
+        "key-column",
+        "summary-column",
+        "priority-column",
+        "status-column",
+        "assignee-column",
+    ];
+
+    fn column_labels(window: &Window) -> Vec<String> {
+        COLUMNS.iter().map(|id| label(window, id)).collect()
+    }
+
+    #[gpui_kit::test]
+    fn a_click_on_a_column_name_sorts_by_it_a_second_reverses_and_a_third_restores(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &unsorted());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[ADD, FIX, BROKEN]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(
+                column_labels(window),
+                ["KEY", "SUMMARY", "PRIORITY", "STATUS", "ASSIGNEE"]
+            );
+        });
+
+        in_window(cx, window, |window, cx| window.click("summary-column", cx));
+        wait_for_rows(cx, window, &[ADD, BROKEN, FIX]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(
+                column_labels(window),
+                [
+                    "KEY",
+                    "SUMMARY, ascending",
+                    "PRIORITY",
+                    "STATUS",
+                    "ASSIGNEE"
+                ]
+            );
+        });
+
+        in_window(cx, window, |window, cx| window.click("summary-column", cx));
+        wait_for_rows(cx, window, &[FIX, BROKEN, ADD]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "summary-column"), "SUMMARY, descending");
+        });
+
+        in_window(cx, window, |window, cx| window.click("summary-column", cx));
+        wait_for_rows(cx, window, &[ADD, FIX, BROKEN]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(label(window, "summary-column"), "SUMMARY");
+        });
+
+        // Another column starts from its ascending order
+        in_window(cx, window, |window, cx| {
+            window.click("summary-column", cx);
+            window.click("key-column", cx);
+        });
+        wait_for_rows(cx, window, &[BROKEN, FIX, ADD]);
+        in_window(cx, window, |window, _| {
+            assert_eq!(
+                column_labels(window),
+                [
+                    "KEY, ascending",
+                    "SUMMARY",
+                    "PRIORITY",
+                    "STATUS",
+                    "ASSIGNEE"
+                ]
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_sort_holds_while_the_sync_brings_issues(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &unsorted());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[ADD, FIX, BROKEN]);
+        in_window(cx, window, |window, cx| window.click("summary-column", cx));
+        wait_for_rows(cx, window, &[ADD, BROKEN, FIX]);
+
+        sync_brings(cx, &tokio, issue(4, "Cart is empty"));
+
+        let cart = "WEB-4: Cart is empty, To Do, Unassigned";
+        wait_for_rows(cx, window, &[ADD, BROKEN, cart, FIX]);
+    }
+
+    #[gpui_kit::test]
+    fn the_sort_applies_to_the_search_and_without_it_the_best_match_is_first(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let data_dir = synced(&tokio, &unsorted());
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_for_rows(cx, window, &[ADD, FIX, BROKEN]);
+        in_window(cx, window, |window, cx| {
+            window.click("search", cx);
+            window.input("log", cx);
+        });
+        wait_until(cx, window, |window| rows(window).len() == 2);
+        let best_first = in_window(cx, window, |window, _| rows(window));
+
+        for (sorted, expected) in [("ascending", [ADD, FIX]), ("descending", [FIX, ADD])] {
+            in_window(cx, window, |window, cx| window.click("summary-column", cx));
+            wait_for_rows(cx, window, &expected);
+            in_window(cx, window, |window, _| {
+                assert_eq!(
+                    label(window, "summary-column"),
+                    format!("SUMMARY, {sorted}")
+                );
+            });
+        }
+
+        in_window(cx, window, |window, cx| window.click("summary-column", cx));
+        wait_until(cx, window, |window| rows(window) == best_first);
+        // A filter narrows the sorted search
+        in_window(cx, window, |window, cx| window.click("key-column", cx));
+        wait_for_rows(cx, window, &[FIX, ADD]);
+        let mut adas = issue(4, "Login page");
+        adas["fields"]["assignee"] = json!({ "accountId": "5b10a", "displayName": "Ada" });
+        sync_brings(cx, &tokio, adas);
+        wait_for_rows(cx, window, &[FIX, ADD, "WEB-4: Login page, To Do, Ada"]);
+        in_window(cx, window, |window, cx| {
+            choose(window, cx, "assignee-filter", "Unassigned")
+        });
+        wait_for_rows(cx, window, &[FIX, ADD]);
+        in_window(cx, window, |window, cx| window.click("key-column", cx));
+        wait_for_rows(cx, window, &[ADD, FIX]);
+    }
+
+    #[gpui_kit::test]
+    fn the_selected_issue_stays_selected_and_in_view_when_the_order_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let tokio = tokio_runtime();
+        let issues: Vec<_> = (1..=60)
+            .map(|id| issue(id, &format!("Task {id}")))
+            .collect();
+        let data_dir = synced(&tokio, &issues);
+        let window = launch(cx, &tokio, data_dir.path());
+        wait_until(cx, window, |window| !rows(window).is_empty());
+        in_window(cx, window, |window, cx| window.click("key-column", cx));
+        wait_until(cx, window, |window| {
+            window.try_find("issue-WEB-1").is_some()
+        });
+        // The first press selects the first row
+        in_window(cx, window, |window, cx| window.press("j", cx));
+
+        // WEB-1 goes from the top to the bottom of the list
+        in_window(cx, window, |window, cx| window.click("key-column", cx));
+        wait_until(cx, window, |window| {
+            label(window, "key-column") == "KEY, descending"
+                && window.try_find("issue-WEB-60").is_none()
+        });
+
+        in_window(cx, window, |window, _| {
+            let row = window.find("issue-WEB-1");
             assert_eq!(row.selected(), Some(true));
             let list = window.find("home").bounds();
             assert!(row.bounds().top() >= list.top() && row.bounds().bottom() <= list.bottom());

@@ -6,15 +6,15 @@ use crate::{
         timer, worklogs,
     },
     models::{
-        AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow,
-        RejectedComment, ReplyTo, Sprint, SprintFilter, StatusCategory, StatusFilter, SyncStatus,
-        User,
+        AssigneeFilter, Comment, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueOrder,
+        IssueRow, RejectedComment, ReplyTo, SortColumn, Sprint, SprintFilter, StatusCategory,
+        StatusFilter, SyncStatus, User,
     },
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::{cmp::Ordering, collections::HashMap};
 
 /// The moment Jira last changed an issue.
 // Jira sends `updated` with the UTC offset of the requesting user's time zone,
@@ -674,6 +674,68 @@ pub(crate) async fn search(
     .await
 }
 
+/// Puts `issues` in `order`. The sort is stable, so issues equal in the
+/// column keep the order the query gave them: the one changed last first, or
+/// the best match first.
+// In Rust rather than in SQL: a search sorts its best matches, which a LIMIT
+// after an ORDER BY of the column would not return
+pub(crate) fn sort(issues: &mut [IssueRow], order: IssueOrder) {
+    issues.sort_by(|a, b| {
+        let unset = |issue: &IssueRow| match order.column {
+            SortColumn::Priority => issue.priority.is_none(),
+            SortColumn::Assignee => issue.assignee_name.is_none(),
+            _ => false,
+        };
+        let by_column = compare(a, b, order.column);
+        unset(a).cmp(&unset(b)).then(if order.descending {
+            by_column.reverse()
+        } else {
+            by_column
+        })
+    });
+}
+
+fn compare(a: &IssueRow, b: &IssueRow, column: SortColumn) -> Ordering {
+    match column {
+        SortColumn::Key => (&a.project_key, a.key.number()).cmp(&(&b.project_key, b.key.number())),
+        SortColumn::Summary => without_case(&a.summary, &b.summary),
+        SortColumn::Priority => {
+            let known = ["Highest", "High", "Medium", "Low", "Lowest"];
+            let a = a.priority.as_deref().unwrap_or_default();
+            let b = b.priority.as_deref().unwrap_or_default();
+            // A priority of another scheme has no known rank and follows the five
+            let rank = |name: &str| {
+                known
+                    .iter()
+                    .position(|known| *known == name)
+                    .unwrap_or(known.len())
+            };
+            rank(a).cmp(&rank(b)).then_with(|| without_case(a, b))
+        }
+        SortColumn::Status => {
+            let rank = |issue: &IssueRow| match issue.status_category {
+                StatusCategory::Todo => 0,
+                StatusCategory::InProgress => 1,
+                StatusCategory::Done => 2,
+            };
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| without_case(&a.status, &b.status))
+        }
+        SortColumn::Assignee => without_case(
+            a.assignee_name.as_deref().unwrap_or_default(),
+            b.assignee_name.as_deref().unwrap_or_default(),
+        ),
+    }
+}
+
+// Without allocating: the list sorts every cached issue
+fn without_case(a: &str, b: &str) -> Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 /// What the cached issues can be filtered by.
 pub(crate) async fn filter_options(pool: &SqlitePool) -> sqlx::Result<FilterOptions> {
     // An account whose name changed has both names in the cache until every
@@ -1323,6 +1385,181 @@ mod tests {
         let rows = list(&pool, &IssueFilter::default()).await.unwrap();
         let keys: Vec<String> = rows.iter().map(|row| row.key.to_string()).collect();
         assert_eq!(keys, ["PROJ-2", "PROJ-3", "PROJ-1"]);
+    }
+
+    /// Four issues about the login, the one stored later changed later:
+    /// PROJ-9, beta, High, In Progress, Grace Hopper;
+    /// PROJ-10, Alpha, no priority, Done, nobody;
+    /// OTHER-2, gamma, Blocker of another scheme, To Do, bob;
+    /// PROJ-11, Delta, Lowest, Backlog in the to do category, Ada Lovelace.
+    async fn seed_for_sorting(pool: &SqlitePool) {
+        let issues = [
+            (
+                "PROJ-9",
+                "beta",
+                Some("High"),
+                ("In Progress", StatusCategory::InProgress),
+                Some("Grace Hopper"),
+            ),
+            (
+                "PROJ-10",
+                "Alpha",
+                None,
+                ("Done", StatusCategory::Done),
+                None,
+            ),
+            (
+                "OTHER-2",
+                "gamma",
+                Some("Blocker"),
+                ("To Do", StatusCategory::Todo),
+                Some("bob"),
+            ),
+            (
+                "PROJ-11",
+                "Delta",
+                Some("Lowest"),
+                ("Backlog", StatusCategory::Todo),
+                Some("Ada Lovelace"),
+            ),
+        ];
+        for (n, (key, summary, priority, (status, category), assignee)) in
+            issues.into_iter().enumerate()
+        {
+            let updated = format!("2026-01-0{}T10:00:00.000+0000", n + 1);
+            let record = IssueRecord {
+                priority: priority.map(str::to_owned),
+                status: status.to_owned(),
+                status_category: category,
+                assignee_id: assignee.map(|name| format!("id-of-{name}")),
+                assignee_name: assignee.map(str::to_owned),
+                ..issue(
+                    &format!("id-{n}"),
+                    key,
+                    &updated,
+                    &format!("{summary} login"),
+                )
+            };
+            upsert(pool, &record).await.unwrap();
+        }
+    }
+
+    /// The keys `list` and, with `query`, `search` return under `filter`,
+    /// sorted by `column`.
+    async fn sorted(
+        pool: &SqlitePool,
+        query: Option<&str>,
+        filter: &IssueFilter,
+        column: SortColumn,
+        descending: bool,
+    ) -> Vec<String> {
+        let mut rows = match query {
+            None => list(pool, filter).await.unwrap(),
+            Some(query) => search(pool, query, filter, 10).await.unwrap(),
+        };
+        sort(&mut rows, IssueOrder { column, descending });
+        rows.iter().map(|row| row.key.to_string()).collect()
+    }
+
+    #[sqlx::test]
+    async fn every_column_sorts_the_list_and_the_search_both_ways(pool: SqlitePool) {
+        seed_for_sorting(&pool).await;
+        let all = IssueFilter::default();
+        let cases = [
+            // By project, then by number, not as text
+            (SortColumn::Key, ["OTHER-2", "PROJ-9", "PROJ-10", "PROJ-11"]),
+            (
+                SortColumn::Summary,
+                ["PROJ-10", "PROJ-9", "PROJ-11", "OTHER-2"],
+            ),
+            // Another scheme after the five, nobody's priority last
+            (
+                SortColumn::Priority,
+                ["PROJ-9", "PROJ-11", "OTHER-2", "PROJ-10"],
+            ),
+            // To do, in progress, done, and by name inside a category
+            (
+                SortColumn::Status,
+                ["PROJ-11", "OTHER-2", "PROJ-9", "PROJ-10"],
+            ),
+            (
+                SortColumn::Assignee,
+                ["PROJ-11", "OTHER-2", "PROJ-9", "PROJ-10"],
+            ),
+        ];
+        for (column, ascending) in cases {
+            for query in [None, Some("login")] {
+                let up = sorted(&pool, query, &all, column, false).await;
+                assert_eq!(up, ascending, "{column:?} ascending, {query:?}");
+                let down = sorted(&pool, query, &all, column, true).await;
+                let mut expected = ascending.to_vec();
+                // Without a value is last both ways
+                if matches!(column, SortColumn::Priority | SortColumn::Assignee) {
+                    expected[..3].reverse();
+                } else {
+                    expected.reverse();
+                }
+                assert_eq!(down, expected, "{column:?} descending, {query:?}");
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn the_sort_applies_to_what_the_filters_and_the_search_let_through(pool: SqlitePool) {
+        seed_for_sorting(&pool).await;
+        let proj = IssueFilter {
+            project: Some("PROJ".to_owned()),
+            ..Default::default()
+        };
+        let key = SortColumn::Key;
+        assert_eq!(
+            sorted(&pool, None, &proj, key, true).await,
+            ["PROJ-11", "PROJ-10", "PROJ-9"]
+        );
+        assert_eq!(
+            sorted(&pool, Some("login"), &proj, key, true).await,
+            ["PROJ-11", "PROJ-10", "PROJ-9"]
+        );
+        let open = IssueFilter {
+            status: Some(StatusFilter::Not(vec!["Done".to_owned()])),
+            ..Default::default()
+        };
+        assert_eq!(
+            sorted(&pool, Some("login"), &open, SortColumn::Assignee, true).await,
+            ["PROJ-9", "OTHER-2", "PROJ-11"]
+        );
+        assert_eq!(
+            sorted(&pool, Some("gamma"), &open, SortColumn::Status, false).await,
+            ["OTHER-2"]
+        );
+    }
+
+    #[sqlx::test]
+    async fn issues_equal_in_the_column_keep_the_last_changed_first(pool: SqlitePool) {
+        for (n, updated) in [T1, T2, "2026-01-03T10:00:00.000+0000"]
+            .into_iter()
+            .enumerate()
+        {
+            let key = format!("PROJ-{}", n + 1);
+            upsert(&pool, &issue(&format!("id-{n}"), &key, updated, "Same"))
+                .await
+                .unwrap();
+        }
+        let all = IssueFilter::default();
+
+        for column in [
+            SortColumn::Summary,
+            SortColumn::Status,
+            SortColumn::Assignee,
+        ] {
+            for descending in [false, true] {
+                assert_eq!(
+                    sorted(&pool, None, &all, column, descending).await,
+                    ["PROJ-3", "PROJ-2", "PROJ-1"],
+                    "{column:?}, descending {descending}"
+                );
+            }
+        }
     }
 
     #[sqlx::test]

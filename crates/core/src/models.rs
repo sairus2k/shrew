@@ -12,6 +12,13 @@ impl From<&str> for IssueKey {
     }
 }
 
+impl IssueKey {
+    /// The number after the project: 123 for PROJ-123.
+    pub(crate) fn number(&self) -> Option<u64> {
+        self.0.rsplit_once('-')?.1.parse().ok()
+    }
+}
+
 impl fmt::Display for IssueKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -67,6 +74,27 @@ pub enum StatusFilter {
     Is(String),
     /// The issues in every status but these. An empty list excludes nothing.
     Not(Vec<String>),
+}
+
+/// A column of the issue list the user can sort it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortColumn {
+    /// By project, then by number: PROJ-9 before PROJ-10.
+    Key,
+    Summary,
+    /// Highest to Lowest, then the priorities of another scheme by name.
+    Priority,
+    /// To do, in progress, done, and by name inside a category.
+    Status,
+    Assignee,
+}
+
+/// An order the user chose for the issue list. Issues without a priority or
+/// an assignee come last in both directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IssueOrder {
+    pub column: SortColumn,
+    pub descending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

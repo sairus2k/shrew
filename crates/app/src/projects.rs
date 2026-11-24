@@ -650,6 +650,41 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_sort_of_the_list_holds_after_the_projects_are_saved(cx: &mut TestAppContext) {
+        let tokio = tokio_runtime();
+        let server = jira(&tokio, ResponseTemplate::new(200));
+        mount_projects(&tokio, &server);
+        let issues = [
+            issue(1, "Fix login"),
+            issue(2, "Fix logout"),
+            api_issue(101, "Login endpoint"),
+        ];
+        let data_dir = synced_on(&tokio, &server.uri(), &issues);
+        watch(&tokio, data_dir.path(), &["WEB", "API"]);
+        let window = launch(cx, &tokio, data_dir.path());
+        let logout = "WEB-2: Fix logout, To Do, Unassigned";
+        wait_until(cx, window, |window| {
+            rows(window) == [API_LOGIN, logout, WEB_LOGIN]
+        });
+        in_window(cx, window, |window, cx| window.click("key-column", cx));
+        wait_until(cx, window, |window| {
+            rows(window) == [API_LOGIN, WEB_LOGIN, logout]
+        });
+        open_projects(cx, window);
+
+        in_window(cx, window, |window, cx| window.click("project-API", cx));
+        in_window(cx, window, |window, cx| window.click("watch-projects", cx));
+
+        // The settings close as the home screen is built anew
+        wait_until(cx, window, |window| window.try_find("settings").is_none());
+        wait_until(cx, window, |window| rows(window) == [WEB_LOGIN, logout]);
+        in_window(cx, window, |window, _| {
+            let key = window.find("key-column");
+            assert_eq!(key.label(), Some("KEY, ascending"));
+        });
+    }
+
+    #[gpui_kit::test]
     fn projects_that_cannot_be_loaded_can_be_asked_for_again(cx: &mut TestAppContext) {
         let tokio = tokio_runtime();
         let server = jira(

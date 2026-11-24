@@ -7,7 +7,7 @@ use crate::{
         sync_queue::{AssigneeChange, Change, CommentChange, TransitionChange, TransitionId},
     },
     models::{
-        Account, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueRow, Project,
+        Account, FilterOptions, IssueDetail, IssueFilter, IssueKey, IssueOrder, IssueRow, Project,
         RunningTimer, SetupStep, ThemeChoice, Transition, User, WorklogSettings, WorklogTarget,
     },
     sync::{
@@ -390,10 +390,18 @@ pub async fn watched_projects(state: &AppState) -> anyhow::Result<Vec<String>> {
     Ok(db::sync_state::watched(&state.pool).await?)
 }
 
-/// The issues in the local cache that pass `filter`, the one Jira changed last
-/// first.
-pub async fn list_issues(state: &AppState, filter: &IssueFilter) -> anyhow::Result<Vec<IssueRow>> {
-    Ok(db::issues::list(&state.pool, filter).await?)
+/// The issues in the local cache that pass `filter`, in `order`, or the one
+/// Jira changed last first.
+pub async fn list_issues(
+    state: &AppState,
+    filter: &IssueFilter,
+    order: Option<IssueOrder>,
+) -> anyhow::Result<Vec<IssueRow>> {
+    let mut issues = db::issues::list(&state.pool, filter).await?;
+    if let Some(order) = order {
+        db::issues::sort(&mut issues, order);
+    }
+    Ok(issues)
 }
 
 /// The assignees and the statuses of the issues in the local cache: what the
@@ -666,14 +674,19 @@ pub async fn discard_worklog(state: &AppState, entry_id: i64) -> anyhow::Result<
 pub const SEARCH_LIMIT: usize = 50;
 
 /// The `SEARCH_LIMIT` best matches of `query` among the issues in the local
-/// cache that pass `filter`, best first. Every word must match a key, a summary
-/// or a description, as a word, a stem or a prefix.
+/// cache that pass `filter`, in `order`, or best first. Every word must match a
+/// key, a summary or a description, as a word, a stem or a prefix.
 pub async fn search_issues(
     state: &AppState,
     query: &str,
     filter: &IssueFilter,
+    order: Option<IssueOrder>,
 ) -> anyhow::Result<Vec<IssueRow>> {
-    Ok(db::issues::search(&state.pool, query, filter, SEARCH_LIMIT as i64).await?)
+    let mut issues = db::issues::search(&state.pool, query, filter, SEARCH_LIMIT as i64).await?;
+    if let Some(order) = order {
+        db::issues::sort(&mut issues, order);
+    }
+    Ok(issues)
 }
 
 #[cfg(test)]
@@ -1638,13 +1651,13 @@ mod tests {
         assert_eq!(account(&state).await, None);
         assert_eq!(setup_step(&state).await.unwrap(), SetupStep::SignIn);
         assert!(
-            list_issues(&state, &IssueFilter::default())
+            list_issues(&state, &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            search_issues(&state, "login", &IssueFilter::default())
+            search_issues(&state, "login", &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1692,13 +1705,13 @@ mod tests {
         assert_eq!(signed_in.account_id, "7c20b");
         assert_eq!(setup_step(&state).await.unwrap(), SetupStep::ChooseProjects);
         assert!(
-            list_issues(&state, &IssueFilter::default())
+            list_issues(&state, &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            search_issues(&state, "login", &IssueFilter::default())
+            search_issues(&state, "login", &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1714,7 +1727,7 @@ mod tests {
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(
-            list_issues(&state, &IssueFilter::default())
+            list_issues(&state, &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .len(),
@@ -1727,7 +1740,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            list_issues(&state, &IssueFilter::default())
+            list_issues(&state, &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1767,7 +1780,9 @@ mod tests {
 
     /// The issue with its unsent status, the outbox entry and the timer.
     async fn nothing_is_lost(state: &AppState) {
-        let issues = list_issues(state, &IssueFilter::default()).await.unwrap();
+        let issues = list_issues(state, &IssueFilter::default(), None)
+            .await
+            .unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].status, "In Progress");
         assert_eq!(unsent_changes(state).await.unwrap(), 1);
@@ -1933,7 +1948,7 @@ mod tests {
 
         assert_eq!(signed_in.account_id, "7c20b");
         assert!(
-            list_issues(&state, &IssueFilter::default())
+            list_issues(&state, &IssueFilter::default(), None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1964,7 +1979,9 @@ mod tests {
         state.pool.close().await;
         let (state, _events) = start_without_keychain(data_dir.path()).await.unwrap();
         assert_eq!(watched_projects(&state).await.unwrap(), ["WEB"]);
-        let listed = list_issues(&state, &IssueFilter::default()).await.unwrap();
+        let listed = list_issues(&state, &IssueFilter::default(), None)
+            .await
+            .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "WEB-1".into());
     }
