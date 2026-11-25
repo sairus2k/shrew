@@ -32,6 +32,19 @@ cargo build --release --locked -p app
 
 A release build opens no console window; a dev build keeps it, as a panic is printed there. The data is in `%APPDATA%\<profile>` and the tokens are the generic credentials `jira-api-token.<profile>` and `tempo-api-token.<profile>` of the Credential Manager, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Windows the release binary is `target\release\app.exe` and nothing packages it yet.
 
+### Linux
+
+Requirements: Linux on x86_64 or aarch64, Rust 1.92+, a C toolchain and the headers of the libraries the build links. On Debian and Ubuntu:
+
+```sh
+sudo apt install build-essential pkg-config libssl-dev libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+cargo run -p app
+cargo build --release --locked -p app
+```
+
+To run, the app needs a Wayland or X11 session, the graphics drivers of the system (Mesa with `mesa-vulkan-drivers` on Ubuntu) and a Secret Service provider such as GNOME Keyring or KWallet, which keeps the tokens. The data is in `$XDG_DATA_HOME/<profile>`, which is `~/.local/share/<profile>` by default, and the tokens are the items of the default collection with the attributes `service` `<profile>` and `username` `jira-api-token` or `tempo-api-token`, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The item in the panel needs a StatusNotifierItem host: Ubuntu and KDE have one, and GNOME elsewhere needs the AppIndicator extension. Where the system draws no title bar, as GNOME under Wayland, the app draws its own. Linux gives no idle time of the user in one way, so the sync does not slow down while the user is away. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Linux the release binary is `target/release/app` and nothing packages it yet.
+
 ### Dev and packaged profiles
 
 The dev build and the installed app keep their data and tokens apart, so that a sign-out, a schema experiment or a wiped database in the dev build never touches the app in daily use, and both can run at the same time:
@@ -60,7 +73,7 @@ The cargo runner (`scripts/dev-run.sh`, set in `.cargo/config.toml`) signs each 
 
 ### UI integration tests
 
-The tests of the `app` crate run the real views in a headless GPUI window on a fresh SQLite file, with a [wiremock](https://docs.rs/wiremock) server as the Jira site. They pass on macOS and on Windows and touch neither the Keychain, the Credential Manager nor the network.
+The tests of the `app` crate run the real views in a headless GPUI window on a fresh SQLite file, with a [wiremock](https://docs.rs/wiremock) server as the Jira site. They pass on macOS, on Windows and on Linux, where they need no display, and touch neither the Keychain, the Credential Manager, the Secret Service nor the network.
 
 ```sh
 # All of them; they are part of `cargo test --workspace` as well

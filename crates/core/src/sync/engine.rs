@@ -90,6 +90,13 @@ fn system_idle_time() -> Duration {
     Duration::from_millis(now.wrapping_sub(info.tick).into())
 }
 
+// X11 and each Wayland compositor tell the idle time in a way of their own,
+// so on Linux the user is never taken to be away
+#[cfg(not(any(test, target_os = "macos", windows)))]
+fn system_idle_time() -> Duration {
+    Duration::ZERO
+}
+
 /// Tests set the idle time through the state: the real one depends on who
 /// touched the machine that runs them.
 fn idle_time(state: &AppState) -> Duration {
@@ -286,6 +293,8 @@ mod tests {
         assert_eq!(poll_interval(false, almost), BACKGROUND_INTERVAL);
     }
 
+    // Linux reports none
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn the_system_reports_the_time_since_the_last_input() {
         // Zero is also what a failed call is turned into, and no real input is

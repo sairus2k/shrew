@@ -8,7 +8,7 @@ use app_core::{
     models::{IssueKey, SetupStep},
 };
 use gpui_kit::component::{
-    ActiveTheme, Sizable, WindowExt as _,
+    ActiveTheme, Sizable, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants},
     notification::Notification,
 };
@@ -505,7 +505,7 @@ impl Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings_key = keys::hint(&EditUserSettings, cx);
         let screen = match &self.screen {
             Screen::SignIn(sign_in) => sign_in.clone().into_any_element(),
@@ -627,7 +627,19 @@ impl Render for Root {
                 )
                 .into_any_element(),
         };
-        div().size_full().track_focus(&self.focus).child(screen)
+        let root = div().size_full().track_focus(&self.focus);
+        // A system that decorates the window itself, as X11 without a
+        // compositor does, has drawn a title bar already
+        if cfg!(target_os = "linux")
+            && matches!(window.window_decorations(), Decorations::Client { .. })
+        {
+            return root
+                .flex()
+                .flex_col()
+                .child(TitleBar::new().child(div().text_size(px(13.)).child("Shrew")))
+                .child(div().flex_1().min_h_0().child(screen));
+        }
+        root.child(screen)
     }
 }
 
@@ -644,6 +656,10 @@ fn open_main_window(step: SetupStep, cx: &mut App) {
     let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // GNOME draws no title bar for a window of Wayland, so the app draws
+        // its own wherever the system leaves that to it
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(WindowDecorations::Client),
         ..Default::default()
     };
     open_window(options, cx, |window, cx| {
