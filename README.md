@@ -30,7 +30,7 @@ cargo run -p app
 cargo build --release --locked -p app
 ```
 
-A release build opens no console window; a dev build keeps it, as a panic is printed there. The data is in `%APPDATA%\<profile>` and the tokens are the generic credentials `jira-api-token.<profile>` and `tempo-api-token.<profile>` of the Credential Manager, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Windows the release binary is `target\release\app.exe` and nothing packages it yet.
+A release build opens no console window; a dev build keeps it, as a panic is printed there. The data is in `%APPDATA%\<profile>` and the tokens are the generic credentials `jira-api-token.<profile>` and `tempo-api-token.<profile>` of the Credential Manager, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Windows the release binary is `target\release\app.exe`, which CI uploads as `Shrew.exe` ([Builds from CI](#builds-from-ci)). The C runtime is linked into the binary (`.cargo/config.toml`), so it needs no Visual C++ Redistributable.
 
 ### Linux
 
@@ -43,7 +43,7 @@ cargo run -p app
 cargo build --release --locked -p app
 ```
 
-To run, the app needs a Wayland or X11 session, the graphics drivers of the system (Mesa with `mesa-vulkan-drivers` on Ubuntu) and a Secret Service provider such as GNOME Keyring or KWallet, which keeps the tokens. The data is in `$XDG_DATA_HOME/<profile>`, which is `~/.local/share/<profile>` by default, and the tokens are the items of the default collection with the attributes `service` `<profile>` and `username` `jira-api-token` or `tempo-api-token`, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The item in the panel needs a StatusNotifierItem host: Ubuntu and KDE have one, and GNOME elsewhere needs the AppIndicator extension. Where the system draws no title bar, as GNOME under Wayland, the app draws its own. Linux gives no idle time of the user in one way, so the sync does not slow down while the user is away. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Linux the release binary is `target/release/app` and nothing packages it yet.
+To run, the app needs a Wayland or X11 session, the graphics drivers of the system (Mesa with `mesa-vulkan-drivers` on Ubuntu) and a Secret Service provider such as GNOME Keyring or KWallet, which keeps the tokens. The data is in `$XDG_DATA_HOME/<profile>`, which is `~/.local/share/<profile>` by default, and the tokens are the items of the default collection with the attributes `service` `<profile>` and `username` `jira-api-token` or `tempo-api-token`, where the profile is `dev.shrew.app.dev` or `dev.shrew.app` as in the table below. The item in the panel needs a StatusNotifierItem host: Ubuntu and KDE have one, and GNOME elsewhere needs the AppIndicator extension. Where the system draws no title bar, as GNOME under Wayland, the app draws its own. Linux gives no idle time of the user in one way, so the sync does not slow down while the user is away. The cargo runner, the signing and `scripts/package.sh` are for macOS only: on Linux the release binary is `target/release/app`, which CI uploads as `shrew` in `Shrew.tar.gz` ([Builds from CI](#builds-from-ci)).
 
 ### Dev and packaged profiles
 
@@ -51,10 +51,10 @@ The dev build and the installed app keep their data and tokens apart, so that a 
 
 | Build | Data (`shrew.db`, `config.json`) | Keychain service |
 | --- | --- | --- |
-| `cargo run -p app`, or any build not made by `scripts/package.sh` | `~/Library/Application Support/dev.shrew.app.dev` | `dev.shrew.app.dev` |
-| `Shrew.app` from `scripts/package.sh` | `~/Library/Application Support/dev.shrew.app` | `dev.shrew.app` |
+| `cargo run -p app`, or any build made without `SHREW_PACKAGED=1` | `~/Library/Application Support/dev.shrew.app.dev` | `dev.shrew.app.dev` |
+| `Shrew.app` from `scripts/package.sh`, or a build from CI | `~/Library/Application Support/dev.shrew.app` | `dev.shrew.app` |
 
-The tokens are the items `jira-api-token` and `tempo-api-token` of that service. The profile is fixed at compile time: `scripts/package.sh` builds with `SHREW_PACKAGED=1` (`app_core::APP_ID`). Deleting the dev data directory and its two Keychain items resets the dev build to a fresh install.
+The tokens are the items `jira-api-token` and `tempo-api-token` of that service. The profile is fixed at compile time: `scripts/package.sh` builds with `SHREW_PACKAGED=1` (`app_core::APP_ID`), and so do the Linux and Windows jobs of CI. Deleting the dev data directory and its two Keychain items resets the dev build to a fresh install.
 
 ### Keychain prompt on every launch
 
@@ -118,6 +118,19 @@ scripts/package.sh
 ```
 
 The identity and the profile are only read from these two variables. A step whose variable is not set is skipped: without `SHREW_SIGN_IDENTITY` the bundle is not signed, without `SHREW_NOTARY_PROFILE` the `.dmg` is not notarized. The script then ends with a warning and names the file `Shrew-NOT-FOR-RELEASE.dmg`, which Gatekeeper blocks on other Macs; only a signed and notarized run writes `target/package/Shrew.dmg`. With no variables set it stops after the unsigned bundle and `.dmg`.
+
+## Builds from CI
+
+The workflow `.github/workflows/build.yml` runs on every push to `main` and on every pull request. On each platform it runs `cargo test --workspace` with `SQLX_OFFLINE=true` and makes a release build with the profile `dev.shrew.app`; the job for Intel Macs only builds, as its runner is too slow for the time limits of the tests, which the Apple Silicon job runs on macOS. The builds of a commit are the artifacts of its run: open the commit's check mark, or the Actions tab, choose the run of the workflow Build and scroll to Artifacts. GitHub shows them to a signed-in user and keeps them for 90 days.
+
+| Artifact | What it holds | To start it |
+| --- | --- | --- |
+| `Shrew-macos-arm64-NOT-FOR-RELEASE` | `Shrew-NOT-FOR-RELEASE.dmg` for Apple Silicon, made by `scripts/package.sh` | Drag Shrew to Applications, then allow it: Gatekeeper blocks an unsigned download until `xattr -dr com.apple.quarantine /Applications/Shrew.app` |
+| `Shrew-macos-x86_64-NOT-FOR-RELEASE` | the same `.dmg` for an Intel Mac | as above |
+| `Shrew-linux-x86_64-NOT-FOR-RELEASE` | `Shrew.tar.gz` with the binary `shrew`, built on Ubuntu 24.04 (glibc 2.39) | Unpack both and run `./shrew`; what it needs at run time is under [Linux](#linux) |
+| `Shrew-windows-x86_64-NOT-FOR-RELEASE` | a `.zip` with `Shrew.exe` | Unpack and run `Shrew.exe`; SmartScreen warns about an unsigned program |
+
+No build is signed, and the macOS builds are not notarized, which `NOT-FOR-RELEASE` says. A job that fails does not stop the jobs of the other platforms, and the run fails with it.
 
 ## License
 

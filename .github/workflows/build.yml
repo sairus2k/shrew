@@ -1,0 +1,105 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  SQLX_OFFLINE: "true"
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A platform that fails must not hide whether the others pass
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: windows-x86_64
+            runner: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the libraries the Linux build links
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      # Not on the Intel runner: it is too slow for the time limits of
+      # the_list_stays_responsive_with_12_000_issues, and the Apple Silicon job
+      # runs the same tests on macOS
+      - name: Test
+        if: matrix.platform != 'macos-x86_64'
+        run: cargo test --workspace --locked
+
+      - name: Package for macOS
+        if: runner.os == 'macOS'
+        run: scripts/package.sh
+
+      # SHREW_PACKAGED gives the build the profile of the installed app, as
+      # scripts/package.sh does on macOS
+      - name: Build for Linux
+        if: runner.os == 'Linux'
+        run: |
+          SHREW_PACKAGED=1 cargo build --release --locked -p app
+          mkdir dist
+          cp target/release/app dist/shrew
+          # A zip artifact drops the executable bit, a tar keeps it
+          tar -czf Shrew.tar.gz -C dist shrew
+
+      - name: Build for Windows
+        if: runner.os == 'Windows'
+        run: |
+          SHREW_PACKAGED=1 cargo build --release --locked -p app
+          mkdir dist
+          cp target/release/app.exe dist/Shrew.exe
+
+      # No build is signed yet (SHR-101), which the names say. A signed .dmg
+      # has another file name and fails the upload until this is changed.
+      - name: Upload the .dmg
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Shrew-${{ matrix.platform }}-NOT-FOR-RELEASE
+          path: target/package/Shrew-NOT-FOR-RELEASE.dmg
+          if-no-files-found: error
+
+      - name: Upload the .tar.gz
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Shrew-${{ matrix.platform }}-NOT-FOR-RELEASE
+          path: Shrew.tar.gz
+          if-no-files-found: error
+
+      - name: Upload Shrew.exe
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: Shrew-${{ matrix.platform }}-NOT-FOR-RELEASE
+          path: dist/Shrew.exe
+          if-no-files-found: error
