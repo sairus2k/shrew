@@ -76,8 +76,8 @@ pub fn install(cx: &mut App) -> gpui_tray::Result<()> {
     #[cfg(not(target_os = "macos"))]
     let icon = Icon::from_gpui(
         &Image::from_bytes(
-            ImageFormat::Svg,
-            include_bytes!("../../../assets/icons/app-icon.svg").to_vec(),
+            ImageFormat::Png,
+            include_bytes!("../../../assets/icons/tray-icon.png").to_vec(),
         ),
         cx,
     )
