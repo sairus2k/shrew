@@ -69,7 +69,7 @@ jobs:
           mkdir dist
           cp target/release/app dist/shrew
           # A zip artifact drops the executable bit, a tar keeps it
-          tar -czf "Shrew-${{ matrix.platform }}-NOT-FOR-RELEASE.tar.gz" -C dist shrew
+          tar -czf Shrew.tar.gz -C dist shrew
 
       - name: Build for Windows
         if: runner.os == 'Windows'
@@ -92,8 +92,8 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:
-          path: Shrew-${{ matrix.platform }}-NOT-FOR-RELEASE.tar.gz
-          archive: false
+          name: Shrew-${{ matrix.platform }}-NOT-FOR-RELEASE
+          path: Shrew.tar.gz
           if-no-files-found: error
 
       - name: Upload Shrew.exe
