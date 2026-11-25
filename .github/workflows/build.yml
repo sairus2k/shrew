@@ -49,7 +49,11 @@ jobs:
         with:
           key: ${{ matrix.platform }}
 
+      # Not on the Intel runner: it is too slow for the time limits of
+      # the_list_stays_responsive_with_12_000_issues, and the Apple Silicon job
+      # runs the same tests on macOS
       - name: Test
+        if: matrix.platform != 'macos-x86_64'
         run: cargo test --workspace --locked
 
       - name: Package for macOS

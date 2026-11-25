@@ -121,7 +121,7 @@ The identity and the profile are only read from these two variables. A step whos
 
 ## Builds from CI
 
-The workflow `.github/workflows/build.yml` runs on every push to `main` and on every pull request. On each platform it runs `cargo test --workspace` with `SQLX_OFFLINE=true` and makes a release build with the profile `dev.shrew.app`. The builds of a commit are the artifacts of its run: open the commit's check mark, or the Actions tab, choose the run of the workflow Build and scroll to Artifacts. GitHub shows them to a signed-in user and keeps them for 90 days.
+The workflow `.github/workflows/build.yml` runs on every push to `main` and on every pull request. On each platform it runs `cargo test --workspace` with `SQLX_OFFLINE=true` and makes a release build with the profile `dev.shrew.app`; the job for Intel Macs only builds, as its runner is too slow for the time limits of the tests, which the Apple Silicon job runs on macOS. The builds of a commit are the artifacts of its run: open the commit's check mark, or the Actions tab, choose the run of the workflow Build and scroll to Artifacts. GitHub shows them to a signed-in user and keeps them for 90 days.
 
 | Artifact | What it holds | To start it |
 | --- | --- | --- |
