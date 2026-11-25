@@ -1,2 +1,7 @@
 [target.'cfg(target_os = "macos")']
 runner = "scripts/dev-run.sh"
+
+# Links the C runtime into the binary, so that it starts on a Windows without
+# the Visual C++ Redistributable
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
